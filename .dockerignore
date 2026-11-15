@@ -1,0 +1,13 @@
+# イメージのビルドに不要なものを送らない（ビルドが速くなり、秘密の混入も防げる）
+.git
+.github
+**/node_modules
+web/dist
+data
+samples
+docs
+charts
+.env
+.env.*
+**/*.md
+.playwright-mcp

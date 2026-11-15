@@ -1,0 +1,716 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ieyoukan/3d-scanner/server/internal/config"
+	"github.com/ieyoukan/3d-scanner/server/internal/jobs"
+	"github.com/ieyoukan/3d-scanner/server/internal/reconstruction"
+	"github.com/ieyoukan/3d-scanner/server/internal/scan"
+	"github.com/ieyoukan/3d-scanner/server/internal/store"
+	"github.com/ieyoukan/3d-scanner/server/internal/workspace"
+)
+
+// このテストは、本物のハンドラ・本物のジョブ管理・メモリ上の Store・偽のパイプラインを組み合わせ、
+// HTTP の入口から「アップロード → 待ち行列 → 処理 → 状態取得 → 成果物配信」までを通しで確かめる。
+
+const testToken = "test-token-0123456789abcdef"
+
+// fakePipeline は全ステップ成功として成果物ファイルを置く。
+type fakePipeline struct{}
+
+func (fakePipeline) Run(ctx context.Context, job reconstruction.Job, rep reconstruction.Reporter) error {
+	write := func(kind scan.AssetKind, name, content string) {
+		path := filepath.Join(job.WS.OutputDir(), name)
+		os.WriteFile(path, []byte(content), 0o640)
+		rep.AssetReady(ctx, kind, path, int64(len(content)))
+	}
+	rep.StepStarted(ctx, scan.StepSfM)
+	os.WriteFile(job.WS.LogPath(scan.StepSfM), []byte("$ colmap feature_extractor\n特徴点を抽出しました\n"), 0o640)
+	write(scan.AssetSparsePLY, "sparse.ply", "ply\nsparse")
+	rep.StepFinished(ctx, scan.StepSfM, scan.StepSucceeded, "3枚中3枚")
+	rep.StepFinished(ctx, scan.StepMVS, scan.StepSkipped, "GPU なし")
+	rep.StepStarted(ctx, scan.StepMesh)
+	write(scan.AssetMeshGLB, "mesh.glb", "glTF-0123456789")
+	rep.StepFinished(ctx, scan.StepMesh, scan.StepSucceeded, "")
+	rep.StepStarted(ctx, scan.StepSplat)
+	rep.StepFinished(ctx, scan.StepSplat, scan.StepFailed, "メモリ不足の可能性があります。")
+	rep.StepFinished(ctx, scan.StepSOG, scan.StepSkipped, "")
+	return nil
+}
+
+// testEnv はテスト1件ぶんのサーバー一式。
+type testEnv struct {
+	t      *testing.T
+	cfg    config.Config
+	store  *store.Memory
+	root   *workspace.Root
+	jobs   *jobs.Service
+	server *Server
+	http   http.Handler
+}
+
+// newTestEnv はサーバーを組み立てる。mutate で設定を変えられる。
+func newTestEnv(t *testing.T, mutate func(*config.Config)) *testEnv {
+	t.Helper()
+	webDir := t.TempDir()
+	os.WriteFile(filepath.Join(webDir, "index.html"), []byte("<!doctype html><title>3D Scanner</title>"), 0o644)
+	os.MkdirAll(filepath.Join(webDir, "assets"), 0o755)
+	os.WriteFile(filepath.Join(webDir, "assets", "index-abc123.js"), []byte("console.log('app')"), 0o644)
+
+	cfg := config.Config{
+		DataDir: t.TempDir(),
+		WebDir:  webDir,
+		Auth:    config.Auth{AccessToken: testToken, CookieSecure: true},
+		Limits: config.Limits{
+			MinImages: 3, MaxImages: 6, MaxImageBytes: 200 * 1024, MaxUploadBytes: 600 * 1024,
+			MaxImagePixels: 1_000_000, MinImageSide: 32, MinFreeDiskBytes: 1, MaxQueuedScans: 2,
+		},
+		Jobs: config.Jobs{Retention: 24 * time.Hour, ExpiredRowRetention: time.Hour, MaxAttempts: 2,
+			PollInterval: 10 * time.Millisecond, JanitorInterval: time.Hour},
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	root, err := workspace.New(cfg.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewMemory()
+	js := jobs.New(st, root, fakePipeline{}, cfg.Jobs, nil)
+	srv := New(cfg, st, root, js, PipelineInfo{MeshEnabled: true, MeshMode: "sparse", SplatEnabled: true, SplatDevice: "cpu"}, nil)
+	return &testEnv{t: t, cfg: cfg, store: st, root: root, jobs: js, server: srv, http: srv.Handler()}
+}
+
+// startWorker はワーカーを動かす（テスト終了時に止める）。
+func (e *testEnv) startWorker() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { e.jobs.Run(ctx); close(done) }()
+	e.t.Cleanup(func() { cancel(); <-done })
+}
+
+// do はリクエストを1つ実行する。opts でヘッダ等を足せる。
+func (e *testEnv) do(method, target string, body io.Reader, opts ...func(*http.Request)) *httptest.ResponseRecorder {
+	e.t.Helper()
+	req := httptest.NewRequest(method, target, body)
+	for _, o := range opts {
+		o(req)
+	}
+	rec := httptest.NewRecorder()
+	e.http.ServeHTTP(rec, req)
+	return rec
+}
+
+func bearer(req *http.Request) { req.Header.Set("Authorization", "Bearer "+testToken) }
+
+func header(k, v string) func(*http.Request) {
+	return func(req *http.Request) { req.Header.Set(k, v) }
+}
+
+// photo は seed ごとに中身の違う小さな JPEG を作る。
+func photo(t *testing.T, seed uint8) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 64, 48))
+	for y := 0; y < 48; y++ {
+		for x := 0; x < 64; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x) * seed, G: uint8(y) + seed, B: seed, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// uploadBody は n 枚の写真を入れた multipart ボディと Content-Type を返す。
+func uploadBody(t *testing.T, n int) (io.Reader, func(*http.Request)) {
+	t.Helper()
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for i := 0; i < n; i++ {
+		fw, _ := w.CreateFormFile("images", fmt.Sprintf("IMG_%d.jpg", i))
+		fw.Write(photo(t, uint8(i+1)))
+	}
+	w.WriteField("metadata", `{"client":{"userAgent":"go-test"},"frames":[{"capturedAt":"2026-11-16T09:00:00Z"}]}`)
+	w.Close()
+	return &body, header("Content-Type", w.FormDataContentType())
+}
+
+func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
+	t.Helper()
+	var v T
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+		t.Fatalf("JSON として読めない（status %d）: %s", rec.Code, rec.Body.String())
+	}
+	return v
+}
+
+// wantError はエラー応答の status と code を確かめる。
+func wantError(t *testing.T, rec *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("status = %d, want %d（body: %s）", rec.Code, status, rec.Body.String())
+	}
+	body := decode[errorBody](t, rec)
+	if body.Error.Code != code || body.Error.Message == "" {
+		t.Fatalf("error = %+v, want code %q と説明文", body.Error, code)
+	}
+}
+
+// createScan はアップロードして ID を返す。
+func (e *testEnv) createScan(n int) string {
+	e.t.Helper()
+	body, ct := uploadBody(e.t, n)
+	rec := e.do("POST", "/api/scans", body, bearer, ct)
+	if rec.Code != http.StatusAccepted {
+		e.t.Fatalf("アップロードが %d: %s", rec.Code, rec.Body.String())
+	}
+	return decode[createResponse](e.t, rec).ID
+}
+
+// waitScan は状態が終了状態になるまで GET を繰り返す（画面のポーリングと同じ）。
+func (e *testEnv) waitScan(id string) scanResponse {
+	e.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rec := e.do("GET", "/api/scans/"+id, nil, bearer)
+		resp := decode[scanResponse](e.t, rec)
+		if resp.Status.Terminal() {
+			return resp
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("終了しない（現在 %q）", resp.Status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (e *testEnv) scanDirs() []string {
+	ids, _ := e.root.List()
+	return ids
+}
+
+// ---------------------------------------------------------------------------
+
+func TestHealthAndConfig(t *testing.T) {
+	e := newTestEnv(t, nil)
+	if rec := e.do("GET", "/healthz", nil); rec.Code != 200 || rec.Body.String() != "ok\n" {
+		t.Errorf("healthz = %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := e.do("GET", "/readyz", nil); rec.Code != 200 {
+		t.Errorf("readyz = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 設定はログイン前の画面が読むので、認証なしで取れる。秘密は含まれない。
+	rec := e.do("GET", "/api/config", nil)
+	cfg := decode[configResponse](t, rec)
+	if !cfg.AuthRequired || cfg.Authenticated {
+		t.Errorf("未ログインの config = %+v", cfg)
+	}
+	if cfg.Limits.MinImages != 3 || cfg.Limits.MaxImages != 6 || cfg.RetentionHours != 24 || cfg.Pipeline.MeshMode != "sparse" {
+		t.Errorf("config = %+v", cfg)
+	}
+	if strings.Contains(rec.Body.String(), testToken) {
+		t.Fatal("config にトークンが含まれている")
+	}
+	if got := decode[configResponse](t, e.do("GET", "/api/config", nil, bearer)); !got.Authenticated {
+		t.Error("Bearer 付きなのに authenticated が false")
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	e := newTestEnv(t, nil)
+	h := e.do("GET", "/", nil).Header()
+	for name, want := range map[string]string{
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+		"Referrer-Policy":         "no-referrer",
+		"Permissions-Policy":      "camera=(self)",
+		"Content-Security-Policy": "default-src 'self'",
+	} {
+		if !strings.Contains(h.Get(name), want) {
+			t.Errorf("%s = %q, want %q を含む", name, h.Get(name), want)
+		}
+	}
+}
+
+// TestProtectedEndpointsRequireAuth: 認証なしでは /api/scans 以下に一切触れない。
+func TestProtectedEndpointsRequireAuth(t *testing.T) {
+	e := newTestEnv(t, nil)
+	id := e.createScan(3)
+	requests := []struct{ method, target string }{
+		{"POST", "/api/scans"},
+		{"GET", "/api/scans/" + id},
+		{"GET", "/api/scans/" + id + "/logs?step=sfm"},
+		{"GET", "/api/scans/" + id + "/assets/mesh_glb"},
+		{"DELETE", "/api/scans/" + id},
+	}
+	for _, rq := range requests {
+		wantError(t, e.do(rq.method, rq.target, nil), http.StatusUnauthorized, "unauthorized")
+		// 間違ったトークンでも同じ。
+		wantError(t, e.do(rq.method, rq.target, nil, header("Authorization", "Bearer wrong-token")), http.StatusUnauthorized, "unauthorized")
+	}
+	// 認証なしの DELETE でスキャンが消えていないこと。
+	if rec := e.do("GET", "/api/scans/"+id, nil, bearer); rec.Code != 200 {
+		t.Fatalf("認証なしの操作でスキャンが変わった: %d", rec.Code)
+	}
+}
+
+func TestLoginCookieFlow(t *testing.T) {
+	e := newTestEnv(t, nil)
+	login := func(token string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{"token": token})
+		return e.do("POST", "/api/session", bytes.NewReader(body), opts...)
+	}
+
+	wantError(t, login("wrong"), http.StatusUnauthorized, "invalid_token")
+
+	rec := login(testToken)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("ログイン = %d %s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("Cookie の数 = %d", len(cookies))
+	}
+	c := cookies[0]
+	// HTTPS 用の設定では __Host- 接頭辞・Secure・HttpOnly・SameSite=Strict が付く。
+	if c.Name != "__Host-scanner_session" || !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Path != "/" || c.MaxAge <= 0 {
+		t.Errorf("Cookie の属性 = %+v", c)
+	}
+	// Cookie の値はトークンそのものではない（漏れてもトークンは分からない）。
+	if c.Value == testToken || strings.Contains(c.Value, testToken) {
+		t.Fatal("Cookie にトークンがそのまま入っている")
+	}
+
+	withCookie := func(req *http.Request) { req.AddCookie(c) }
+	id := e.createScan(3)
+	if rec := e.do("GET", "/api/scans/"+id, nil, withCookie); rec.Code != 200 {
+		t.Errorf("Cookie で GET できない: %d", rec.Code)
+	}
+	// 値を1文字変えた Cookie は通らない。
+	forged := *c
+	forged.Value = "0" + c.Value[1:]
+	if c.Value[0] == '0' {
+		forged.Value = "1" + c.Value[1:]
+	}
+	wantError(t, e.do("GET", "/api/scans/"+id, nil, func(r *http.Request) { r.AddCookie(&forged) }), http.StatusUnauthorized, "unauthorized")
+
+	// ログアウトは Cookie を消す指示（MaxAge<0）を返す。
+	out := e.do("DELETE", "/api/session", nil, withCookie).Result().Cookies()
+	if len(out) != 1 || out[0].MaxAge >= 0 {
+		t.Errorf("ログアウトの Cookie = %+v", out)
+	}
+}
+
+// TestCrossOriginWritesAreRejected: Cookie 認証の POST/DELETE は、自分のページ発でなければ拒否する（CSRF 対策）。
+func TestCrossOriginWritesAreRejected(t *testing.T) {
+	e := newTestEnv(t, nil)
+	body, _ := json.Marshal(map[string]string{"token": testToken})
+	c := e.do("POST", "/api/session", bytes.NewReader(body)).Result().Cookies()[0]
+	withCookie := func(req *http.Request) { req.AddCookie(c) }
+	id := e.createScan(3)
+
+	// 同じドメインの別サブドメイン（同一サイトだが別オリジン）からの削除。
+	// httptest のリクエストの Host は example.com。
+	rec := e.do("DELETE", "/api/scans/"+id, nil, withCookie, header("Origin", "https://other.example.com"))
+	wantError(t, rec, http.StatusForbidden, "cross_origin")
+	if rec := e.do("GET", "/api/scans/"+id, nil, withCookie); rec.Code != 200 {
+		t.Fatal("拒否したはずの削除が実行された")
+	}
+	upload, ct := uploadBody(t, 3)
+	wantError(t, e.do("POST", "/api/scans", upload, withCookie, ct, header("Origin", "https://evil.test")), http.StatusForbidden, "cross_origin")
+	// ログイン自体も別オリジンからは受け付けない。
+	wantError(t, e.do("POST", "/api/session", bytes.NewReader(body), header("Origin", "https://evil.test")), http.StatusForbidden, "cross_origin")
+
+	// 自分のオリジンからなら通る。
+	if rec := e.do("DELETE", "/api/scans/"+id, nil, withCookie, header("Origin", "https://example.com")); rec.Code != 200 {
+		t.Errorf("同一オリジンの削除が %d", rec.Code)
+	}
+	// Bearer（ブラウザ以外）は Cookie を勝手に送られる心配が無いので、Origin に関係なく通る。
+	id2 := e.createScan(3)
+	if rec := e.do("DELETE", "/api/scans/"+id2, nil, bearer, header("Origin", "https://evil.test")); rec.Code != 200 {
+		t.Errorf("Bearer の削除が %d", rec.Code)
+	}
+}
+
+func TestLoginRateLimit(t *testing.T) {
+	e := newTestEnv(t, nil)
+	bad, _ := json.Marshal(map[string]string{"token": "wrong"})
+	for i := 0; i < 10; i++ {
+		wantError(t, e.do("POST", "/api/session", bytes.NewReader(bad)), http.StatusUnauthorized, "invalid_token")
+	}
+	// 11回目からは、正しいトークンでも一定時間は受け付けない。
+	good, _ := json.Marshal(map[string]string{"token": testToken})
+	rec := e.do("POST", "/api/session", bytes.NewReader(good))
+	wantError(t, rec, http.StatusTooManyRequests, "too_many_attempts")
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After が無い")
+	}
+	// 別の接続元は影響を受けない。
+	other := func(r *http.Request) { r.RemoteAddr = "203.0.113.9:5555" }
+	if rec := e.do("POST", "/api/session", bytes.NewReader(good), other); rec.Code != http.StatusNoContent {
+		t.Errorf("別の接続元まで制限された: %d", rec.Code)
+	}
+}
+
+func TestNoAuthModeAllowsEverything(t *testing.T) {
+	e := newTestEnv(t, func(c *config.Config) { c.Auth = config.Auth{AllowNoAuth: true} })
+	cfg := decode[configResponse](t, e.do("GET", "/api/config", nil))
+	if cfg.AuthRequired || !cfg.Authenticated {
+		t.Errorf("config = %+v", cfg)
+	}
+	body, ct := uploadBody(t, 3)
+	if rec := e.do("POST", "/api/scans", body, ct); rec.Code != http.StatusAccepted {
+		t.Errorf("認証なしモードでアップロードできない: %d", rec.Code)
+	}
+}
+
+// TestScanLifecycle: アップロードから成果物の取得までの一連の流れ。
+func TestScanLifecycle(t *testing.T) {
+	e := newTestEnv(t, nil)
+
+	body, ct := uploadBody(t, 4)
+	rec := e.do("POST", "/api/scans", body, bearer, ct)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	created := decode[createResponse](t, rec)
+	if !scan.ValidID(created.ID) || created.Status != scan.StatusQueued || created.FrameCount != 4 {
+		t.Fatalf("応答 = %+v", created)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/api/scans/"+created.ID {
+		t.Errorf("Location = %q", loc)
+	}
+	// 写真はサーバーが決めた名前で保存されている（利用者のファイル名 IMG_0.jpg は使わない）。
+	ws, _ := e.root.Scan(created.ID)
+	entries, _ := os.ReadDir(ws.ImagesDir())
+	if len(entries) != 4 || entries[0].Name() != "frame_0001.jpg" {
+		t.Errorf("保存された写真 = %v", entries)
+	}
+
+	// ワーカーが動く前は queued で、待ち順が分かる。
+	queued := decode[scanResponse](t, e.do("GET", "/api/scans/"+created.ID, nil, bearer))
+	if queued.Status != scan.StatusQueued || queued.QueuePosition == nil || *queued.QueuePosition != 0 || len(queued.Steps) != 5 {
+		t.Fatalf("queued の応答 = %+v", queued)
+	}
+	// 処理前は成果物を配信しない。
+	wantError(t, e.do("GET", "/api/scans/"+created.ID+"/assets/mesh_glb", nil, bearer), http.StatusGone, "asset_unavailable")
+
+	e.startWorker()
+	e.jobs.Notify()
+	done := e.waitScan(created.ID)
+
+	// 偽パイプラインは「Mesh 成功・3DGS 失敗」を報告する → partial。失敗は隠されない。
+	if done.Status != scan.StatusPartial || done.Error == nil || done.Error.Code != "splat_failed" {
+		t.Fatalf("終了時 = %+v（error=%+v）", done.Status, done.Error)
+	}
+	if done.QueuePosition != nil {
+		t.Error("終了後に待ち順が付いている")
+	}
+	byName := map[scan.StepName]stepResponse{}
+	for _, st := range done.Steps {
+		byName[st.Name] = st
+	}
+	if st := byName[scan.StepSfM]; st.Status != scan.StepSucceeded || st.Message != "3枚中3枚" || !st.HasLog {
+		t.Errorf("SfM = %+v", st)
+	}
+	if st := byName[scan.StepSplat]; st.Status != scan.StepFailed || st.Error == "" {
+		t.Errorf("3DGS = %+v", st)
+	}
+	kinds := map[scan.AssetKind]assetResponse{}
+	for _, a := range done.Assets {
+		kinds[a.Kind] = a
+	}
+	// URL の末尾には拡張子つきのファイル名が付く（ビューアが形式を見分けるため）。
+	if len(kinds) != 2 || kinds[scan.AssetMeshGLB].URL != "/api/scans/"+created.ID+"/assets/mesh_glb/mesh.glb" {
+		t.Fatalf("成果物 = %+v", done.Assets)
+	}
+	// ファイル名なしの URL（仕様どおりの形）でも同じものが取れる。
+	if plain := e.do("GET", "/api/scans/"+created.ID+"/assets/mesh_glb", nil, bearer); plain.Code != 200 || plain.Body.String() != "glTF-0123456789" {
+		t.Errorf("ファイル名なしの URL = %d %q", plain.Code, plain.Body.String())
+	}
+	// 種類と合わないファイル名は受け付けない（名前でファイルを選ばせない）。
+	for _, name := range []string{"scene.sog", "..%2f..%2fsecret", "mesh.glb.bak"} {
+		if rec := e.do("GET", "/api/scans/"+created.ID+"/assets/mesh_glb/"+name, nil, bearer); rec.Code == 200 {
+			t.Errorf("名前 %q で成果物が取れてしまった", name)
+		}
+	}
+
+	// 成果物の取得。
+	asset := e.do("GET", kinds[scan.AssetMeshGLB].URL, nil, bearer)
+	if asset.Code != 200 || asset.Body.String() != "glTF-0123456789" || asset.Header().Get("Content-Type") != "model/gltf-binary" {
+		t.Errorf("成果物 = %d %q (%s)", asset.Code, asset.Body.String(), asset.Header().Get("Content-Type"))
+	}
+	if cc := asset.Header().Get("Cache-Control"); !strings.Contains(cc, "private") {
+		t.Errorf("成果物の Cache-Control = %q（共有キャッシュに残さない）", cc)
+	}
+	if asset.Header().Get("Content-Disposition") != "" {
+		t.Error("download を指定していないのに attachment が付いた")
+	}
+	// ?download=1 でファイルとして保存させる。
+	dl := e.do("GET", kinds[scan.AssetMeshGLB].URL+"?download=1", nil, bearer)
+	if cd := dl.Header().Get("Content-Disposition"); cd != "attachment; filename=mesh.glb" {
+		t.Errorf("Content-Disposition = %q", cd)
+	}
+	// Range（途中からの取得）に対応している。
+	part := e.do("GET", kinds[scan.AssetMeshGLB].URL, nil, bearer, header("Range", "bytes=0-3"))
+	if part.Code != http.StatusPartialContent || part.Body.String() != "glTF" {
+		t.Errorf("Range = %d %q", part.Code, part.Body.String())
+	}
+	// 生成に失敗した種類は 404（成功したふりをしない）。
+	wantError(t, e.do("GET", "/api/scans/"+created.ID+"/assets/gaussian_ply", nil, bearer), http.StatusNotFound, "asset_not_ready")
+	wantError(t, e.do("GET", "/api/scans/"+created.ID+"/assets/passwd", nil, bearer), http.StatusNotFound, "unknown_asset")
+
+	// 処理ログ。
+	logs := e.do("GET", "/api/scans/"+created.ID+"/logs?step=sfm", nil, bearer)
+	if logs.Code != 200 || !strings.Contains(logs.Body.String(), "colmap feature_extractor") || !strings.HasPrefix(logs.Header().Get("Content-Type"), "text/plain") {
+		t.Errorf("ログ = %d %q", logs.Code, logs.Body.String())
+	}
+	wantError(t, e.do("GET", "/api/scans/"+created.ID+"/logs?step=splat", nil, bearer), http.StatusNotFound, "no_log")
+
+	// 削除すると、行もファイルも無くなる。
+	del := e.do("DELETE", "/api/scans/"+created.ID, nil, bearer)
+	if del.Code != 200 || decode[map[string]string](t, del)["result"] != "deleted" {
+		t.Errorf("削除 = %d %s", del.Code, del.Body.String())
+	}
+	wantError(t, e.do("GET", "/api/scans/"+created.ID, nil, bearer), http.StatusNotFound, "not_found")
+	if dirs := e.scanDirs(); len(dirs) != 0 {
+		t.Errorf("削除後も作業ディレクトリが残っている: %v", dirs)
+	}
+}
+
+// TestUploadRejections: 断ったアップロードは、理由を返し、サーバーに何も残さない。
+func TestUploadRejections(t *testing.T) {
+	t.Run("multipart でない", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		rec := e.do("POST", "/api/scans", strings.NewReader(`{"images":[]}`), bearer, header("Content-Type", "application/json"))
+		wantError(t, rec, http.StatusUnsupportedMediaType, "unsupported_media_type")
+	})
+	t.Run("枚数不足", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		body, ct := uploadBody(t, 2)
+		wantError(t, e.do("POST", "/api/scans", body, bearer, ct), http.StatusBadRequest, "too_few_images")
+		if dirs := e.scanDirs(); len(dirs) != 0 {
+			t.Errorf("断ったのに作業ディレクトリが残っている: %v", dirs)
+		}
+		if n, _ := e.store.CountActive(context.Background()); n != 0 {
+			t.Errorf("断ったのにジョブが登録された: %d", n)
+		}
+	})
+	t.Run("枚数超過", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		body, ct := uploadBody(t, 7)
+		wantError(t, e.do("POST", "/api/scans", body, bearer, ct), http.StatusRequestEntityTooLarge, "too_many_images")
+		if dirs := e.scanDirs(); len(dirs) != 0 {
+			t.Errorf("作業ディレクトリが残っている: %v", dirs)
+		}
+	})
+	t.Run("全体が大きすぎる", func(t *testing.T) {
+		e := newTestEnv(t, func(c *config.Config) { c.Limits.MaxUploadBytes = 2 * 1024 })
+		body, ct := uploadBody(t, 4)
+		wantError(t, e.do("POST", "/api/scans", body, bearer, ct), http.StatusRequestEntityTooLarge, "upload_too_large")
+		if dirs := e.scanDirs(); len(dirs) != 0 {
+			t.Errorf("作業ディレクトリが残っている: %v", dirs)
+		}
+	})
+	t.Run("画像でないファイル", func(t *testing.T) {
+		e := newTestEnv(t, nil)
+		var body bytes.Buffer
+		w := multipart.NewWriter(&body)
+		for i := 0; i < 3; i++ {
+			fw, _ := w.CreateFormFile("images", "x.jpg")
+			fw.Write([]byte("#!/bin/sh\necho これは写真ではありません\n"))
+		}
+		w.Close()
+		rec := e.do("POST", "/api/scans", &body, bearer, header("Content-Type", w.FormDataContentType()))
+		wantError(t, rec, http.StatusUnsupportedMediaType, "unsupported_type")
+	})
+	t.Run("待ち行列が一杯", func(t *testing.T) {
+		e := newTestEnv(t, nil) // MaxQueuedScans = 2、ワーカーは動かさない
+		e.createScan(3)
+		e.createScan(3)
+		body, ct := uploadBody(t, 3)
+		rec := e.do("POST", "/api/scans", body, bearer, ct)
+		wantError(t, rec, http.StatusTooManyRequests, "queue_full")
+		if rec.Header().Get("Retry-After") == "" {
+			t.Error("Retry-After が無い")
+		}
+		if dirs := e.scanDirs(); len(dirs) != 2 {
+			t.Errorf("作業ディレクトリ = %d 個, want 2", len(dirs))
+		}
+	})
+	t.Run("ディスクの空きが足りない", func(t *testing.T) {
+		e := newTestEnv(t, func(c *config.Config) { c.Limits.MinFreeDiskBytes = 1 << 60 }) // 1 EiB は必ず足りない
+		body, ct := uploadBody(t, 3)
+		wantError(t, e.do("POST", "/api/scans", body, bearer, ct), http.StatusInsufficientStorage, "disk_full")
+	})
+}
+
+// TestMalformedIDsNeverReachTheFilesystem: URL の ID に何を入れても、ハンドラは何も返さず、何も実行しない。
+//
+// 期待する応答は2通り:
+//   - 404: ハンドラが ID の形式検査で弾いた。
+//   - 3xx: パスに生の ".." が含まれる場合。Go 標準の ServeMux は、ハンドラを呼ぶ前にパスを
+//     正規化し、正規化後の URL へのリダイレクトを返す（".." を含むパスはハンドラに届かない）。
+//
+// どちらでも「不正な ID がファイルシステムに届かない」ことは満たされる。200 だけは決して返らない。
+func TestMalformedIDsNeverReachTheFilesystem(t *testing.T) {
+	e := newTestEnv(t, nil)
+	// 実在するスキャンを1つ作っておく。不正な ID の操作がこれに影響しないことも確かめる。
+	real := e.createScan(3)
+	rejected := func(code int) bool {
+		return code == http.StatusNotFound || (code >= 300 && code < 400)
+	}
+	unknown, _ := scan.NewID()
+	for _, id := range []string{unknown, "abc", "..", "%2e%2e", "..%2f..%2fetc", "00000000-0000-4000-8000-00000000000Z"} {
+		for _, suffix := range []string{"", "/logs?step=sfm", "/assets/mesh_glb"} {
+			rec := e.do("GET", "/api/scans/"+id+suffix, nil, bearer)
+			if !rejected(rec.Code) {
+				t.Errorf("GET /api/scans/%s%s = %d（404 かリダイレクトのはず）", id, suffix, rec.Code)
+			}
+		}
+		if rec := e.do("DELETE", "/api/scans/"+id, nil, bearer); !rejected(rec.Code) {
+			t.Errorf("DELETE /api/scans/%s = %d（404 かリダイレクトのはず）", id, rec.Code)
+		}
+	}
+	// 形式は正しいが存在しない ID と、明らかに不正な ID は、必ずハンドラ自身が 404 を返す。
+	for _, id := range []string{unknown, "abc", "00000000-0000-4000-8000-00000000000Z"} {
+		wantError(t, e.do("GET", "/api/scans/"+id, nil, bearer), http.StatusNotFound, "not_found")
+		wantError(t, e.do("DELETE", "/api/scans/"+id, nil, bearer), http.StatusNotFound, "not_found")
+	}
+	// 実在するスキャンと、その写真は無傷。
+	if rec := e.do("GET", "/api/scans/"+real, nil, bearer); rec.Code != http.StatusOK {
+		t.Errorf("無関係なスキャンが影響を受けた: %d", rec.Code)
+	}
+	if dirs := e.scanDirs(); len(dirs) != 1 || dirs[0] != real {
+		t.Errorf("作業ディレクトリ = %v, want [%s]", dirs, real)
+	}
+}
+
+func TestLogsRejectUnknownStep(t *testing.T) {
+	e := newTestEnv(t, nil)
+	id := e.createScan(3)
+	for _, step := range []string{"", "unknown", "../../../etc/passwd", "sfm/../../x"} {
+		rec := e.do("GET", "/api/scans/"+id+"/logs?step="+step, nil, bearer)
+		wantError(t, rec, http.StatusBadRequest, "bad_step")
+	}
+}
+
+// TestAssetPathEscapeIsNotServed: 万一 DB の相対パスが作業ディレクトリの外を指していても、配信しない。
+func TestAssetPathEscapeIsNotServed(t *testing.T) {
+	e := newTestEnv(t, nil)
+	id := e.createScan(3)
+	e.startWorker()
+	e.waitScan(id)
+
+	secret := filepath.Join(e.cfg.DataDir, "secret.txt")
+	os.WriteFile(secret, []byte("サーバー上の秘密"), 0o600)
+	ctx := context.Background()
+
+	// (1) ".." で外に出る相対パス。
+	e.store.PutAsset(ctx, id, scan.Asset{Kind: scan.AssetGaussianPLY, RelativePath: "../../secret.txt", SizeBytes: 1})
+	rec := e.do("GET", "/api/scans/"+id+"/assets/gaussian_ply", nil, bearer)
+	if rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), "秘密") {
+		t.Fatalf("外を指すパスが配信された: %d %q", rec.Code, rec.Body.String())
+	}
+	// (2) 絶対パス。
+	e.store.PutAsset(ctx, id, scan.Asset{Kind: scan.AssetGaussianPLY, RelativePath: secret, SizeBytes: 1})
+	if rec := e.do("GET", "/api/scans/"+id+"/assets/gaussian_ply", nil, bearer); rec.Code != http.StatusNotFound {
+		t.Fatalf("絶対パスが配信された: %d", rec.Code)
+	}
+	// (3) 作業ディレクトリ内のシンボリックリンクが外を指している。
+	ws, _ := e.root.Scan(id)
+	link := filepath.Join(ws.OutputDir(), "link.ply")
+	if err := os.Symlink(secret, link); err == nil {
+		e.store.PutAsset(ctx, id, scan.Asset{Kind: scan.AssetGaussianPLY, RelativePath: "output/link.ply", SizeBytes: 1})
+		rec := e.do("GET", "/api/scans/"+id+"/assets/gaussian_ply", nil, bearer)
+		if rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), "秘密") {
+			t.Fatalf("外を指すリンクが配信された: %d %q", rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestDeleteQueuedScanCancels(t *testing.T) {
+	e := newTestEnv(t, nil)
+	id := e.createScan(3)
+	rec := e.do("DELETE", "/api/scans/"+id, nil, bearer)
+	if rec.Code != 200 || decode[map[string]string](t, rec)["result"] != "cancelled" {
+		t.Fatalf("削除 = %d %s", rec.Code, rec.Body.String())
+	}
+	got := decode[scanResponse](t, e.do("GET", "/api/scans/"+id, nil, bearer))
+	if got.Status != scan.StatusCancelled {
+		t.Errorf("状態 = %q", got.Status)
+	}
+	// 中止したスキャンの写真は残さない。成果物も配信しない。
+	if dirs := e.scanDirs(); len(dirs) != 0 {
+		t.Errorf("中止後も写真が残っている: %v", dirs)
+	}
+	wantError(t, e.do("GET", "/api/scans/"+id+"/assets/mesh_glb", nil, bearer), http.StatusGone, "asset_unavailable")
+}
+
+// TestStaticAndSPAFallback: Web の配信と、SPA のための index.html へのフォールバック。
+func TestStaticAndSPAFallback(t *testing.T) {
+	e := newTestEnv(t, nil)
+	id, _ := scan.NewID()
+
+	for _, path := range []string{"/", "/scans/" + id, "/scans/" + id + "/view"} {
+		rec := e.do("GET", path, nil)
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), "<title>3D Scanner</title>") {
+			t.Errorf("GET %s = %d %q（index.html のはず）", path, rec.Code, rec.Body.String())
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("GET %s の Cache-Control = %q", path, cc)
+		}
+	}
+
+	js := e.do("GET", "/assets/index-abc123.js", nil)
+	if js.Code != 200 || js.Body.String() != "console.log('app')" || !strings.Contains(js.Header().Get("Cache-Control"), "immutable") {
+		t.Errorf("JS = %d %q cache=%q", js.Code, js.Body.String(), js.Header().Get("Cache-Control"))
+	}
+	// 存在しない JS に index.html を返さない（HTML を JS として読ませない）。
+	if rec := e.do("GET", "/assets/missing.js", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("存在しない JS = %d", rec.Code)
+	}
+	// 存在しない API は JSON の 404（HTML を返さない）。
+	wantError(t, e.do("GET", "/api/nope", nil), http.StatusNotFound, "not_found")
+
+	// Web のディレクトリの外にあるファイルは、どう書いても取れない。
+	os.WriteFile(filepath.Join(filepath.Dir(e.cfg.WebDir), "outside.txt"), []byte("外のファイル"), 0o644)
+	for _, path := range []string{"/../outside.txt", "/assets/../../outside.txt", "/%2e%2e/outside.txt"} {
+		rec := e.do("GET", path, nil)
+		if strings.Contains(rec.Body.String(), "外のファイル") {
+			t.Errorf("GET %s で Web ディレクトリの外が読めた", path)
+		}
+	}
+
+	if rec := e.do("POST", "/", nil); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST / = %d", rec.Code)
+	}
+}
+
+// TestPanicDoesNotKillServer: ハンドラの不具合（パニック）は 500 になるだけで、プロセスは落ちない。
+func TestPanicDoesNotKillServer(t *testing.T) {
+	e := newTestEnv(t, nil)
+	h := e.server.recoverPanics(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("バグ") }))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	wantError(t, rec, http.StatusInternalServerError, "internal")
+}

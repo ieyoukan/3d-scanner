@@ -1,0 +1,23 @@
+# 依存パッケージとビルド結果
+node_modules/
+web/dist/
+server/bin/
+*.tsbuildinfo
+
+# ローカルの作業データ（写真・復元結果）。リポジトリに入れない
+/data/
+/samples/
+*.part
+
+# 秘密情報。.env.example だけをコミットする
+.env
+.env.*
+!.env.example
+*.env
+
+# エディタ・OS・ツールが作るもの
+.DS_Store
+.idea/
+.vscode/
+.playwright-mcp/
+coverage/
