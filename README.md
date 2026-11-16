@@ -254,7 +254,8 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | PostgreSQL 実装 | 契約テストを PostgreSQL 17 に対して実行 | 成功 |
 | Web | `tsc --noEmit`、`vitest run`、`vite build` | 成功（単体テスト 69 件） |
 | Helm | `helm lint`、`helm template`（4 通りの構成）、kubeconform（Kubernetes 1.33、strict） | 成功 |
-| コンテナイメージ | linux/arm64 でビルド | 成功（1.45GB） |
+| コンテナイメージ | linux/arm64 を手元で、linux/amd64 を GitHub Actions でビルド | 成功（約 1.5GB。amd64 は約 20 分） |
+| 公開イメージ（amd64） | `ghcr.io/ieyoukan/3d-scanner:sha-e58f622` を認証なしで取得し、パイプラインを実行（arm64 機上のエミュレーション） | 取得できる。SfM → メッシュ → 3DGS（10 反復）→ SOG がすべて成功 |
 | SfM（実画像） | サンプル 11 枚を COLMAP 4.2.1 で実行 | 11/11 枚の位置を推定、3D 点 8,348 個、再投影誤差 0.63px、約 1 分 |
 | メッシュ（簡易） | `delaunay_mesher`（疎）→ `mesh_texturer` → GLB | 頂点 4,586・面 9,166、3.7MB、約 2 秒 |
 | 3DGS（CPU） | OpenSplat 300 / 700 反復 | 7 分 23 秒 / 10 分 11 秒。PLY 2.0MB |
@@ -276,7 +277,7 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | 密な復元（MVS）によるメッシュ | CUDA 対応の GPU が無い。単体テストでコマンドの順番と引数だけ確認 | CUDA 入りのイメージを作り、`MESH_MODE=dense` で実行する（[docs/learning/03-mvs.md](docs/learning/03-mvs.md)） |
 | GPU での 3DGS 学習 | 同上 | CUDA 版の OpenSplat を入れ、`SPLAT_FORCE_CPU=false` |
 | スマホ実機（Android Chrome）での撮影 | 開発環境から実機に繋いでいない | HTTPS の URL を用意し、実機で撮影から閲覧まで通す |
-| linux/amd64 のイメージ | 手元は arm64。amd64 は GitHub Actions でビルドする | Actions の Image ワークフローの結果を見る |
+| amd64 の実機での所要時間 | amd64 イメージの動作はエミュレーションで確認したが、処理時間は実機と異なる | 配備後に、実際の所要時間を測る |
 | 本番クラスタへの配備 | 実際のクラスタには適用していない。使い捨ての k3s では確認したが、Proxmox CSI のボリューム、Cloudflare の Ingress、SealedSecret の復号は本番でしか確かめられない | home-manifests の Pull Request をマージし、Pod・PVC・Ingress を確認する |
 | Cloudflare Tunnel 経由のアップロード | 未配備 | 80 枚程度を実機から送り、413 / 524 が出ないことを確認する |
 | 20 枚を超える写真での処理時間とメモリ | サンプルは 11 枚 | 枚数を増やして、所要時間とメモリ使用量を測る |
