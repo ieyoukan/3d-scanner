@@ -1,0 +1,135 @@
+# テストとビルドの確認。push と Pull Request のたびに走る。
+#
+# 3つのジョブは互いに独立していて、並列に実行される:
+#   server  Go: 整形の確認、vet、テスト（PostgreSQL を使う契約テストを含む）
+#   web     Vite + React: 型チェック、単体テスト、本番ビルド
+#   chart   Helm: lint、template、Kubernetes のスキーマ検証
+#
+# コンテナイメージのビルドは時間がかかるので image.yml に分けてある。
+#
+# アクションは「タグ」ではなくコミットのハッシュで固定している。
+# タグは後から別のコミットに付け替えられるので、ハッシュで固定すると
+# 「昨日と同じものが動く」ことが保証される（行末のコメントが対応する版）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# このワークフローはリポジトリを読むだけ。書き込み権限は与えない。
+permissions:
+  contents: read
+
+# 同じブランチに続けて push したら、古い方の実行は止める（結果を待つ意味が無いため）。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    name: Go（vet・テスト）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    # テスト用の PostgreSQL。このジョブの間だけ存在し、終わると消える。
+    # Store の契約テスト（internal/store/contract_test.go）を本物の DB に対して流すために使う。
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: scanner
+          # CI の中だけで使う使い捨ての値。本番の資格情報ではない。
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: scanner_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scanner -d scanner_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # go.mod に書いた版を使う（Dockerfile・手元と揃える）。
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: 整形されているか（gofmt）
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt が必要なファイル:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: テスト（競合検出つき）
+        env:
+          TEST_DATABASE_URL: postgres://scanner:ci-only-password@localhost:5432/scanner_test?sslmode=disable
+        # -race: 複数の goroutine が同じ変数を同時に読み書きしていないかを実行時に検出する。
+        run: go test -race -count=1 ./...
+      - name: ビルド
+        run: go build ./...
+
+  web:
+    name: Web（型チェック・テスト・ビルド）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # npm ci は package-lock.json に書かれた版をそのまま入れる（npm install と違い、勝手に更新しない）。
+      - run: npm ci
+      - name: 型チェック
+        run: npm run typecheck
+      - name: 単体テスト
+        run: npm test
+      - name: 本番ビルド
+        run: npm run build
+
+  chart:
+    name: Helm（lint・template・スキーマ検証）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+      - name: helm lint
+        run: helm lint charts/3d-scanner --set auth.existingSecret=dummy --set postgresql.auth.existingSecret=dummy
+      - name: helm template（代表的な3通りの構成）
+        run: |
+          mkdir -p rendered
+          # 1. 自宅クラスタと同じ形: 既存の Secret、Cloudflare の Ingress、Proxmox CSI
+          helm template scanner charts/3d-scanner -n 3d-scanner \
+            --set auth.existingSecret=3d-scanner-secrets \
+            --set postgresql.auth.existingSecret=3d-scanner-secrets \
+            --set ingress.enabled=true --set ingress.className=cloudflare \
+            --set 'ingress.hosts[0].host=scanner.example.com' \
+            --set persistence.storageClass=proxmox-data \
+            --set postgresql.persistence.storageClass=proxmox-data > rendered/home.yaml
+          # 2. 外部の DB を使う
+          helm template scanner charts/3d-scanner \
+            --set auth.existingSecret=s --set postgresql.enabled=false \
+            --set externalDatabase.host=db.example --set externalDatabase.existingSecret=db > rendered/external-db.yaml
+          # 3. GPU を割り当て、作業領域を emptyDir にする
+          helm template scanner charts/3d-scanner \
+            --set auth.existingSecret=s --set postgresql.auth.existingSecret=s \
+            --set gpu.enabled=true --set persistence.enabled=false > rendered/gpu.yaml
+      - name: 秘密の値が未設定なら止まることの確認
+        run: |
+          # 何も指定しないと、アクセストークンが無いので失敗するのが正しい。
+          if helm template scanner charts/3d-scanner > /dev/null 2>&1; then
+            echo "秘密の値が未設定なのに template が成功してしまった"; exit 1
+          fi
+      - name: Kubernetes のスキーマに合っているか（kubeconform）
+        run: |
+          for f in rendered/*.yaml; do
+            docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary -kubernetes-version 1.33.0 - < "$f"
+          done
