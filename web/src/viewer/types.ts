@@ -18,7 +18,7 @@ export function describeViewerError(err: unknown): string {
   if (/webgl|context/i.test(text)) {
     return 'このブラウザでは3D表示（WebGL）を使えません。ファイルをダウンロードして、別のソフトで開いてください。';
   }
-  if (/401|unauthor/i.test(text)) return 'ログインの期限が切れました。ページを読み込み直してください。';
+  if (/401|403|unauthor/i.test(text)) return 'ログインの期限が切れた可能性があります。ページを読み込み直してください。';
   if (/404|410/.test(text)) return 'ファイルが見つかりません。保存期限を過ぎて削除された可能性があります。';
   return '読み込みに失敗しました。通信状況を確認して、もう一度お試しください。';
 }

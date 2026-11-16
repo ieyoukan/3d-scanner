@@ -16,7 +16,6 @@ export type ScanLoad =
   | { kind: 'loading' }
   | { kind: 'ready'; scan: Scan; stale: boolean }
   | { kind: 'not-found' }
-  | { kind: 'unauthorized' }
   | { kind: 'error'; message: string };
 
 export function useScan(id: string) {
@@ -42,10 +41,6 @@ export function useScan(id: string) {
         if (controller.signal.aborted) return;
         if (err instanceof ApiError && err.status === 404) {
           setLoad({ kind: 'not-found' });
-          return;
-        }
-        if (err instanceof ApiError && err.status === 401) {
-          setLoad({ kind: 'unauthorized' });
           return;
         }
         // 一時的な通信エラー。最後の状態があればそれを「古いかもしれない」印つきで出し、再試行を続ける。

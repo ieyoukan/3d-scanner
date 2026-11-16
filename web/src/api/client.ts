@@ -45,7 +45,7 @@ export function toApiError(status: number, body: string): ApiError {
 
 /** サーバーの説明が無いときに出す、ステータスコードごとの文言。 */
 function defaultMessage(status: number): string {
-  if (status === 401) return 'アクセストークンが必要です。';
+  if (status === 401 || status === 403) return 'アクセスが許可されていません。ログインの期限が切れた可能性があります。ページを読み込み直してください。';
   if (status === 413) return 'アップロードが大きすぎます。写真の枚数を減らしてください。';
   if (status === 524 || status === 504) return 'サーバーの応答が間に合いませんでした。少し待ってからお試しください。';
   if (status >= 500) return 'サーバーでエラーが発生しました。少し待ってからお試しください。';
@@ -57,20 +57,9 @@ async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** 画面が最初に読む設定（上限値、認証の要否など）。 */
+/** 画面が最初に読む設定（上限値など）。 */
 export function fetchConfig(signal?: AbortSignal): Promise<ServerConfig> {
   return getJSON<ServerConfig>('/api/config', signal);
-}
-
-/** トークンでログインする。成功するとサーバーが Cookie を発行する。 */
-export async function login(token: string): Promise<void> {
-  await ensureOk(
-    await fetch('/api/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
-    }),
-  );
 }
 
 export function fetchScan(id: string, signal?: AbortSignal): Promise<Scan> {

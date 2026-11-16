@@ -26,25 +26,9 @@ type Config struct {
 	// WebDir はビルド済み Web（index.html 等）の場所。空なら API だけを提供する。
 	WebDir string
 
-	Auth     Auth
 	Limits   Limits
 	Jobs     Jobs
 	Pipeline Pipeline
-}
-
-// Auth は簡易アクセス制限の設定。
-type Auth struct {
-	// AccessToken は共有トークン。これを知っている人だけが /api を使える。
-	AccessToken string
-	// AllowNoAuth は「トークン無しで全員に開放する」ことの明示的な許可。
-	// ローカル開発用。トークンの設定し忘れで本番が無防備になるのを防ぐため、
-	// トークンが空でこれも false なら起動を拒否する（フェイルクローズ）。
-	AllowNoAuth bool
-	// CookieSecure が true ならセッション Cookie に Secure 属性を付ける（HTTPS でのみ送られる）。
-	CookieSecure bool
-	// TrustProxyHeaders が true なら、接続元の判定に CF-Connecting-IP ヘッダを使う。
-	// Cloudflare Tunnel 経由でしか届かない構成のときだけ true にする（直接届く経路があると偽装できる）。
-	TrustProxyHeaders bool
 }
 
 // Limits はアップロードの上限。「無制限に受け付けない」ための値を1か所に集める。
@@ -145,12 +129,6 @@ func Load(getenv func(string) string) (Config, error) {
 		ListenAddr: r.str("LISTEN_ADDR", ":8080"),
 		DataDir:    r.str("DATA_DIR", "/data"),
 		WebDir:     r.str("WEB_DIR", ""),
-		Auth: Auth{
-			AccessToken:       r.str("ACCESS_TOKEN", ""),
-			AllowNoAuth:       r.boolean("ALLOW_NO_AUTH", false),
-			CookieSecure:      r.boolean("COOKIE_SECURE", true),
-			TrustProxyHeaders: r.boolean("TRUST_PROXY_HEADERS", false),
-		},
 		Limits: Limits{
 			MinImages:        r.integer("MIN_IMAGES", 8),
 			MaxImages:        r.integer("MAX_IMAGES", 80),
@@ -253,12 +231,6 @@ func (c Config) validate() []string {
 
 	if c.DatabaseURL == "" {
 		add("DATABASE_URL（または DB_HOST）が未設定です")
-	}
-	if c.Auth.AccessToken == "" && !c.Auth.AllowNoAuth {
-		add("ACCESS_TOKEN が未設定です。誰でも使える状態で起動したい場合だけ ALLOW_NO_AUTH=true を指定してください")
-	}
-	if c.Auth.AccessToken != "" && len(c.Auth.AccessToken) < 16 {
-		add("ACCESS_TOKEN は16文字以上にしてください（短いと総当たりで破られます）")
 	}
 	l := c.Limits
 	if l.MinImages < 3 {
@@ -395,9 +367,4 @@ func (r *reader) duration(key string, def time.Duration) time.Duration {
 // FromOS は実際の環境変数から読む。main から呼ぶ入口。
 func FromOS() (Config, error) {
 	return Load(os.Getenv)
-}
-
-// AuthEnabled はアクセス制限が有効かどうかを返す。
-func (c Config) AuthEnabled() bool {
-	return c.Auth.AccessToken != ""
 }

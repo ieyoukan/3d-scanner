@@ -25,9 +25,6 @@ data:
   DB_NAME: {{ .Values.externalDatabase.database | quote }}
   DB_SSLMODE: {{ .Values.externalDatabase.sslmode | quote }}
   {{- end }}
-  ALLOW_NO_AUTH: {{ .Values.auth.allowNoAuth | quote }}
-  COOKIE_SECURE: {{ .Values.auth.cookieSecure | quote }}
-  TRUST_PROXY_HEADERS: {{ .Values.auth.trustProxyHeaders | quote }}
   RETENTION: {{ .Values.config.retention | quote }}
   {{- with .Values.config.limits }}
   MIN_IMAGES: {{ .minImages | quote }}

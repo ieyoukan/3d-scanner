@@ -1,31 +1,18 @@
 // 「/scans/:id」の画面。処理の進行状況を表示し、終わったらビューアへ案内する。
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { deleteScan } from '../api/client';
-import { isTerminal, type Scan, type ServerConfig } from '../api/types';
+import { isTerminal, type Scan } from '../api/types';
 import { ReconstructionProgress } from '../progress/ReconstructionProgress';
 import { useNow, useScan } from '../progress/useScan';
 import { Button, buttonClass } from '../ui/Button';
 import { AlertIcon, BackIcon, CubeIcon, SpinnerIcon } from '../ui/icons';
 
-interface Props {
-  config: ServerConfig;
-  onUnauthorized: () => void;
-}
-
-export function ScanPage({ onUnauthorized }: Props) {
+export function ScanPage() {
   const { id = '' } = useParams();
   const { load, refresh } = useScan(id);
   const active = load.kind === 'ready' && !isTerminal(load.scan.status);
   const now = useNow(active);
-
-  // 認証切れを親に知らせる。親の state を変える操作なので、描画の最中ではなく
-  // 描画が終わった後（useEffect）に行う。描画中に他の部品の state を変えると React が警告する。
-  const unauthorized = load.kind === 'unauthorized';
-  useEffect(() => {
-    if (unauthorized) onUnauthorized();
-  }, [unauthorized, onUnauthorized]);
-  if (unauthorized) return null;
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-xl flex-col">

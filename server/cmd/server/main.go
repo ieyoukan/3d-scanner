@@ -52,9 +52,6 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if !cfg.AuthEnabled() {
-		log.Warn("ACCESS_TOKEN が未設定です。誰でもアップロードと閲覧ができます（ALLOW_NO_AUTH=true）")
-	}
 
 	// SIGTERM（Kubernetes が Pod を止めるときの合図）か Ctrl+C で ctx が取り消される。
 	// この ctx をすべての goroutine に渡しておくと、合図1つで全体が止まり始める。

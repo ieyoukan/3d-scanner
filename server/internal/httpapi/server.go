@@ -8,8 +8,6 @@
 //	GET    /healthz                       生存確認（依存先を見ない）
 //	GET    /readyz                        準備完了の確認（DB と保存先を見る）
 //	GET    /api/config                    画面が使う設定（上限など）。認証不要
-//	POST   /api/session                   トークンでログイン（Cookie を発行）
-//	DELETE /api/session                   ログアウト
 //	POST   /api/scans                     写真をアップロードして復元ジョブを登録（202 Accepted）
 //	GET    /api/scans/{id}                状態・ステップ・成果物の一覧
 //	GET    /api/scans/{id}/logs?step=sfm  ステップの処理ログ（テキスト）
@@ -53,8 +51,6 @@ type Server struct {
 	log      *slog.Logger
 	now      func() time.Time
 
-	auth    *authenticator
-	limiter *attemptLimiter
 	// uploadSlots は同時に受け付けるアップロードの数を制限する（セマフォ）。
 	// 容量2のチャネルに「席札」を入れられた人だけが進める。席が無ければ 429 で断る。
 	// 同時アップロードの数だけディスクと帯域を使うので、際限なく並行させない。
@@ -69,8 +65,6 @@ func New(cfg config.Config, st store.Store, root *workspace.Root, js *jobs.Servi
 	return &Server{
 		cfg: cfg, store: st, root: root, jobs: js, pipeline: info, log: log,
 		now:         time.Now,
-		auth:        newAuthenticator(cfg.Auth.AccessToken, cfg.Auth.CookieSecure),
-		limiter:     newAttemptLimiter(10, 5*time.Minute),
 		uploadSlots: make(chan struct{}, 2),
 	}
 }
@@ -85,12 +79,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
-	// 認証不要（ログイン前の画面が必要とするもの）。
+	// アプリ自身は認証を持たない。アクセス制限は前段（Cloudflare Access など）で行う。
+	// s.protect は、状態を変えるリクエストが自分のページから来たものかだけを確かめる。
 	mux.HandleFunc("GET /api/config", s.handleConfig)
-	mux.HandleFunc("POST /api/session", s.handleLogin)
-	mux.HandleFunc("DELETE /api/session", s.handleLogout)
 
-	// ここから下は認証が必要。s.protect で包んだものだけが保護される。
 	mux.Handle("POST /api/scans", s.protect(s.handleCreateScan))
 	mux.Handle("GET /api/scans/{id}", s.protect(s.handleGetScan))
 	mux.Handle("GET /api/scans/{id}/logs", s.protect(s.handleGetLogs))
@@ -113,15 +105,10 @@ func (s *Server) Handler() http.Handler {
 	return s.logRequests(s.recoverPanics(securityHeaders(mux)))
 }
 
-// protect は認証と CSRF 対策を通ったリクエストだけを next に渡す。
+// protect は、状態を変えるリクエスト（POST / DELETE）が自分のページから来たものだけを next に渡す。
 func (s *Server) protect(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.auth.authenticated(r) {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "アクセストークンが必要です。")
-			return
-		}
-		// Cookie で認証された「状態を変えるリクエスト」は、自分のページから来たものだけ受け付ける。
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && s.auth.usesCookie(r) && !sameOrigin(r) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !sameOrigin(r) {
 			writeError(w, http.StatusForbidden, "cross_origin", "別のサイトからの操作は受け付けません。")
 			return
 		}

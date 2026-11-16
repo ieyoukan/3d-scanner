@@ -68,12 +68,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// 設定とログイン
+// 設定
 // ---------------------------------------------------------------------------
 
 type configResponse struct {
-	AuthRequired   bool           `json:"authRequired"`
-	Authenticated  bool           `json:"authenticated"`
 	Limits         limitsResponse `json:"limits"`
 	RetentionHours float64        `json:"retentionHours"`
 	Pipeline       PipelineInfo   `json:"pipeline"`
@@ -96,8 +94,6 @@ type limitsResponse struct {
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	l := s.cfg.Limits
 	writeJSON(w, http.StatusOK, configResponse{
-		AuthRequired:  s.auth.enabled,
-		Authenticated: s.auth.authenticated(r),
 		Limits: limitsResponse{
 			MinImages: l.MinImages, MaxImages: l.MaxImages, MaxImageBytes: l.MaxImageBytes,
 			MaxUploadBytes: l.MaxUploadBytes, MaxImagePixels: l.MaxImagePixels, MinImageSide: l.MinImageSide,
@@ -105,44 +101,6 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		RetentionHours: s.cfg.Jobs.Retention.Hours(),
 		Pipeline:       s.pipeline,
 	})
-}
-
-// handleLogin はトークンを確かめ、正しければセッション Cookie を発行する。
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if !sameOrigin(r) {
-		writeError(w, http.StatusForbidden, "cross_origin", "別のサイトからの操作は受け付けません。")
-		return
-	}
-	if !s.auth.enabled {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	key := clientKey(r, s.cfg.Auth.TrustProxyHeaders)
-	if s.limiter.blocked(key) {
-		w.Header().Set("Retry-After", "300")
-		writeError(w, http.StatusTooManyRequests, "too_many_attempts", "試行回数が多すぎます。数分待ってからもう一度お試しください。")
-		return
-	}
-	var body struct {
-		Token string `json:"token"`
-	}
-	// ログインのボディはごく小さいはず。巨大な JSON を読まされないよう上限を付ける。
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "リクエストの形式が正しくありません。")
-		return
-	}
-	if !s.auth.checkToken(body.Token) {
-		s.limiter.fail(key)
-		writeError(w, http.StatusUnauthorized, "invalid_token", "アクセストークンが違います。")
-		return
-	}
-	s.auth.setCookie(w)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	s.auth.clearCookie(w)
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +388,7 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 // handleGetAsset は成果物ファイルを返す。
 //
 // 守っていること:
-//   - 認証（protect）を通ったリクエストだけが来る。
+//   - protect（同一オリジン確認）を通ったリクエストだけが来る。
 //   - {kind} は「知っている種類」の表で検証する。ファイル名を URL から受け取らない。
 //   - 実際のパスは DB の相対パスから求め、作業ディレクトリの外を指していないか確かめる。
 //   - 処理待ち・中止・期限切れのスキャンからは配信しない。

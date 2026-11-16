@@ -61,13 +61,6 @@ spec:
                 name: {{ include "3d-scanner.fullname" . }}
           env:
             # 秘密の値は Secret から直接読む（ConfigMap や values に平文で置かない）。
-            {{- if not .Values.auth.allowNoAuth }}
-            - name: ACCESS_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "3d-scanner.auth.secretName" . }}
-                  key: {{ .Values.auth.existingSecretKey }}
-            {{- end }}
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:

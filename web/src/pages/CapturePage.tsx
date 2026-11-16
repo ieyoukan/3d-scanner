@@ -21,10 +21,9 @@ type Phase = 'capture' | 'review';
 
 interface Props {
   config: ServerConfig;
-  onUnauthorized: () => void;
 }
 
-export function CapturePage({ config, onUnauthorized }: Props) {
+export function CapturePage({ config }: Props) {
   const { limits } = config;
   const navigate = useNavigate();
   const { frames, add, remove, clear } = useFrames(limits.maxImages);
@@ -99,7 +98,6 @@ export function CapturePage({ config, onUnauthorized }: Props) {
                 clear();
                 navigate(`/scans/${result.id}`);
               }}
-              onUnauthorized={onUnauthorized}
             />
           </div>
         </div>

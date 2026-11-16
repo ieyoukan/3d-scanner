@@ -4,7 +4,7 @@
 
 - このアプリを Kubernetes に載せるために、何を・なぜそう設定しているか。
 - PVC と `ReadWriteOnce` の意味。なぜレプリカを 1 に固定しているのか。
-- 秘密の値（トークン、DB パスワード）を Git に平文で置かない方法。
+- 秘密の値（DB パスワード）を Git に平文で置かない方法。
 - GPU の扱い。なぜ既定では使わないのか。
 - Argo CD（GitOps）でどう配備されるか。
 
@@ -109,12 +109,12 @@ StorageClass の `volumeBindingMode: WaitForFirstConsumer` は「Pod の配置�
 
 ### 秘密の値
 
-アクセストークンと DB のパスワードは、Git に平文で置いてはいけない。chart は 2 通りの渡し方を用意している。
+DB のパスワードは、Git に平文で置いてはいけない。chart は 2 通りの渡し方を用意している。
 
 | 方法 | 用途 |
 | --- | --- |
-| `auth.existingSecret` / `postgresql.auth.existingSecret` | 本番。別の手段で作った Secret の名前を指定する |
-| `auth.token` / `postgresql.auth.password` | 手元での検証。`--set` で渡す（values ファイルには書かない） |
+| `postgresql.auth.existingSecret` | 本番。別の手段で作った Secret の名前を指定する |
+| `postgresql.auth.password` | 手元での検証。`--set` で渡す（values ファイルには書かない） |
 
 どちらも指定しないと、`helm template` の時点でエラーになって止まる（`templates/_helpers.tpl` の `3d-scanner.validate`）。
 「秘密が未設定のまま配備され、起動してから気づく」ことを防ぐ。
@@ -128,7 +128,6 @@ chart の中で乱数からパスワードを作る方法は採っていない�
 ```bash
 # home-manifests のルートで（kubeseal と、k3s-1 への SSH が必要）
 cat > 3d-scanner-secrets.env <<EOF
-ACCESS_TOKEN=$(openssl rand -hex 24)
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
 EOF
 ./create-sealed-secret.sh --name 3d-scanner-secrets --namespace 3d-scanner \
@@ -136,7 +135,7 @@ EOF
 rm 3d-scanner-secrets.env     # 平文は残さない（*.env は .gitignore 済み）
 ```
 
-アクセストークンは画面で入力するので、削除する前に控えておく。
+アプリ自体にはログイン機能が無い。公開する URL には Cloudflare Access などの認証を前段に置く（README「公開するときの注意」）。
 
 ### コンテナの権限
 
@@ -275,7 +274,7 @@ kubectl --context k3s-1 -n 3d-scanner get pods,pvc,ingress
 | `CreateContainerConfigError` | 参照している Secret が無い | SealedSecret が同期されているか、名前とキーが合っているか |
 | `Multi-Attach error` | 古い Pod がディスクを掴んだまま、新しい Pod が別ノードで起動しようとした | 更新方式が `Recreate` になっているか。古い Pod が消えるのを待つ |
 | 起動するが書き込めない（permission denied） | `fsGroup` が無い、UID が違う | `podSecurityContext` を確認 |
-| `CrashLoopBackOff` で「ACCESS_TOKEN が未設定」 | Secret のキー名が違う | `auth.existingSecretKey` を確認 |
+| `CrashLoopBackOff` で DB に接続できない | Secret のキー名が違う、パスワードが違う | `postgresql.auth.existingSecretKey` を確認 |
 | `ImagePullBackOff` | イメージが非公開、タグが無い | GHCR のパッケージの公開設定、`image.tag` を確認 |
 | アップロードで 413 | Cloudflare の 100MB 制限 | 写真を減らす。`maxUploadMB` を 95 以下に |
 | ジョブの途中で Pod が再起動する | メモリ上限を超えた（OOM Kill） | `kubectl describe pod` の `Last State: OOMKilled`。上限を上げるか、写真・解像度を減らす |
@@ -301,7 +300,7 @@ docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary \
   -kubernetes-version 1.33.0 - < /tmp/rendered.yaml
 
 # 秘密の値が未設定なら止まること
-helm template scanner charts/3d-scanner     # → 「アクセストークンが未設定です」で失敗するのが正しい
+helm template scanner charts/3d-scanner     # → 「PostgreSQL のパスワードが未設定です」で失敗するのが正しい
 ```
 
 使い捨てのクラスタで確認したこと:

@@ -19,14 +19,9 @@ import { SplatViewer } from '../viewer/SplatViewer';
 import { buildDownloads, buildTabs, defaultTab, type TabKey, type ViewerTab } from '../viewer/tabs';
 import type { ViewerHandle, ViewerState } from '../viewer/types';
 
-export function ViewPage({ onUnauthorized }: { onUnauthorized: () => void }) {
+export function ViewPage() {
   const { id = '' } = useParams();
   const { load } = useScan(id);
-
-  const unauthorized = load.kind === 'unauthorized';
-  useEffect(() => {
-    if (unauthorized) onUnauthorized();
-  }, [unauthorized, onUnauthorized]);
 
   if (load.kind === 'ready') return <Viewer scan={load.scan} />;
 

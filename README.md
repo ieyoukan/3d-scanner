@@ -52,11 +52,11 @@ COLMAP などの外部ツールはコンテナイメージに入っているの�
 ## いちばん簡単な動かし方（Docker Compose）
 
 ```bash
-./scripts/dev-env.sh          # .env を作る（アクセストークンと DB パスワードを乱数で生成）
+./scripts/dev-env.sh          # .env を作る（DB パスワードを乱数で生成）
 docker compose up --build     # 初回は COLMAP と OpenSplat のビルドに 40〜60 分かかる
 ```
 
-`http://localhost:8080` を開き、`.env` の `ACCESS_TOKEN` を入力する。
+`http://localhost:8080` を開く（アプリ自体にログインは無い。ポートは手元の 127.0.0.1 にだけ公開される）。
 8080 番を他のプログラムが使っている場合は、`.env` に `APP_PORT=18080` のように書く。
 
 サンプルの写真で試す:
@@ -88,7 +88,7 @@ TEST_DATABASE_URL='postgres://user:pass@localhost:5432/scanner_test?sslmode=disa
 この場合、復元ジョブは SfM で失敗する。
 
 ```bash
-DATABASE_URL='postgres://...' ALLOW_NO_AUTH=true COOKIE_SECURE=false \
+DATABASE_URL='postgres://...' \
 REQUIRE_TOOLS=false DATA_DIR=./data go run ./cmd/server
 ```
 
@@ -122,10 +122,6 @@ docker run --rm -v "$PWD/samples/sceaux:/work" -e SPLAT_ITERATIONS=300 \
 | 変数 | 既定値 | 内容 |
 | --- | --- | --- |
 | `DATABASE_URL` | – | PostgreSQL の接続文字列。または `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` を個別に指定 |
-| `ACCESS_TOKEN` | – | 共有のアクセストークン（16 文字以上）。未設定だと起動しない |
-| `ALLOW_NO_AUTH` | `false` | `true` でトークン無しの起動を許す（閉じた環境での検証用） |
-| `COOKIE_SECURE` | `true` | セッション Cookie を HTTPS でのみ送る。HTTP で試すときだけ `false` |
-| `TRUST_PROXY_HEADERS` | `false` | 接続元の判定に `CF-Connecting-IP` を使う（Cloudflare 経由でしか届かない構成のみ） |
 | `DATA_DIR` | `/data` | 作業領域（PVC のマウント先） |
 | `WEB_DIR` | – | ビルド済み Web の場所。空なら API のみ |
 | `RETENTION` | `24h` | 保存期間 |
@@ -149,25 +145,24 @@ docker run --rm -v "$PWD/samples/sceaux:/work" -e SPLAT_ITERATIONS=300 \
 
 ```bash
 BASE=http://localhost:8080
-TOKEN=...   # .env の ACCESS_TOKEN
 
 # 写真を送って復元ジョブを登録する（すぐに 202 が返る）
-curl -X POST "$BASE/api/scans" -H "Authorization: Bearer $TOKEN" \
+curl -X POST "$BASE/api/scans" \
   -F images=@photo1.jpg -F images=@photo2.jpg -F images=@photo3.jpg  # 実際は 8 枚以上
 # → {"id":"38b5d76c-...","status":"queued","frameCount":11,"duplicatesSkipped":0,"expiresAt":"..."}
 
 # 状態を確認する（終わるまで数秒おきに繰り返す）
-curl "$BASE/api/scans/$ID" -H "Authorization: Bearer $TOKEN"
+curl "$BASE/api/scans/$ID"
 # → {"status":"running","steps":[{"name":"sfm","status":"succeeded","message":"11枚中11枚の..."}, ...],"assets":[...]}
 
 # 処理ログ
-curl "$BASE/api/scans/$ID/logs?step=sfm" -H "Authorization: Bearer $TOKEN"
+curl "$BASE/api/scans/$ID/logs?step=sfm"
 
 # 成果物（mesh_glb / gaussian_sog / gaussian_ply / sparse_ply / scene_json）
-curl -o mesh.glb "$BASE/api/scans/$ID/assets/mesh_glb" -H "Authorization: Bearer $TOKEN"
+curl -o mesh.glb "$BASE/api/scans/$ID/assets/mesh_glb"
 
 # 中止（処理中）または削除（終了済み）
-curl -X DELETE "$BASE/api/scans/$ID" -H "Authorization: Bearer $TOKEN"
+curl -X DELETE "$BASE/api/scans/$ID"
 ```
 
 エラーは `{"error":{"code":"too_few_images","message":"写真が足りません…"}}` の形で返る。
@@ -198,17 +193,15 @@ main に push すると、GitHub Actions が `ghcr.io/ieyoukan/3d-scanner` に�
 
 ```bash
 # 構文と出力の確認
-helm lint charts/3d-scanner --set auth.existingSecret=x --set postgresql.auth.existingSecret=x
-helm template scanner charts/3d-scanner --set auth.existingSecret=x --set postgresql.auth.existingSecret=x
+helm lint charts/3d-scanner --set postgresql.auth.existingSecret=x
+helm template scanner charts/3d-scanner --set postgresql.auth.existingSecret=x
 
 # 配備の例（秘密の値は先に Secret として作っておく）
 kubectl create namespace 3d-scanner
 kubectl -n 3d-scanner create secret generic 3d-scanner-secrets \
-  --from-literal=ACCESS_TOKEN="$(openssl rand -hex 24)" \
   --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 
 helm install scanner charts/3d-scanner -n 3d-scanner \
-  --set auth.existingSecret=3d-scanner-secrets \
   --set postgresql.auth.existingSecret=3d-scanner-secrets \
   --set persistence.storageClass=proxmox-data \
   --set postgresql.persistence.storageClass=proxmox-data \
@@ -226,7 +219,7 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | `ingress.hosts[].host` / `ingress.className` | 公開するホスト名と IngressClass |
 | `persistence.storageClass` / `persistence.size` | 作業領域の StorageClass と容量 |
 | `postgresql.enabled` / `externalDatabase.*` | 内蔵の PostgreSQL を使うか、既存の DB に繋ぐか |
-| `auth.existingSecret` / `postgresql.auth.existingSecret` | 秘密の値を入れた Secret の名前 |
+| `postgresql.auth.existingSecret` | DB パスワードを入れた Secret の名前 |
 | `config.retention` | 保存期間 |
 | `config.pipeline.*` | メッシュの作り方、3DGS の反復回数など |
 | `gpu.enabled` / `gpu.resourceName` | GPU の割り当て（既定のイメージでは使われない） |
@@ -237,8 +230,9 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 
 ### 公開するときの注意
 
-- アクセストークンは「知っている人なら誰でも使える」共有の鍵。利用者ごとの管理は無い。
-  インターネットに公開する場合は、Cloudflare Access などの認証を前段に重ねることを勧める。
+- **このアプリにはログイン機能が無い。** 公開する URL の前段に Cloudflare Access などの認証を必ず置くこと
+  （置かないと、URL を知っている人は誰でもアップロード・閲覧・削除ができ、CPU とディスクを使われる）。
+  アプリは、別サイトのページから発生した POST / DELETE（CSRF）だけは Origin の確認で断る。
 - 写真には部屋の中や人が写りうる。保存期間を必要以上に長くしない。
 - Cloudflare（Free / Pro）はアップロードを 1 回 100MB で打ち切る。`config.limits.maxUploadMB` は 95 以下にする。
 
@@ -260,7 +254,7 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | メッシュ（簡易） | `delaunay_mesher`（疎）→ `mesh_texturer` → GLB | 頂点 4,586・面 9,166、3.7MB、約 2 秒 |
 | 3DGS（CPU） | OpenSplat 300 / 700 反復 | 7 分 23 秒 / 10 分 11 秒。PLY 2.0MB |
 | SOG | `splat-transform -g cpu` | 2.0MB → 約 110KB、1 秒 |
-| サーバー経由の一連の流れ | Docker Compose で起動し、ブラウザ（スマホ幅）で操作 | ログイン → 写真選択 → 確認・削除 → 送信 → 処理状況 → 3 つのタブで 3D 表示 → 保存 |
+| サーバー経由の一連の流れ | Docker Compose で起動し、ブラウザ（スマホ幅）で操作 | （当時はトークンのログインあり）写真選択 → 確認・削除 → 送信 → 処理状況 → 3 つのタブで 3D 表示 → 保存 |
 | 部分成功 | 3D 点が極端に少ない入力 | メッシュ失敗・3DGS 成功 → `partial`。失敗理由を表示し、タブは無効で残る |
 | SfM の失敗 | 模様の無い単色画像 | `failed`。後段は「実行せず」、成果物なし |
 | キャンセル | SfM 実行中に DELETE | `cancelled`。外部プロセスが止まり、作業領域が削除される |

@@ -1,7 +1,7 @@
-// アプリ全体の入口。3つのことを決める:
-//   1. 最初にサーバーの設定を読む（上限値、認証が必要かどうか）
-//   2. 認証が必要でまだログインしていなければ、トークン入力画面を出す
-//   3. URL に応じて表示する画面を選ぶ（ルーティング）
+// アプリ全体の入口。2つのことを決める:
+//   1. 最初にサーバーの設定を読む（上限値など）
+//   2. URL に応じて表示する画面を選ぶ（ルーティング）
+// アクセス制限はこのアプリでは行わない（前段の Cloudflare Access などに任せる）。
 //
 // 画面は3つ:
 //   /                 撮影・確認・送信
@@ -11,7 +11,6 @@ import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { fetchConfig } from './api/client';
 import type { ServerConfig } from './api/types';
-import { TokenGate } from './auth/TokenGate';
 import { CapturePage } from './pages/CapturePage';
 import { ScanPage } from './pages/ScanPage';
 import { Button, buttonClass } from './ui/Button';
@@ -50,21 +49,13 @@ export function App() {
   }
 
   const { config } = boot;
-  if (config.authRequired && !config.authenticated) {
-    // ログインできたら設定を読み直す（authenticated が true になって本体が表示される）。
-    return <TokenGate onAuthenticated={load} />;
-  }
-
-  // どこかの通信が 401（Cookie の期限切れなど）を返したら、設定を読み直して入力画面に戻す。
-  const onUnauthorized = load;
-
   return (
     <BrowserRouter>
       <Suspense fallback={<FullScreenMessage busy>3Dビューアを読み込んでいます…</FullScreenMessage>}>
         <Routes>
-          <Route path="/" element={<CapturePage config={config} onUnauthorized={onUnauthorized} />} />
-          <Route path="/scans/:id" element={<ScanPage config={config} onUnauthorized={onUnauthorized} />} />
-          <Route path="/scans/:id/view" element={<ViewPage onUnauthorized={onUnauthorized} />} />
+          <Route path="/" element={<CapturePage config={config} />} />
+          <Route path="/scans/:id" element={<ScanPage />} />
+          <Route path="/scans/:id/view" element={<ViewPage />} />
           <Route
             path="*"
             element={

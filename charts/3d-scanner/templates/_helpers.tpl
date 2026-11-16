@@ -46,14 +46,6 @@ app.kubernetes.io/component: postgresql
 {{- include "3d-scanner.fullname" . -}}
 {{- end -}}
 
-{{/*
-アクセストークンを持つ Secret の名前。
-既存の Secret が指定されていればそれ、無ければこの chart が作る Secret。
-*/}}
-{{- define "3d-scanner.auth.secretName" -}}
-{{- .Values.auth.existingSecret | default (include "3d-scanner.secretName" .) -}}
-{{- end -}}
-
 {{/* DB のパスワードを持つ Secret の名前とキー。内蔵 PostgreSQL か外部 DB かで出どころが変わる。 */}}
 {{- define "3d-scanner.database.secretName" -}}
 {{- if .Values.postgresql.enabled -}}
@@ -71,11 +63,10 @@ app.kubernetes.io/component: postgresql
 {{- end -}}
 {{- end -}}
 
-{{/* この chart が Secret を作る必要があるか（値が直接渡されたものが1つでもあれば作る）。 */}}
+{{/* この chart が Secret を作る必要があるか（DB パスワードが値で直接渡されたときだけ作る）。 */}}
 {{- define "3d-scanner.createSecret" -}}
-{{- $token := and (not .Values.auth.existingSecret) .Values.auth.token -}}
 {{- $db := and .Values.postgresql.enabled (not .Values.postgresql.auth.existingSecret) .Values.postgresql.auth.password -}}
-{{- if or $token $db -}}true{{- end -}}
+{{- if $db -}}true{{- end -}}
 {{- end -}}
 
 {{/*
@@ -83,9 +74,6 @@ app.kubernetes.io/component: postgresql
 「秘密の値が未設定のまま配備され、起動してから気づく」ことを防ぐ。
 */}}
 {{- define "3d-scanner.validate" -}}
-{{- if and (not .Values.auth.existingSecret) (not .Values.auth.token) (not .Values.auth.allowNoAuth) -}}
-{{- fail "アクセストークンが未設定です。auth.existingSecret（推奨）か auth.token を指定してください。誰でも使える状態にする場合だけ auth.allowNoAuth=true。" -}}
-{{- end -}}
 {{- if and .Values.postgresql.enabled (not .Values.postgresql.auth.existingSecret) (not .Values.postgresql.auth.password) -}}
 {{- fail "PostgreSQL のパスワードが未設定です。postgresql.auth.existingSecret（推奨）か postgresql.auth.password を指定してください。" -}}
 {{- end -}}

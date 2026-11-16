@@ -102,13 +102,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
       - name: helm lint
-        run: helm lint charts/3d-scanner --set auth.existingSecret=dummy --set postgresql.auth.existingSecret=dummy
+        run: helm lint charts/3d-scanner --set postgresql.auth.existingSecret=dummy
       - name: helm template（代表的な3通りの構成）
         run: |
           mkdir -p rendered
           # 1. 自宅クラスタと同じ形: 既存の Secret、Cloudflare の Ingress、Proxmox CSI
           helm template scanner charts/3d-scanner -n 3d-scanner \
-            --set auth.existingSecret=3d-scanner-secrets \
             --set postgresql.auth.existingSecret=3d-scanner-secrets \
             --set ingress.enabled=true --set ingress.className=cloudflare \
             --set 'ingress.hosts[0].host=scanner.example.com' \
@@ -116,15 +115,15 @@ jobs:
             --set postgresql.persistence.storageClass=proxmox-data > rendered/home.yaml
           # 2. 外部の DB を使う
           helm template scanner charts/3d-scanner \
-            --set auth.existingSecret=s --set postgresql.enabled=false \
+            --set postgresql.enabled=false \
             --set externalDatabase.host=db.example --set externalDatabase.existingSecret=db > rendered/external-db.yaml
           # 3. GPU を割り当て、作業領域を emptyDir にする
           helm template scanner charts/3d-scanner \
-            --set auth.existingSecret=s --set postgresql.auth.existingSecret=s \
+            --set postgresql.auth.existingSecret=s \
             --set gpu.enabled=true --set persistence.enabled=false > rendered/gpu.yaml
       - name: 秘密の値が未設定なら止まることの確認
         run: |
-          # 何も指定しないと、アクセストークンが無いので失敗するのが正しい。
+          # 何も指定しないと、DB パスワードが無いので失敗するのが正しい。
           if helm template scanner charts/3d-scanner > /dev/null 2>&1; then
             echo "秘密の値が未設定なのに template が成功してしまった"; exit 1
           fi

@@ -7,7 +7,6 @@
 //                     ├──失敗──▶ idle（エラーを表示。写真はそのまま残るので再送できる）
 //                     └──中止──▶ idle
 import { useEffect, useRef, useState } from 'react';
-import { ApiError } from '../api/client';
 import type { CreateScanResult, Limits, PipelineInfo } from '../api/types';
 import type { Frame } from '../capture/frames';
 import { formatBytes, type Check } from '../capture/validation';
@@ -23,11 +22,9 @@ interface Props {
   pipeline: PipelineInfo;
   /** サーバーが受け付けたら呼ばれる。 */
   onCreated: (result: CreateScanResult) => void;
-  /** 認証が切れていた（401）ときに呼ばれる。 */
-  onUnauthorized: () => void;
 }
 
-export function UploadPanel({ frames, check, limits, retentionHours, pipeline, onCreated, onUnauthorized }: Props) {
+export function UploadPanel({ frames, check, limits, retentionHours, pipeline, onCreated }: Props) {
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const handle = useRef<UploadHandle | null>(null);
@@ -46,10 +43,6 @@ export function UploadPanel({ frames, check, limits, retentionHours, pipeline, o
     } catch (err) {
       setProgress(null);
       if (err instanceof DOMException && err.name === 'AbortError') return; // 自分で中止した
-      if (err instanceof ApiError && err.status === 401) {
-        onUnauthorized();
-        return;
-      }
       setError(err instanceof Error ? err.message : 'アップロードに失敗しました。');
     } finally {
       handle.current = null;

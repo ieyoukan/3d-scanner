@@ -16,7 +16,6 @@ func env(m map[string]string) func(string) string {
 func minimal(extra map[string]string) map[string]string {
 	m := map[string]string{
 		"DATABASE_URL": "postgres://scanner:pw@localhost:5432/scanner?sslmode=disable",
-		"ACCESS_TOKEN": "0123456789abcdef0123",
 	}
 	for k, v := range extra {
 		m[k] = v
@@ -44,37 +43,16 @@ func TestLoadDefaults(t *testing.T) {
 	if p.ColmapUseGPU || !p.SplatForceCPU || p.MeshMode != MeshModeAuto || !p.RequireTools {
 		t.Errorf("Pipeline = %+v", p)
 	}
-	if !cfg.Auth.CookieSecure || cfg.Auth.TrustProxyHeaders || !cfg.AuthEnabled() {
-		t.Errorf("Auth = %+v", cfg.Auth)
-	}
-}
-
-// TestLoadFailsClosedWithoutToken: トークンの設定し忘れは、無防備な起動ではなく起動失敗になる。
-func TestLoadFailsClosedWithoutToken(t *testing.T) {
-	_, err := Load(env(map[string]string{"DATABASE_URL": "postgres://x/y"}))
-	if err == nil || !strings.Contains(err.Error(), "ACCESS_TOKEN") {
-		t.Fatalf("err = %v", err)
-	}
-	// 明示的に許可したときだけ、トークン無しで起動できる。
-	cfg, err := Load(env(map[string]string{"DATABASE_URL": "postgres://x/y", "ALLOW_NO_AUTH": "true"}))
-	if err != nil || cfg.AuthEnabled() {
-		t.Fatalf("ALLOW_NO_AUTH=true: cfg.AuthEnabled=%v err=%v", cfg.AuthEnabled(), err)
-	}
-	// 短すぎるトークンは受け付けない。
-	if _, err := Load(env(minimal(map[string]string{"ACCESS_TOKEN": "short"}))); err == nil {
-		t.Fatal("短いトークンで起動できてしまった")
-	}
 }
 
 // TestDatabaseURLFromParts: パスワードに URL の区切り文字が入っていても、正しい接続文字列になる。
 func TestDatabaseURLFromParts(t *testing.T) {
 	password := "p@ss:w/rd?#&=%"
 	cfg, err := Load(env(map[string]string{
-		"ACCESS_TOKEN": "0123456789abcdef0123",
-		"DB_HOST":      "scanner-postgresql",
-		"DB_USER":      "scanner",
-		"DB_PASSWORD":  password,
-		"DB_NAME":      "scanner",
+		"DB_HOST":     "scanner-postgresql",
+		"DB_USER":     "scanner",
+		"DB_PASSWORD": password,
+		"DB_NAME":     "scanner",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -100,18 +78,16 @@ func TestDatabaseURLFromParts(t *testing.T) {
 // TestLoadReportsAllProblemsAtOnce: 問題は1つずつではなく、まとめて報告する。
 func TestLoadReportsAllProblemsAtOnce(t *testing.T) {
 	_, err := Load(env(map[string]string{
-		"ACCESS_TOKEN":     "0123456789abcdef0123",
 		"MIN_IMAGES":       "十枚",   // 数値でない
 		"MAX_IMAGES":       "2",    // MIN_IMAGES（既定 8）より小さい
 		"RETENTION":        "1day", // Go の時間表記でない
 		"MESH_MODE":        "fancy",
 		"SPLAT_ITERATIONS": "0",
-		"COOKIE_SECURE":    "maybe",
 	}))
 	if err == nil {
 		t.Fatal("不正な設定でエラーにならない")
 	}
-	for _, want := range []string{"DATABASE_URL", "MIN_IMAGES", "MAX_IMAGES", "RETENTION", "MESH_MODE", "SPLAT_ITERATIONS", "COOKIE_SECURE"} {
+	for _, want := range []string{"DATABASE_URL", "MIN_IMAGES", "MAX_IMAGES", "RETENTION", "MESH_MODE", "SPLAT_ITERATIONS"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("エラーに %s の指摘が無い:\n%v", want, err)
 		}
@@ -121,7 +97,7 @@ func TestLoadReportsAllProblemsAtOnce(t *testing.T) {
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := Load(env(minimal(map[string]string{
 		"MAX_UPLOAD_MB": "50", "RETENTION": "48h", "MESH_MODE": "sparse", "NUM_THREADS": "4",
-		"SPLAT_ITERATIONS": "500", "SPLAT_DOWNSCALE": "4", "ENABLE_SPLAT": "false", "TRUST_PROXY_HEADERS": "true",
+		"SPLAT_ITERATIONS": "500", "SPLAT_DOWNSCALE": "4", "ENABLE_SPLAT": "false",
 	})))
 	if err != nil {
 		t.Fatal(err)
@@ -132,9 +108,6 @@ func TestLoadOverrides(t *testing.T) {
 	p := cfg.Pipeline
 	if p.MeshMode != MeshModeSparse || p.NumThreads != 4 || p.SplatIterations != 500 || p.SplatDownscale != 4 || p.EnableSplat {
 		t.Errorf("Pipeline = %+v", p)
-	}
-	if !cfg.Auth.TrustProxyHeaders {
-		t.Error("TRUST_PROXY_HEADERS が効いていない")
 	}
 }
 

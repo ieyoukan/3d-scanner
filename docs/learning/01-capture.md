@@ -199,10 +199,10 @@ cd web && npm test
 # サーバー側の検証（偽装・巨大画像・重複など）の単体テスト
 cd server && go test ./internal/upload/ ./internal/httpapi/
 
-# API を直接叩く（docker compose で起動済み、トークンは .env の ACCESS_TOKEN）
+# API を直接叩く（docker compose で起動済み）
 ./scripts/fetch-sample.sh
 args=(); for f in samples/sceaux/images/*.JPG; do args+=(-F "images=@$f"); done
-curl -s -X POST http://localhost:8080/api/scans -H "Authorization: Bearer $ACCESS_TOKEN" "${args[@]}"
+curl -s -X POST http://localhost:8080/api/scans "${args[@]}"
 ```
 
 この開発時点で確かめたこと・確かめていないこと:

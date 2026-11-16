@@ -254,7 +254,7 @@ TEST_DATABASE_URL='postgres://user:pass@localhost:5432/scanner_test?sslmode=disa
 
 ```bash
 # キャンセル: 投入してすぐ DELETE し、プロセスとディレクトリが消えることを見る
-curl -X DELETE "$BASE/api/scans/$ID" -H "Authorization: Bearer $TOKEN"
+curl -X DELETE "$BASE/api/scans/$ID"
 docker compose exec app sh -c 'ls /data/scans'
 
 # 回復: 処理中に再起動し、ログに「中断されていたジョブをやり直します」が出ることを見る

@@ -94,8 +94,6 @@ export interface PipelineInfo {
 }
 
 export interface ServerConfig {
-  authRequired: boolean;
-  authenticated: boolean;
   limits: Limits;
   retentionHours: number;
   pipeline: PipelineInfo;

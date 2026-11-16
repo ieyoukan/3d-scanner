@@ -18,7 +18,7 @@
 - COLMAP による SfM、メッシュ化、テクスチャ生成。gltfpack による GLB 化。
 - OpenSplat による 3D Gaussian Splatting。SplatTransform による SOG 化。
 - PostgreSQL でジョブの状態を管理し、写真と成果物は PVC に保存。保存期限で自動削除。
-- 共有トークンによる簡易アクセス制限。
+- アクセス制限はアプリに持たせず、前段の Cloudflare Access に任せる（同一オリジン確認だけ行う）。
 - Dockerfile、docker compose、Helm chart、GitHub Actions。
 
 ### MVP で実装していないもの
@@ -145,8 +145,7 @@ API とワーカーを同じ Pod・同じプロセスにしているのは、作
 | --- | --- |
 | `GET /healthz` | 生存確認（依存先を見ない） |
 | `GET /readyz` | DB と保存先を確認 |
-| `GET /api/config` | 上限値、認証の要否、サーバーの構成。認証不要 |
-| `POST /api/session` / `DELETE /api/session` | トークンでログイン（Cookie を発行）／ログアウト |
+| `GET /api/config` | 上限値、サーバーの構成 |
 | `POST /api/scans` | `multipart/form-data`（`images` 複数＋任意の `metadata`）。`202 Accepted` |
 | `GET /api/scans/{id}` | 状態、ステップ、成果物、待ち順 |
 | `GET /api/scans/{id}/logs?step=sfm` | ステップの処理ログ（末尾 256KB） |
@@ -180,13 +179,11 @@ API とワーカーを同じ Pod・同じプロセスにしているのは、作
 
 ### アクセス制限
 
-- 共有トークン（環境変数 `ACCESS_TOKEN`）。未設定なら起動を拒否する
-  （`ALLOW_NO_AUTH=true` を明示したときだけ無しで起動）。
-- ブラウザは `POST /api/session` で HttpOnly・SameSite=Strict の Cookie を受け取る。
-  Cookie の値はトークンから HMAC で導いた別の値。curl などは `Authorization: Bearer`。
-- Cookie で認証された POST / DELETE は `Origin` を検査する（同じドメインの別サブドメインからの CSRF 対策）。
-- ログインの失敗回数を接続元ごとに制限する。
-- インターネットに公開する場合は Cloudflare Access などを前段に重ねることを勧める。
+- アプリ自体にログインは無い（以前は共有トークン方式だったが、Cloudflare Access を前段に置く方針に変えて取り除いた）。
+  公開する URL には必ず Access などの認証を置く。
+- 状態を変える POST / DELETE は `Origin` を検査する。前段の認証 Cookie は別サイトのページが出したリクエストにも
+  付き得るので、同じドメインの別サブドメインからの CSRF を断つために残している。
+- アップロードの同時実行数、待ち行列の件数、ディスクの空きの確認で、使われすぎを防ぐ。
 
 ## 6. 復元パイプライン
 
@@ -258,7 +255,7 @@ Helm chart の要点（詳細は `charts/3d-scanner/values.yaml` のコメント
 | 項目 | 初版の案 | 実装 | 理由 |
 | --- | --- | --- | --- |
 | Helm chart の場所 | `home-manifests/apps/3d-scanner/` | アプリのリポジトリの `charts/3d-scanner/` | 実装指示（アプリに chart を置き、home-manifests からは GitHub 経由で参照）に従った。既存の他アプリとも同じ形 |
-| Pod の構成 | `web` と `api` を別の Deployment | 1 つの Deployment（Go が Web も配る） | 同一オリジンになり Cookie 認証と CSP が単純になる。Pod が 1 つで済む |
+| Pod の構成 | `web` と `api` を別の Deployment | 1 つの Deployment（Go が Web も配る） | 同一オリジンになり CSRF 対策と CSP が単純になる。Pod が 1 つで済む |
 | メッシュ（GPU なし） | 記載なし（MVS 前提） | `delaunay_mesher --input_type sparse` による簡易メッシュ | クラスタに GPU が無く、`patch_match_stereo` を実行できないため。粗いが CPU で数秒 |
 | `mesh_texturer` の出力 | OBJ + MTL + テクスチャを想定 | 面ごとの UV を持つ PLY + PNG | COLMAP 4.2.1 のソースで確認。Go で OBJ に変換してから gltfpack に渡す |
 | 作業領域の構成 | `colmap/database.db`、`colmap/sparse/` | 直下に `database.db`、`sparse/0/` | OpenSplat がプロジェクトルート直下の `images/` と `sparse/0/` を読むため |
