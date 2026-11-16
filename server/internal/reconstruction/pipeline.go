@@ -241,6 +241,12 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 	}
 	args = p.withThreads(args, "--Mapper.num_threads")
 	if err := p.colmap(ctx, logPath, p.cfg.SfMTimeout, args...); err != nil {
+		// 写真どうしがつながらないと、mapper は「モデルを1つも作れなかった」と出力して
+		// 終了コード 1 で終わる（COLMAP 4.2.1 で確認）。最もよくある失敗なので、
+		// 「終了コード 1」ではなく、撮り直し方の分かる説明に置き換える。
+		if noSparseModel(err) {
+			return "", friendly(noModelMessage)
+		}
 		return "", err
 	}
 
@@ -277,6 +283,21 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		msg += "位置を推定できなかった写真は、以降の処理では使われません。"
 	}
 	return msg, nil
+}
+
+// noModelMessage は、SfM がモデルを1つも作れなかったときの説明。
+const noModelMessage = "写真どうしの対応が見つからず、カメラの位置を推定できませんでした。" +
+	"隣り合う写真が7割ほど重なるように、対象のまわりを少しずつ移動しながら撮り直してください。" +
+	"無地の壁や光沢のある面、ぶれた写真は対応が取りにくくなります。"
+
+// noSparseModel は、mapper の失敗が「モデルを作れなかった」ことによるものかを返す。
+func noSparseModel(err error) bool {
+	var exitErr *cmdrun.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	return strings.Contains(exitErr.StderrTail, "Failed to create any sparse model") ||
+		strings.Contains(exitErr.StderrTail, "No images with matches")
 }
 
 // minRegisteredImages は SfM を成功とみなす最小の登録枚数。
@@ -322,9 +343,7 @@ func (p *Pipeline) selectBestModel(ctx context.Context, ws *workspace.Scan, logP
 	}
 
 	if best == nil {
-		return nil, friendly("写真どうしの対応が見つからず、カメラの位置を推定できませんでした。" +
-			"隣り合う写真が7割ほど重なるように、対象のまわりを少しずつ移動しながら撮り直してください。" +
-			"無地の壁や光沢のある面は対応が取りにくい被写体です。")
+		return nil, friendly(noModelMessage)
 	}
 	if best.RegisteredImages < minRegisteredImages {
 		return nil, friendly(fmt.Sprintf("%d枚中%d枚しかカメラの位置を推定できませんでした。"+
@@ -748,7 +767,11 @@ func userMessage(err error) string {
 	}
 	var exitErr *cmdrun.ExitError
 	if errors.As(err, &exitErr) {
-		msg := fmt.Sprintf("%s がエラーで終了しました（終了コード %d）。", filepath.Base(exitErr.Command), exitErr.ExitCode)
+		tool := filepath.Base(exitErr.Command)
+		msg := fmt.Sprintf("%s がエラーで終了しました（終了コード %d）。", tool, exitErr.ExitCode)
+		if exitErr.Signal != "" {
+			msg = fmt.Sprintf("%s が異常終了しました（%s）。", tool, exitErr.Signal)
+		}
 		if hint := exitHint(exitErr); hint != "" {
 			msg += hint
 		} else {
@@ -760,16 +783,24 @@ func userMessage(err error) string {
 }
 
 // exitHint は、よくある失敗に対して原因の見当を付ける一言を返す。
+//
+// 止まり方（終了コードとシグナル）と、標準エラー出力の文言を手掛かりにする。
+// 確実に分かるわけではないので「可能性があります」と書き、決めつけない。
 func exitHint(e *cmdrun.ExitError) string {
 	tail := strings.ToLower(e.StderrTail)
 	switch {
-	// 終了コード 137 = 128 + 9（SIGKILL）。コンテナではメモリ上限超過（OOM Kill）が典型。
-	case e.ExitCode == 137 || e.ExitCode == -1 || strings.Contains(tail, "out of memory") || strings.Contains(tail, "bad_alloc"):
-		return "メモリ不足の可能性があります。写真の枚数か解像度を減らしてください。"
-	case strings.Contains(tail, "requires cuda") || strings.Contains(tail, "cuda"):
-		return "この処理には NVIDIA GPU（CUDA）が必要ですが、サーバーにありません。"
 	case strings.Contains(tail, "no space left"):
 		return "サーバーのディスクが一杯です。"
+	case strings.Contains(tail, "requires cuda") || strings.Contains(tail, "cuda"):
+		return "この処理には NVIDIA GPU（CUDA）が必要ですが、サーバーにありません。"
+	// SIGKILL は外からの強制終了。コンテナではメモリ上限の超過（OOM Kill）が典型。
+	// 終了コード 137 は 128 + 9（SIGKILL）で、シェル経由で同じことが起きたときの値。
+	case e.Signal == "SIGKILL" || e.ExitCode == 137 || strings.Contains(tail, "out of memory") || strings.Contains(tail, "bad_alloc"):
+		return "メモリ不足の可能性があります。写真の枚数か解像度を減らしてください。"
+	// SIGABRT / SIGSEGV はツール自身の異常終了。入力が乏しい（点や写真が少なすぎる）ときに起きやすい。
+	case e.Signal != "":
+		return "ツールが処理を続けられませんでした。位置を推定できた写真や3D点が少なすぎる可能性があります。" +
+			"写真の重なりを増やして撮り直すと改善することがあります。"
 	}
 	return ""
 }

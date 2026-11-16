@@ -64,16 +64,25 @@ type Runner interface {
 // ErrTimeout はコマンドが制限時間内に終わらなかったことを表す。
 var ErrTimeout = errors.New("制限時間内に終わりませんでした")
 
-// ExitError はコマンドが 0 以外の終了コードで終わったことを表す。
+// ExitError はコマンドが正常に終わらなかったことを表す。
 type ExitError struct {
-	Command  string
+	Command string
+	// ExitCode は終了コード。シグナルで止められた場合は -1。
 	ExitCode int
+	// Signal はプロセスを止めたシグナルの名前（"SIGKILL" など）。自分で終了した場合は空。
+	// 止まり方で原因の見当が変わる:
+	//   SIGKILL          外から強制終了された。コンテナではメモリ上限超過（OOM Kill）が典型。
+	//   SIGABRT/SIGSEGV  プログラム自身の異常終了（想定外の入力、内部エラー）。
+	Signal string
 	// StderrTail は標準エラー出力の末尾。原因はたいていここに書かれている。
 	StderrTail string
 }
 
 func (e *ExitError) Error() string {
 	msg := fmt.Sprintf("%s が終了コード %d で失敗しました", e.Command, e.ExitCode)
+	if e.Signal != "" {
+		msg = fmt.Sprintf("%s がシグナル %s で異常終了しました", e.Command, e.Signal)
+	}
 	if e.StderrTail != "" {
 		msg += ": " + lastLine(e.StderrTail)
 	}
@@ -90,7 +99,9 @@ type Exec struct {
 
 // NewExec は既定値つきの Exec を返す。
 func NewExec() *Exec {
-	return &Exec{TailBytes: 8 * 1024, KillDelay: 10 * time.Second}
+	// 猶予は 5 秒。実機で試すと COLMAP は SIGTERM では止まらず、猶予が切れてから強制終了されていた。
+	// これらのツールは終了時の片付けを必要としないので、長く待つ意味がない。
+	return &Exec{TailBytes: 8 * 1024, KillDelay: 5 * time.Second}
 }
 
 // Run は Runner の実装。
@@ -143,6 +154,13 @@ func (e *Exec) Run(ctx context.Context, cmd Command) (Result, error) {
 	start := time.Now()
 	runErr := c.Run()
 	dur := time.Since(start)
+	if runCtx.Err() != nil {
+		// 取り消し・時間切れで止めた場合の最後の掃除。
+		// 猶予が切れたとき Go が強制終了するのは直接の子プロセスだけなので、
+		// SIGTERM を無視した孫プロセスが残りうる。グループ全体に SIGKILL を送って確実に止める。
+		// （既に誰も居なければ何も起きない）
+		killGroup(c)
+	}
 
 	res := Result{Duration: dur, OutputTail: outTail.String()}
 	if logFile != nil {
@@ -163,7 +181,12 @@ func (e *Exec) Run(ctx context.Context, cmd Command) (Result, error) {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
-		return res, &ExitError{Command: cmd.Name, ExitCode: exitErr.ExitCode(), StderrTail: errTail.String()}
+		return res, &ExitError{
+			Command:    cmd.Name,
+			ExitCode:   exitErr.ExitCode(),
+			Signal:     signalName(exitErr),
+			StderrTail: errTail.String(),
+		}
 	}
 	// ここに来るのは「起動自体ができなかった」場合（実行ファイルが無い、権限が無いなど）。
 	return res, fmt.Errorf("%s を起動できません: %w", cmd.Name, runErr)

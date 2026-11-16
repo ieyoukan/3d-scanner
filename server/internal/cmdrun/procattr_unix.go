@@ -21,3 +21,33 @@ func terminate(c *exec.Cmd) error {
 	}
 	return syscall.Kill(-c.Process.Pid, syscall.SIGTERM)
 }
+
+// killGroup はプロセスグループ全体を強制終了する（SIGKILL は無視できない）。
+func killGroup(c *exec.Cmd) {
+	if c.Process != nil {
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+// signalNames は、原因の見当を付けるのに使う主なシグナルの名前。
+var signalNames = map[syscall.Signal]string{
+	syscall.SIGKILL: "SIGKILL",
+	syscall.SIGTERM: "SIGTERM",
+	syscall.SIGABRT: "SIGABRT",
+	syscall.SIGSEGV: "SIGSEGV",
+	syscall.SIGBUS:  "SIGBUS",
+	syscall.SIGFPE:  "SIGFPE",
+	syscall.SIGILL:  "SIGILL",
+}
+
+// signalName は、プロセスがシグナルで終了していればその名前を返す。そうでなければ空文字。
+func signalName(err *exec.ExitError) string {
+	status, ok := err.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return ""
+	}
+	if name, ok := signalNames[status.Signal()]; ok {
+		return name
+	}
+	return status.Signal().String()
+}

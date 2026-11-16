@@ -470,6 +470,31 @@ func TestRunSfMWithoutModel(t *testing.T) {
 	}
 }
 
+// TestRunSfMMapperReportsNoModel: COLMAP 4.2.1 の mapper は、写真がつながらないとき
+// 「Failed to create any sparse model」と出して終了コード 1 で終わる（実機で確認した挙動）。
+// 利用者には「終了コード 1」ではなく、撮り直し方の分かる説明を出す。
+func TestRunSfMMapperReportsNoModel(t *testing.T) {
+	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
+	run.fail["colmap mapper"] = &cmdrun.ExitError{
+		Command: "colmap", ExitCode: 1,
+		StderrTail: "W incremental_pipeline.cc:390] No images with matches\nE sfm.cc:310] Failed to create any sparse model\n",
+	}
+	p := New(testPipelineConfig(), run, Capabilities{}, nil)
+	p.Run(context.Background(), job, rep)
+
+	msg := rep.messages[scan.StepSfM]
+	if rep.finished[scan.StepSfM] != scan.StepFailed || !strings.Contains(msg, "重なる") || strings.Contains(msg, "終了コード") {
+		t.Fatalf("SfM = %q / %q", rep.finished[scan.StepSfM], msg)
+	}
+	// それ以外の理由での失敗は、そのまま伝える（原因を取り違えない）。
+	run2, rep2, job2 := newFakeRunner(), newFakeReporter(), newJob(t)
+	run2.fail["colmap mapper"] = &cmdrun.ExitError{Command: "colmap", ExitCode: 1, StderrTail: "database is locked"}
+	New(testPipelineConfig(), run2, Capabilities{}, nil).Run(context.Background(), job2, rep2)
+	if msg := rep2.messages[scan.StepSfM]; !strings.Contains(msg, "終了コード 1") {
+		t.Fatalf("別の原因の失敗 = %q", msg)
+	}
+}
+
 func TestRunSfMTooFewRegisteredImages(t *testing.T) {
 	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
 	run.registered = 2
@@ -711,6 +736,10 @@ func TestUserMessage(t *testing.T) {
 		{friendly("写真が足りません"), "写真が足りません"},
 		{fmt.Errorf("opensplat（制限 6h）: %w", cmdrun.ErrTimeout), "制限時間内"},
 		{&cmdrun.ExitError{Command: "/usr/local/bin/opensplat", ExitCode: 137}, "メモリ不足"},
+		{&cmdrun.ExitError{Command: "opensplat", ExitCode: -1, Signal: "SIGKILL"}, "メモリ不足"},
+		// 実機で観測した例: 3D点が 53 個しか無い入力で colmap が SIGABRT で落ちた。メモリ不足とは言わない。
+		{&cmdrun.ExitError{Command: "colmap", ExitCode: -1, Signal: "SIGABRT", StderrTail: "*** SIGABRT received"}, "少なすぎる"},
+		{&cmdrun.ExitError{Command: "colmap", ExitCode: -1, Signal: "SIGSEGV"}, "SIGSEGV"},
 		{&cmdrun.ExitError{Command: "colmap", ExitCode: 1, StderrTail: "Dense stereo reconstruction requires CUDA, which is not available"}, "CUDA"},
 		{&cmdrun.ExitError{Command: "colmap", ExitCode: 1, StderrTail: "write failed: No space left on device"}, "ディスク"},
 		{&cmdrun.ExitError{Command: "colmap", ExitCode: 3, StderrTail: "something else"}, "終了コード 3"},
@@ -719,5 +748,9 @@ func TestUserMessage(t *testing.T) {
 		if got := userMessage(c.err); !strings.Contains(got, c.want) {
 			t.Errorf("userMessage(%v) = %q, want %q を含む", c.err, got, c.want)
 		}
+	}
+	// クラッシュ（SIGABRT）をメモリ不足と説明しない。
+	if got := userMessage(&cmdrun.ExitError{Command: "colmap", ExitCode: -1, Signal: "SIGABRT"}); strings.Contains(got, "メモリ") {
+		t.Errorf("SIGABRT をメモリ不足と説明している: %q", got)
 	}
 }

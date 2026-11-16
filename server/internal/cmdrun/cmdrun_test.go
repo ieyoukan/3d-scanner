@@ -40,15 +40,22 @@ func helper(mode string) {
 		fmt.Fprintln(os.Stderr, "1行目の警告")
 		fmt.Fprintln(os.Stderr, "ERROR: 画像が足りません")
 		os.Exit(3)
+	case "killed": // 外から SIGKILL された状況（メモリ上限超過と同じ止まり方）
+		syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		time.Sleep(time.Second)
 	case "sleep": // 止められるまで待つ
 		time.Sleep(60 * time.Second)
 	case "ignore-term": // SIGTERM を無視する行儀の悪いプロセス
 		signal.Ignore(syscall.SIGTERM)
 		fmt.Println("ready")
 		time.Sleep(60 * time.Second)
-	case "spawn": // 孫プロセスを起動して PID を出力し、待つ
+	case "spawn", "spawn-stubborn": // 孫プロセスを起動して PID を出力し、待つ
 		child := exec.Command(os.Args[0])
-		child.Env = append(os.Environ(), "CMDRUN_HELPER=sleep")
+		childMode := "sleep"
+		if mode == "spawn-stubborn" {
+			childMode = "ignore-term" // SIGTERM を無視する孫プロセス
+		}
+		child.Env = append(os.Environ(), "CMDRUN_HELPER="+childMode)
 		if err := child.Start(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -150,6 +157,30 @@ func TestRunExitErrorHasCodeAndStderr(t *testing.T) {
 	}
 }
 
+// TestRunReportsSignal: シグナルで止まったプロセスは、その種類が分かる形で報告される。
+// 「メモリ不足で強制終了された」のか「プログラム自身が異常終了した」のかで、利用者への説明が変わる。
+func TestRunReportsSignal(t *testing.T) {
+	// Go のランタイムは SIGABRT を受けるとスタックを出力して終了コード 2 で終わることがあるため、
+	// ここでは「外から止められた」SIGKILL で確かめる（SIGKILL は捕捉できないので必ずシグナル終了になる）。
+	_, err := NewExec().Run(context.Background(), helperCommand(t, "killed"))
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("err = %v, want *ExitError", err)
+	}
+	if exitErr.Signal != "SIGKILL" || exitErr.ExitCode != -1 {
+		t.Errorf("Signal = %q, ExitCode = %d, want SIGKILL / -1", exitErr.Signal, exitErr.ExitCode)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "SIGKILL") {
+		t.Errorf("エラー文にシグナル名が無い: %q", msg)
+	}
+
+	// 自分で終了コードを返した場合は、シグナルは空。
+	_, err = NewExec().Run(context.Background(), helperCommand(t, "fail"))
+	if errors.As(err, &exitErr) && exitErr.Signal != "" {
+		t.Errorf("通常の失敗なのに Signal = %q", exitErr.Signal)
+	}
+}
+
 func TestRunTimeout(t *testing.T) {
 	cmd := helperCommand(t, "sleep")
 	cmd.Timeout = 200 * time.Millisecond
@@ -202,14 +233,23 @@ func TestRunKillsProcessThatIgnoresSIGTERM(t *testing.T) {
 }
 
 // TestRunCancelStopsGrandchild: 取り消すと、CLI が内部で起動した孫プロセスも一緒に止まる。
+// 孫が SIGTERM を無視する場合でも、最後のグループごとの強制終了で止まる。
 func TestRunCancelStopsGrandchild(t *testing.T) {
+	for _, mode := range []string{"spawn", "spawn-stubborn"} {
+		t.Run(mode, func(t *testing.T) { cancelAndExpectGrandchildGone(t, mode) })
+	}
+}
+
+func cancelAndExpectGrandchildGone(t *testing.T, mode string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := helperCommand(t, "spawn")
+	cmd := helperCommand(t, mode)
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := NewExec().Run(ctx, cmd)
+		e := NewExec()
+		e.KillDelay = 300 * time.Millisecond
+		_, err := e.Run(ctx, cmd)
 		done <- err
 	}()
 

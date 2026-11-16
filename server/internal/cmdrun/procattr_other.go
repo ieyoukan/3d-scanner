@@ -14,3 +14,12 @@ func terminate(c *exec.Cmd) error {
 	}
 	return c.Process.Kill()
 }
+
+// signalName は Unix 以外では常に空（シグナルの概念が違うため）。
+func signalName(*exec.ExitError) string { return "" }
+
+func killGroup(c *exec.Cmd) {
+	if c.Process != nil {
+		_ = c.Process.Kill()
+	}
+}

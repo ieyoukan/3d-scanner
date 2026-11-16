@@ -309,6 +309,8 @@ type stepResponse struct {
 	Error      string          `json:"error"`
 	// HasLog は処理ログを取得できるかどうか。
 	HasLog bool `json:"hasLog"`
+	// Progress は実行中ステップの実測の進み具合。分からないステップでは省略される。
+	Progress *stepProgress `json:"progress,omitempty"`
 }
 
 type assetResponse struct {
@@ -364,6 +366,9 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		if wsErr == nil {
 			if fi, err := os.Stat(ws.LogPath(st.Name)); err == nil && fi.Size() > 0 {
 				sr.HasLog = true
+			}
+			if st.Name == scan.StepSplat && st.Status == scan.StepRunning {
+				sr.Progress = splatProgress(ws.LogPath(st.Name), s.pipeline.SplatIterations)
 			}
 		}
 		resp.Steps = append(resp.Steps, sr)
