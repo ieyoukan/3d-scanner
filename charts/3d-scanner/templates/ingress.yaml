@@ -22,7 +22,12 @@ spec:
     - host: {{ .host | quote }}
       http:
         paths:
-          {{- range .paths }}
+          {{- /*
+          paths を省略したホストは「/ 以下すべて」とみなす。
+          helm の --set 'ingress.hosts[0].host=...' はリストを丸ごと置き換えるので、
+          既定値の paths が消える。そのままだと経路の無い不正な Ingress になってしまう。
+          */}}
+          {{- range (.paths | default (list (dict "path" "/" "pathType" "Prefix"))) }}
           - path: {{ .path | quote }}
             pathType: {{ .pathType | default "Prefix" }}
             backend:
