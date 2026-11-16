@@ -1,0 +1,130 @@
+// サーバー（Go）の JSON と1対1で対応する型。
+// サーバー側の定義は server/internal/httpapi/handlers.go と server/internal/scan/scan.go にある。
+// 片方だけ変えると食い違うので、項目を足すときは両方を直すこと。
+
+/** スキャン全体の状態。 */
+export type ScanStatus =
+  | 'queued' // 順番待ち
+  | 'running' // 処理中
+  | 'partial' // 一部だけ成功（例: Mesh は出来たが 3DGS は失敗）
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'expired'; // 保存期限が過ぎて削除済み
+
+/** 復元パイプラインの1段階。 */
+export type StepName = 'sfm' | 'mvs' | 'mesh' | 'splat' | 'sog';
+
+export type StepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
+
+/** 配信される成果物の種類。 */
+export type AssetKind = 'sparse_ply' | 'scene_json' | 'mesh_glb' | 'gaussian_ply' | 'gaussian_sog';
+
+export interface ApiErrorDetail {
+  /** 画面側が分岐に使う識別子（例: too_few_images）。 */
+  code: string;
+  /** そのまま表示できる日本語の説明。 */
+  message: string;
+}
+
+export interface Step {
+  name: StepName;
+  status: StepStatus;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** 成功・スキップ時の補足。 */
+  message: string;
+  /** 失敗の理由。 */
+  error: string;
+  hasLog: boolean;
+  /**
+   * 実行中ステップの実測の進み具合。サーバーがツールの出力から読み取れたときだけ入る
+   * （いまは 3DGS の学習だけ）。入っていないステップでは、進み具合を表示しない。
+   */
+  progress?: StepProgress;
+}
+
+export interface StepProgress {
+  current: number;
+  total: number;
+  /** 数えている単位（例: ステップ）。 */
+  unit: string;
+}
+
+export interface Asset {
+  kind: AssetKind;
+  sizeBytes: number;
+  url: string;
+}
+
+export interface Scan {
+  id: string;
+  status: ScanStatus;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  frameCount: number;
+  /** 自分より前に並んでいる件数。queued のときだけ入る。 */
+  queuePosition?: number;
+  error: ApiErrorDetail | null;
+  steps: Step[];
+  assets: Asset[];
+}
+
+export interface Limits {
+  minImages: number;
+  maxImages: number;
+  maxImageBytes: number;
+  maxUploadBytes: number;
+  maxImagePixels: number;
+  minImageSide: number;
+}
+
+export interface PipelineInfo {
+  meshEnabled: boolean;
+  /** dense = 密な復元あり / sparse = 疎な点群からの簡易メッシュ */
+  meshMode: 'dense' | 'sparse';
+  splatEnabled: boolean;
+  splatIterations: number;
+  splatDevice: 'cpu' | 'gpu';
+  colmapVersion: string;
+  colmapGpu: boolean;
+}
+
+export interface ServerConfig {
+  authRequired: boolean;
+  authenticated: boolean;
+  limits: Limits;
+  retentionHours: number;
+  pipeline: PipelineInfo;
+}
+
+export interface CreateScanResult {
+  id: string;
+  status: ScanStatus;
+  frameCount: number;
+  duplicatesSkipped: number;
+  expiresAt: string;
+}
+
+/** SfM 結果の要約（output/scene.json）。ビューアが向きと初期視点を決めるのに使う。 */
+export interface SceneInfo {
+  totalImages: number;
+  registeredImages: number;
+  points: number;
+  meanReprojectionError: number;
+  /** 世界座標での「上」方向。 */
+  up: [number, number, number];
+  /** 被写体の中心の推定値。 */
+  center: [number, number, number];
+  /** 中心からの広がりの目安。 */
+  radius: number;
+  cameraPositions: [number, number, number][];
+}
+
+/** 終了状態（これ以上変化しない）かどうか。 */
+export function isTerminal(status: ScanStatus): boolean {
+  return status !== 'queued' && status !== 'running';
+}

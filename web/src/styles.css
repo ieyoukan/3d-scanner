@@ -1,0 +1,96 @@
+/*
+ * 見た目の土台。Tailwind CSS v4 は、この1行の import と @theme の定義だけで使える
+ * （設定ファイルは不要）。@theme に書いた変数は、そのままクラス名になる:
+ *   --color-amber  →  bg-amber / text-amber / border-amber
+ *
+ * 配色の考え方:
+ *   写真と3Dモデルが主役なので、画面そのものは暗い無彩色にして色を持たせない。
+ *   強調色は琥珀色の1色だけ（暗室のセーフライトの色）。「いま押せる主要な操作」と
+ *   「進行中」にだけ使い、それ以外は白〜灰色の濃淡で区別する。
+ *   状態の色（成功の緑・失敗の赤）は、アイコンと短い言葉を必ず添えて、色だけに頼らない。
+ */
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #0f1011;      /* いちばん奥の背景 */
+  --color-panel: #17191b;    /* カードや帯の面 */
+  --color-raised: #212427;   /* 押せる部品など、一段手前の面 */
+  --color-line: #2e3236;     /* 罫線 */
+  --color-paper: #edeae4;    /* 本文の文字（真っ白より少し温かい） */
+  --color-mute: #9a9fa5;     /* 補助的な文字 */
+  --color-amber: #f2a93b;    /* 強調色 */
+  --color-amber-deep: #c9821a;
+  --color-ok: #74c98a;
+  --color-bad: #f0705f;
+
+  /* 日本語は端末に入っているゴシック体を使う（Web フォントを読み込まないので速く、外部通信も無い）。 */
+  --font-sans: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background: var(--color-ink);
+    color: var(--color-paper);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.6;
+    /* タップしたときに出る青い矩形（モバイルブラウザの既定）を消す。押した感触は各部品の :active で出す。 */
+    -webkit-tap-highlight-color: transparent;
+    /* 画面全体を引っ張って更新する動作を止める（3Dビューアのドラッグ操作と衝突するため）。 */
+    overscroll-behavior: none;
+  }
+
+  /* キーボード操作のときだけ、フォーカス位置をはっきり示す。 */
+  :focus-visible {
+    outline: 2px solid var(--color-amber);
+    outline-offset: 2px;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+}
+
+@layer utilities {
+  /* ノッチやホームバーに操作部品が隠れないよう、端末が教えてくれる安全領域ぶん余白を取る。 */
+  .pad-safe-b {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+
+  .pad-safe-t {
+    padding-top: max(0.5rem, env(safe-area-inset-top));
+  }
+
+  /* 枚数や経過時間など、変化する数字の桁がガタつかないよう等幅の数字にする。 */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* 「処理中」を示す回転。動きを減らす設定の利用者には回さない。 */
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  animation: spin-slow 1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
