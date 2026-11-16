@@ -194,7 +194,7 @@ func readPipeline(r *reader) Pipeline {
 		ColmapUseGPU:       r.boolean("COLMAP_USE_GPU", false),
 		ColmapMaxImageSize: r.integer("COLMAP_MAX_IMAGE_SIZE", 1600),
 		NumThreads:         r.integer("NUM_THREADS", 0),
-		SplatIterations:    r.integer("SPLAT_ITERATIONS", 2000),
+		SplatIterations:    r.integer("SPLAT_ITERATIONS", 1000),
 		SplatDownscale:     r.float("SPLAT_DOWNSCALE", 2),
 		SplatForceCPU:      r.boolean("SPLAT_FORCE_CPU", true),
 		SfMTimeout:         r.duration("SFM_TIMEOUT", 1*time.Hour),
