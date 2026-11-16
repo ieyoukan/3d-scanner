@@ -1,0 +1,248 @@
+# 3d-scanner の既定値。
+#
+# 構成（MVP）:
+#   Deployment  アプリ本体（Web + API + ワーカーが1プロセス）。必ず 1 レプリカ。
+#   PVC         作業領域 /data（写真・中間ファイル・成果物）。ReadWriteOnce。
+#   StatefulSet PostgreSQL（ジョブの状態を保存）。既存の DB を使うなら無効にできる。
+#   Ingress     外部公開（任意）。
+#
+# なぜ 1 レプリカ固定なのか:
+#   作業領域の PVC は ReadWriteOnce（同時に1ノードからしかマウントできない）。
+#   また、ワーカーは「実行中のジョブは自分のもの」という前提で起動時の回復を行う。
+#   レプリカを増やすと両方の前提が崩れるので、テンプレート側で 1 に固定してある。
+#   詳しくは docs/learning/06-helm-proxmox-csi.md を参照。
+
+# -- リソース名の基になる名前。空なら "scanner"。
+# （Service の名前は英字で始める必要があるため、chart 名の "3d-scanner" はそのまま使えない）
+fullnameOverride: ""
+
+image:
+  # -- コンテナイメージ。GitHub Actions が main への push ごとに GHCR へ公開する。
+  repository: ghcr.io/ieyoukan/3d-scanner
+  # -- タグ。空なら Chart.yaml の appVersion。
+  # "latest" を使う場合は pullPolicy を Always にしないと、ノードに残った古いイメージが使われる。
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# -- 非公開レジストリから取得する場合の認証情報（Secret 名の一覧）。
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# アクセス制限
+# ---------------------------------------------------------------------------
+auth:
+  # -- アクセストークンを入れた既存の Secret の名前（推奨）。
+  # SealedSecret などで別途作成しておく。値を Git に平文で置かないため。
+  existingSecret: ""
+  # -- 上の Secret の中のキー名。
+  existingSecretKey: ACCESS_TOKEN
+  # -- トークンを values で直接渡す（手元での検証用）。
+  # helm install --set auth.token=... のように渡し、values ファイルには書かないこと。
+  token: ""
+  # -- トークン無しで誰でも使える状態にする。閉じたネットワークでの検証以外では使わない。
+  allowNoAuth: false
+  # -- セッション Cookie に Secure 属性を付ける（HTTPS でのみ送信）。HTTP で試すときだけ false。
+  cookieSecure: true
+  # -- 接続元の判定に CF-Connecting-IP ヘッダを使う。
+  # Cloudflare Tunnel 経由でしか届かない構成なら true。クラスタ内から直接届く経路があるなら false。
+  trustProxyHeaders: false
+
+# ---------------------------------------------------------------------------
+# 外部公開
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  # -- IngressClass。Cloudflare Tunnel Ingress Controller なら "cloudflare"。
+  className: ""
+  annotations: {}
+  hosts:
+    - host: scanner.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # -- TLS の設定。Cloudflare Tunnel を使う場合は Cloudflare 側で TLS を終端するので空でよい。
+  tls: []
+
+service:
+  type: ClusterIP
+  port: 80
+
+# ---------------------------------------------------------------------------
+# 作業領域（写真・中間ファイル・成果物）
+# ---------------------------------------------------------------------------
+persistence:
+  # -- false にすると emptyDir（Pod が消えるとデータも消える）。検証用。
+  enabled: true
+  # -- 既存の PVC を使う場合はその名前。
+  existingClaim: ""
+  # -- StorageClass。空文字ならクラスタの既定。Proxmox CSI なら "proxmox-data"。
+  storageClass: ""
+  # -- Proxmox CSI のディスクは 1 ノードにしか接続できないので ReadWriteOnce。
+  accessMode: ReadWriteOnce
+  # -- 目安: 1 スキャンあたり 数百MB〜2GB（写真・歪み補正済み画像・成果物）× 保存期間内の件数。
+  size: 30Gi
+
+# ---------------------------------------------------------------------------
+# データベース（ジョブの状態）
+# ---------------------------------------------------------------------------
+postgresql:
+  # -- true: この chart が PostgreSQL（1 レプリカの StatefulSet）を立てる。
+  #    false: externalDatabase の設定で既存の DB に接続する。
+  enabled: true
+  image:
+    repository: postgres
+    tag: "17-alpine"
+    pullPolicy: IfNotPresent
+  auth:
+    username: scanner
+    database: scanner
+    # -- パスワードを入れた既存の Secret の名前（推奨）。
+    existingSecret: ""
+    existingSecretKey: POSTGRES_PASSWORD
+    # -- パスワードを values で直接渡す（手元での検証用）。values ファイルには書かないこと。
+    password: ""
+  persistence:
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    # -- 保存するのはジョブの状態だけなので小さくてよい。
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# -- postgresql.enabled=false のときの接続先。
+externalDatabase:
+  host: ""
+  port: 5432
+  username: scanner
+  database: scanner
+  # -- disable / require / verify-full など（PostgreSQL の sslmode）。
+  sslmode: disable
+  # -- パスワードを入れた既存の Secret。
+  existingSecret: ""
+  existingSecretKey: POSTGRES_PASSWORD
+
+# ---------------------------------------------------------------------------
+# アプリの設定
+# ---------------------------------------------------------------------------
+config:
+  # -- 写真と成果物を保存する期間（Go の時間表記。24h, 72h など）。過ぎたら自動で削除する。
+  retention: 24h
+
+  limits:
+    minImages: 8
+    maxImages: 80
+    # -- 写真1枚の上限（MB）。
+    maxImageMB: 15
+    # -- 1回のアップロード全体の上限（MB）。
+    # Cloudflare（Free / Pro）はリクエストボディを 100MB で打ち切るので、それより小さくする。
+    maxUploadMB: 95
+    # -- 順番待ち＋実行中の上限。超えたら新規の受付を断る。
+    maxQueuedScans: 5
+    # -- 作業領域の空きがこれを下回ったら新規の受付を断る（MB）。
+    minFreeDiskMB: 2048
+
+  pipeline:
+    # -- メッシュ（GLB）を作るか。
+    enableMesh: true
+    # -- 3D Gaussian Splatting を作るか。
+    enableSplat: true
+    # -- メッシュの作り方。
+    #   auto:   COLMAP が CUDA 対応なら dense、そうでなければ sparse
+    #   dense:  密な復元（patch_match_stereo）。NVIDIA GPU と CUDA 入りイメージが必要
+    #   sparse: 疎な点群からの簡易メッシュ。CPU で動くが粗い
+    meshMode: auto
+    # -- 特徴抽出・歪み補正時の画像の長辺の上限（画素）。大きいほど精密で遅い。
+    colmapMaxImageSize: 1600
+    # -- 外部CLIが使うスレッド数。resources.limits.cpu と同じ値にする。
+    # 0 は「CLI の既定（ノードの全コア）」。CPU 制限付きのコンテナで全コアぶんのスレッドを
+    # 立てると、奪い合いでかえって遅くなる。
+    numThreads: 4
+    # -- 3DGS の学習反復回数。CPU は GPU の約100倍遅い。
+    # 実測（Apple Silicon 8コア、11枚・学習解像度 1416×1064）: 1 反復あたり約 1.5 秒。
+    # 1000 反復で 25 分前後が目安。写真の枚数と解像度に比例して伸びる。
+    splatIterations: 1000
+    # -- 学習時の画像の縮小率。2 なら縦横 1/2（画素数 1/4、時間もおよそ 1/4）。
+    splatDownscale: 2
+    # -- 3DGS を CPU で学習する。GPU 対応イメージと GPU を用意したら false にする。
+    splatForceCPU: true
+    # -- 各ステップの制限時間。
+    timeouts:
+      sfm: 1h
+      mvs: 2h
+      mesh: 1h
+      splat: 6h
+      sog: 30m
+
+  # -- 追加の環境変数（上に無い設定を渡したいとき）。例: [{name: MAX_ATTEMPTS, value: "3"}]
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# GPU
+# ---------------------------------------------------------------------------
+gpu:
+  # -- GPU をコンテナに割り当てる。
+  #
+  # 注意: 既定のイメージは CPU 専用で、有効にしても使われない。
+  #   - COLMAP の密な復元（patch_match_stereo）は NVIDIA CUDA（または AMD HIP）専用。
+  #   - OpenSplat の GPU 実行は CUDA / ROCm / Metal のみ。
+  #   Intel の内蔵 GPU（gpu.intel.com/i915）は、どちらのツールも対応していない。
+  # NVIDIA GPU を追加したら、CUDA 対応でビルドしたイメージに差し替えたうえで有効にする
+  # （手順のメモ: docs/learning/03-mvs.md）。
+  enabled: false
+  # -- デバイスプラグインが公開するリソース名。NVIDIA: nvidia.com/gpu / Intel: gpu.intel.com/i915
+  resourceName: nvidia.com/gpu
+  count: 1
+
+# ---------------------------------------------------------------------------
+# Pod の設定
+# ---------------------------------------------------------------------------
+resources:
+  # requests は「このぶんは必ず確保してほしい」量。スケジューラがノードを選ぶ基準になる。
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  # limits は上限。メモリの上限を超えるとコンテナは強制終了される（OOM Kill）。
+  # SfM と 3DGS は写真の枚数に比例してメモリを使う。80 枚・長辺 1600px で数 GB。
+  limits:
+    cpu: "4"
+    memory: 8Gi
+
+# -- 配置するノードの条件。復元は重いので、余力のあるノードに寄せたいときに使う。
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+
+# -- Pod 全体のセキュリティ設定。
+podSecurityContext:
+  runAsNonRoot: true
+  # イメージ内の scanner ユーザー（deploy/docker/Dockerfile で UID 10001 として作成）。
+  runAsUser: 10001
+  runAsGroup: 10001
+  # fsGroup: マウントしたボリュームの所有グループをこの GID にする。
+  # これが無いと、root 所有で作られた PVC に非 root のコンテナが書き込めない。
+  fsGroup: 10001
+  # ボリュームのルートの所有者が既に合っていれば、全ファイルの chown をやり直さない
+  # （ファイルが多いと起動のたびに数分かかるため）。
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- コンテナのセキュリティ設定。
+securityContext:
+  allowPrivilegeEscalation: false
+  # ルートファイルシステムを読み取り専用にする。書けるのは /data（PVC）と /tmp（emptyDir）だけ。
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- 停止の合図（SIGTERM）から強制終了までの猶予（秒）。
+# アプリは実行中の外部CLIに SIGTERM を送って最大 5 秒待ち、処理中の HTTP リクエストを最大 20 秒待つ。
+# その合計より長くする。
+terminationGracePeriodSeconds: 45

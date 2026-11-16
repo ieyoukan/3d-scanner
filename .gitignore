@@ -21,3 +21,6 @@ server/bin/
 .vscode/
 .playwright-mcp/
 coverage/
+
+# 手元だけの compose 上書き設定
+docker-compose.override.yml

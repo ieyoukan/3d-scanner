@@ -1,0 +1,29 @@
+3D Scanner を配備しました。
+
+{{- if .Values.ingress.enabled }}
+
+公開 URL:
+{{- range .Values.ingress.hosts }}
+  https://{{ .host }}/
+{{- end }}
+{{- else }}
+
+Ingress は無効です。手元から開くには:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "3d-scanner.fullname" . }} 8080:{{ .Values.service.port }}
+  → http://localhost:8080/
+  （HTTP で試す場合は auth.cookieSecure=false が必要です）
+{{- end }}
+
+状態の確認:
+  kubectl -n {{ .Release.Namespace }} get pods,pvc -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "3d-scanner.fullname" . }}
+
+{{- if .Values.auth.allowNoAuth }}
+
+注意: auth.allowNoAuth=true のため、URL を知っている人は誰でもアップロードと閲覧ができます。
+{{- end }}
+{{- if include "3d-scanner.createSecret" . }}
+
+注意: 秘密の値を values から直接渡しています（検証用）。
+本番では auth.existingSecret / postgresql.auth.existingSecret を使ってください。
+{{- end }}

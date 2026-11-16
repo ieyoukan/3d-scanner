@@ -1,0 +1,11 @@
+apiVersion: v2
+name: 3d-scanner
+description: スマホの写真から 3D モデル（メッシュ / 3D Gaussian Splatting）を作る Web アプリ
+type: application
+# version は chart 自体の版。テンプレートや values の構造を変えたら上げる。
+version: 0.1.0
+# appVersion は配備するアプリの版。image.tag を指定しなかったときのタグになる。
+appVersion: "0.1.0"
+home: https://github.com/ieyoukan/3d-scanner
+sources:
+  - https://github.com/ieyoukan/3d-scanner

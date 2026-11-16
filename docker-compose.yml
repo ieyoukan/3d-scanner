@@ -1,0 +1,59 @@
+# ローカルで全体（Web + API + ワーカー + PostgreSQL）を動かすための構成。
+#
+#   ./scripts/dev-env.sh        # .env を作る（ランダムなトークンとDBパスワード）
+#   docker compose up --build   # 初回は COLMAP 等のビルドに 40〜60 分かかる
+#   → http://localhost:8080 を開き、.env の ACCESS_TOKEN を入力する（ポートは .env の APP_PORT で変更可）
+#
+# 本番（Kubernetes）の配備は charts/3d-scanner を使う。こちらは手元で試すためのもの。
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: scanner
+      POSTGRES_DB: scanner
+      # パスワードはこのファイルに書かず、.env から受け取る。未設定なら起動時にエラーにする（:? の意味）。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?.env に POSTGRES_PASSWORD を設定してください（scripts/dev-env.sh で作れます）}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # ポートは公開しない。DB に触れるのは同じ compose ネットワーク内の app だけ。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scanner -d scanner"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    image: 3d-scanner:dev
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # DB の接続先は部品ごとに渡す（パスワードに記号が入っていても、サーバー側で正しく URL に組み立てる）。
+      DB_HOST: db
+      DB_USER: scanner
+      DB_NAME: scanner
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?}
+      ACCESS_TOKEN: ${ACCESS_TOKEN:?.env に ACCESS_TOKEN を設定してください（scripts/dev-env.sh で作れます）}
+      # http://localhost で試すので、Cookie の Secure 属性を外す。HTTPS で公開するときは必ず true（既定値）にする。
+      COOKIE_SECURE: "false"
+      # 手元の CPU で数分で終わるよう、3DGS の反復回数を控えめにする。
+      SPLAT_ITERATIONS: ${SPLAT_ITERATIONS:-300}
+      SPLAT_DOWNSCALE: ${SPLAT_DOWNSCALE:-2}
+      RETENTION: ${RETENTION:-24h}
+    ports:
+      # 127.0.0.1 に限定して公開する（同じ LAN の他の機器からは見えない）。
+      # 8080 番を他のプログラムが使っているときは、.env に APP_PORT=18080 のように書いて変える。
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    volumes:
+      - scan-data:/data
+    # 読み取り専用のルートファイルシステムで動くことを、手元でも確かめておく（本番の設定と揃える）。
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  db-data:
+  scan-data:

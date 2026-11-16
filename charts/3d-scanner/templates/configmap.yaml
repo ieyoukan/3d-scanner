@@ -1,0 +1,54 @@
+{{- /*
+秘密でない設定を環境変数としてまとめる。
+秘密の値（トークン、DB パスワード）はここに入れず、Deployment が Secret から直接読む。
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "3d-scanner.fullname" . }}
+  labels:
+    {{- include "3d-scanner.labels" . | nindent 4 }}
+data:
+  LISTEN_ADDR: ":8080"
+  DATA_DIR: /data
+  WEB_DIR: /app/web
+  {{- if .Values.postgresql.enabled }}
+  DB_HOST: {{ include "3d-scanner.postgresql.fullname" . | quote }}
+  DB_PORT: "5432"
+  DB_USER: {{ .Values.postgresql.auth.username | quote }}
+  DB_NAME: {{ .Values.postgresql.auth.database | quote }}
+  DB_SSLMODE: disable
+  {{- else }}
+  DB_HOST: {{ .Values.externalDatabase.host | quote }}
+  DB_PORT: {{ .Values.externalDatabase.port | quote }}
+  DB_USER: {{ .Values.externalDatabase.username | quote }}
+  DB_NAME: {{ .Values.externalDatabase.database | quote }}
+  DB_SSLMODE: {{ .Values.externalDatabase.sslmode | quote }}
+  {{- end }}
+  ALLOW_NO_AUTH: {{ .Values.auth.allowNoAuth | quote }}
+  COOKIE_SECURE: {{ .Values.auth.cookieSecure | quote }}
+  TRUST_PROXY_HEADERS: {{ .Values.auth.trustProxyHeaders | quote }}
+  RETENTION: {{ .Values.config.retention | quote }}
+  {{- with .Values.config.limits }}
+  MIN_IMAGES: {{ .minImages | quote }}
+  MAX_IMAGES: {{ .maxImages | quote }}
+  MAX_IMAGE_MB: {{ .maxImageMB | quote }}
+  MAX_UPLOAD_MB: {{ .maxUploadMB | quote }}
+  MAX_QUEUED_SCANS: {{ .maxQueuedScans | quote }}
+  MIN_FREE_DISK_MB: {{ .minFreeDiskMB | quote }}
+  {{- end }}
+  {{- with .Values.config.pipeline }}
+  ENABLE_MESH: {{ .enableMesh | quote }}
+  ENABLE_SPLAT: {{ .enableSplat | quote }}
+  MESH_MODE: {{ .meshMode | quote }}
+  COLMAP_MAX_IMAGE_SIZE: {{ .colmapMaxImageSize | quote }}
+  NUM_THREADS: {{ .numThreads | quote }}
+  SPLAT_ITERATIONS: {{ .splatIterations | quote }}
+  SPLAT_DOWNSCALE: {{ .splatDownscale | quote }}
+  SPLAT_FORCE_CPU: {{ .splatForceCPU | quote }}
+  SFM_TIMEOUT: {{ .timeouts.sfm | quote }}
+  MVS_TIMEOUT: {{ .timeouts.mvs | quote }}
+  MESH_TIMEOUT: {{ .timeouts.mesh | quote }}
+  SPLAT_TIMEOUT: {{ .timeouts.splat | quote }}
+  SOG_TIMEOUT: {{ .timeouts.sog | quote }}
+  {{- end }}

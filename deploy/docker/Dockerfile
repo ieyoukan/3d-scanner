@@ -207,7 +207,9 @@ COPY server/go.mod server/go.sum ./
 RUN go mod download
 COPY server/ ./
 # CGO_ENABLED=0: C ライブラリに依存しない単一バイナリにする（実行イメージの glibc の版に左右されない）。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scanner-server ./cmd/server
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scanner-server ./cmd/server \
+    # reconstruct: DB も HTTP も無しでパイプラインだけを実行する学習・検証用のツール。
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/reconstruct ./cmd/reconstruct
 
 # ----------------------------------------------------------------------------
 # 最終イメージ
@@ -219,7 +221,7 @@ FROM tools AS runtime
 RUN useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin scanner \
     && mkdir -p /app/web /data \
     && chown -R scanner:scanner /data
-COPY --from=server-build /out/scanner-server /app/scanner-server
+COPY --from=server-build /out/scanner-server /out/reconstruct /app/
 COPY --from=web-build /src/web/dist /app/web
 
 ENV LISTEN_ADDR=:8080 \
