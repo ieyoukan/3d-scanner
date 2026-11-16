@@ -261,7 +261,9 @@ docker compose exec app sh -c 'ls /data/scans'
 docker compose restart app && docker compose logs app | grep -E '中断|やり直'
 ```
 
-どちらも Docker Compose 上で実際に確認した。Kubernetes 上での再起動（Pod の削除）は**未検証**。
+どちらも Docker Compose 上で実際に確認した。Kubernetes でも、使い捨ての k3s（v1.33.6）に chart を入れ、
+ジョブ実行中に `kubectl delete pod` して、新しい Pod が同じ PVC を引き継いでやり直すことを確認した。
+本番クラスタ（Proxmox CSI）では**未検証**。
 
 ### テストの考え方
 

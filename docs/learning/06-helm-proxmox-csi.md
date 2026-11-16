@@ -304,7 +304,20 @@ docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary \
 helm template scanner charts/3d-scanner     # → 「アクセストークンが未設定です」で失敗するのが正しい
 ```
 
-クラスタで確認すること（**未検証**。マージ後に行う）:
+使い捨てのクラスタで確認したこと:
+
+本番と同じ版の k3s（v1.33.6）を Docker のコンテナ 1 つで起動し、chart を `helm install` した。
+
+- Pod は 2 つとも `1/1 Running`、再起動 0 回。3 種類のプローブが通る。
+- PVC は 2 つとも `Bound`（StorageClass は k3s 同梱の `local-path`）。
+- コンテナは UID 10001、`/data` に書き込める、ルート FS への書き込みは拒否される。
+- 実写真 11 枚の復元ジョブが成功し、成果物が PVC に残る。
+- ジョブ実行中に Pod を削除すると、新しい Pod が同じ PVC で起動し、ジョブを最初からやり直して完了する。
+
+この確認で分からないこと: Proxmox CSI のボリュームの挙動（ノードをまたぐ再接続、`fsGroup` の適用）、
+Cloudflare の Ingress、SealedSecret の復号。これらは本番クラスタでしか確かめられない。
+
+本番クラスタで確認すること（**未検証**。マージ後に行う）:
 
 ```bash
 # 必ず最初に、対象のクラスタを確認する。kubeconfig には複数のクラスタが入っている

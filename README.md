@@ -265,6 +265,8 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | キャンセル | SfM 実行中に DELETE | `cancelled`。外部プロセスが止まり、作業領域が削除される |
 | 再起動からの回復 | 実行中にコンテナを再起動 | 起動時に待ち行列へ戻り、2 回目の着手で完了 |
 | 非 root・読み取り専用 | Compose の `read_only: true`、UID 10001 | 動作 |
+| Helm chart の実インストール | 使い捨ての k3s v1.33.6（Docker 上、StorageClass は `local-path`）に `helm install` | Pod 2 つが Running、プローブ通過、PVC 2 つが Bound。UID 10001・読み取り専用ルート FS のまま復元ジョブが成功 |
+| Kubernetes 上での回復 | 同じ k3s で、ジョブ実行中に Pod を削除 | 新しい Pod が同じ PVC で起動し、中断ジョブを 2 回目の着手で完了。以前のスキャンも保持 |
 | カメラ経路 | `getUserMedia` を合成映像に差し替えて撮影 | 映像表示・撮影・取り込みが動作。拒否時は写真選択に切り替わる |
 
 ### 未検証のこと
@@ -275,7 +277,7 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | GPU での 3DGS 学習 | 同上 | CUDA 版の OpenSplat を入れ、`SPLAT_FORCE_CPU=false` |
 | スマホ実機（Android Chrome）での撮影 | 開発環境から実機に繋いでいない | HTTPS の URL を用意し、実機で撮影から閲覧まで通す |
 | linux/amd64 のイメージ | 手元は arm64。amd64 は GitHub Actions でビルドする | Actions の Image ワークフローの結果を見る |
-| クラスタへの配備 | 実際のクラスタには適用していない | home-manifests の Pull Request をマージし、Pod・PVC・Ingress を確認する |
+| 本番クラスタへの配備 | 実際のクラスタには適用していない。使い捨ての k3s では確認したが、Proxmox CSI のボリューム、Cloudflare の Ingress、SealedSecret の復号は本番でしか確かめられない | home-manifests の Pull Request をマージし、Pod・PVC・Ingress を確認する |
 | Cloudflare Tunnel 経由のアップロード | 未配備 | 80 枚程度を実機から送り、413 / 524 が出ないことを確認する |
 | 20 枚を超える写真での処理時間とメモリ | サンプルは 11 枚 | 枚数を増やして、所要時間とメモリ使用量を測る |
 
