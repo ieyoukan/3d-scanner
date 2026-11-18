@@ -175,7 +175,23 @@ func (p *Postgres) Get(ctx context.Context, id string) (scan.Detail, error) {
 		a.Kind = scan.AssetKind(kind)
 		d.Assets = append(d.Assets, a)
 	}
-	return d, assetRows.Err()
+	if err := assetRows.Err(); err != nil {
+		return d, err
+	}
+
+	var sj scan.SplatJob
+	var status string
+	var started sql.NullTime
+	err = p.db.QueryRowContext(ctx, `SELECT status, queued_at, started_at, attempts FROM splat_jobs WHERE scan_id = $1`, id).
+		Scan(&status, &sj.QueuedAt, &started, &sj.Attempts)
+	switch {
+	case err == nil:
+		sj.Status, sj.StartedAt = scan.SplatJobStatus(status), timePtr(started)
+		d.Splat = &sj
+	case !errors.Is(err, sql.ErrNoRows):
+		return d, err
+	}
+	return d, nil
 }
 
 func (p *Postgres) CountActive(ctx context.Context) (int, error) {
@@ -249,7 +265,8 @@ func (p *Postgres) List(ctx context.Context, q ListQuery) ([]scan.Summary, error
 	// 続きの版が完成した古い版は出さない（同じ対象のカードが版の数だけ並ばないように）。
 	// 古い版は、続きの版の画面から辿れる。
 	query := `SELECT ` + scanColumns + `,
-		COALESCE((SELECT string_agg(kind, ',' ORDER BY kind) FROM scan_assets a WHERE a.scan_id = s.id), '')
+		COALESCE((SELECT string_agg(kind, ',' ORDER BY kind) FROM scan_assets a WHERE a.scan_id = s.id), ''),
+		EXISTS (SELECT 1 FROM splat_jobs j WHERE j.scan_id = s.id)
 		FROM scans s WHERE status <> 'expired'
 		AND NOT EXISTS (SELECT 1 FROM scans c WHERE c.parent_id = s.id AND c.status IN ('succeeded', 'partial'))`
 	args := []any{}
@@ -268,11 +285,12 @@ func (p *Postgres) List(ctx context.Context, q ListQuery) ([]scan.Summary, error
 	var out []scan.Summary
 	for rows.Next() {
 		var kinds string
-		sc, err := scanRow(rows, &kinds)
+		var splatPending bool
+		sc, err := scanRow(rows, &kinds, &splatPending)
 		if err != nil {
 			return nil, err
 		}
-		sum := scan.Summary{Scan: sc}
+		sum := scan.Summary{Scan: sc, SplatPending: splatPending}
 		for _, k := range strings.Split(kinds, ",") {
 			if k != "" {
 				sum.AssetKinds = append(sum.AssetKinds, scan.AssetKind(k))
@@ -444,6 +462,9 @@ func (p *Postgres) MarkExpired(ctx context.Context, id string, now time.Time) er
 		if err := requireOneRow(res); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM splat_jobs WHERE scan_id = $1`, id); err != nil {
+			return err
+		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM scan_assets WHERE scan_id = $1`, id)
 		return err
 	})
@@ -456,6 +477,163 @@ func (p *Postgres) PurgeExpired(ctx context.Context, expiredBefore time.Time) (i
 	}
 	n, err := res.RowsAffected()
 	return int(n), err
+}
+
+// ---- あとで作る 3DGS の待ち行列 ----
+
+// resetSplatSteps は splat / sog のステップを「待ち」に戻し、理由を message に入れる。
+func resetSplatSteps(ctx context.Context, tx *sql.Tx, id, message string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE scan_steps SET status = 'pending', started_at = NULL, finished_at = NULL, message = $2, error_message = ''
+		WHERE scan_id = $1 AND name IN ('splat', 'sog')`, id, message)
+	return err
+}
+
+func (p *Postgres) EnqueueSplat(ctx context.Context, id string, now time.Time) error {
+	return p.inTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		// 行をロックしてから状態を見る（同時に削除・期限切れにされても判断が食い違わない）。
+		err := tx.QueryRowContext(ctx, `SELECT status FROM scans WHERE id = $1 FOR UPDATE`, id).Scan(&status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !scan.Status(status).Keepable() {
+			return ErrConflict
+		}
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO splat_jobs (scan_id, status, queued_at) VALUES ($1, 'queued', $2)
+			ON CONFLICT (scan_id) DO NOTHING`, id, now)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			if err != nil {
+				return err
+			}
+			return ErrConflict // 既に待っているか、学習している
+		}
+		return resetSplatSteps(ctx, tx, id, splatQueuedStep)
+	})
+}
+
+func (p *Postgres) ClaimNextSplat(ctx context.Context, now time.Time) (*scan.Scan, error) {
+	// ClaimNext と同じく、選ぶのと running にするのを1文で行う。
+	// 完成していないスキャン（期限切れ・中止など）の行は選ばない。
+	var id string
+	err := p.inTx(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `
+		UPDATE splat_jobs SET status = 'running', started_at = $1, attempts = attempts + 1
+		WHERE scan_id = (
+			SELECT j.scan_id FROM splat_jobs j JOIN scans s ON s.id = j.scan_id
+			WHERE j.status = 'queued' AND s.status IN ('succeeded', 'partial')
+			ORDER BY j.queued_at, j.scan_id
+			FOR UPDATE OF j SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING scan_id::text`, now).Scan(&id)
+		if err != nil {
+			return err
+		}
+		// 待っている間の説明（「あとで作ります」「順番を譲りました」）は、始めた時点で消す。
+		return resetSplatSteps(ctx, tx, id, "")
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sc, err := scanRow(p.db.QueryRowContext(ctx, `SELECT `+scanColumns+` FROM scans WHERE id = $1`, id))
+	if err != nil {
+		return nil, err
+	}
+	return &sc, nil
+}
+
+func (p *Postgres) FinishSplat(ctx context.Context, id string, out scan.Outcome, now time.Time) (bool, error) {
+	done := false
+	err := p.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM splat_jobs WHERE scan_id = $1 AND status = 'running'`, id)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return err
+		}
+		done = true
+		// 完成しているスキャンの状態だけを書き換える（期限切れ・削除の途中のものには触らない）。
+		_, err = tx.ExecContext(ctx, `
+			UPDATE scans SET status = $2, error_code = $3, error_message = $4, updated_at = $5
+			WHERE id = $1 AND status IN ('succeeded', 'partial')`,
+			id, string(out.Status), out.ErrorCode, out.ErrorMessage, now)
+		return err
+	})
+	return done, err
+}
+
+func (p *Postgres) RequeueSplat(ctx context.Context, id string, now time.Time) error {
+	return p.inTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE splat_jobs SET status = 'queued', started_at = NULL, attempts = GREATEST(attempts - 1, 0)
+			WHERE scan_id = $1 AND status = 'running'`, id)
+		if err != nil {
+			return err
+		}
+		if err := requireOneRow(res); err != nil {
+			return err
+		}
+		return resetSplatSteps(ctx, tx, id, splatYieldedStep)
+	})
+}
+
+func (p *Postgres) SplatQueuePosition(ctx context.Context, id string) (int, error) {
+	var n int
+	err := p.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM splat_jobs o, splat_jobs me
+		WHERE me.scan_id = $1 AND o.status = 'queued' AND (o.queued_at, o.scan_id) < (me.queued_at, me.scan_id)`, id).Scan(&n)
+	return n, err
+}
+
+func (p *Postgres) RecoverSplats(ctx context.Context, maxAttempts int, now time.Time) (requeued, failed []string, err error) {
+	err = p.inTx(ctx, func(tx *sql.Tx) error {
+		failed, err = collectIDs(tx.QueryContext(ctx, `
+			DELETE FROM splat_jobs WHERE status = 'running' AND attempts >= $1 RETURNING scan_id::text`, maxAttempts))
+		if err != nil {
+			return err
+		}
+		for _, id := range failed {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE scan_steps SET status = 'failed', finished_at = $2, error_message = $3
+				WHERE scan_id = $1 AND name = 'splat'`, id, now, interruptedStep); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE scan_steps SET status = 'skipped', finished_at = $2, message = $3
+				WHERE scan_id = $1 AND name = 'sog' AND status IN ('pending', 'running')`, id, now, notRunStep); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE scans SET status = 'partial', error_code = $2, error_message = $3, updated_at = $4
+				WHERE id = $1 AND status IN ('succeeded', 'partial')`, id, splatFailedCode, splatFailedMessage, now); err != nil {
+				return err
+			}
+		}
+		requeued, err = collectIDs(tx.QueryContext(ctx, `
+			UPDATE splat_jobs SET status = 'queued', started_at = NULL WHERE status = 'running' RETURNING scan_id::text`))
+		if err != nil {
+			return err
+		}
+		for _, id := range requeued {
+			if err := resetSplatSteps(ctx, tx, id, splatQueuedStep); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return requeued, failed, err
 }
 
 // ---- 小さな補助関数 ----

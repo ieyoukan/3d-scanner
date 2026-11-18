@@ -95,6 +95,7 @@ func stepStatus(d scan.Detail, name scan.StepName) scan.StepStatus {
 
 func runContract(t *testing.T, open func(t *testing.T) Store) {
 	ctx := context.Background()
+	t.Run("3DGS の待ち行列", func(t *testing.T) { runSplatContract(t, open) })
 
 	t.Run("作成直後は queued で全ステップが pending", func(t *testing.T) {
 		s := open(t)
@@ -556,6 +557,158 @@ func runContract(t *testing.T, open func(t *testing.T) Store) {
 		rows, err := s.List(ctx, ListQuery{Limit: 10})
 		if err != nil || len(rows) != 2 {
 			t.Fatalf("一覧 = %d件, %v（両方出るはず）", len(rows), err)
+		}
+	})
+}
+
+// 3DGS をあとで作る待ち行列。
+func runSplatContract(t *testing.T, open func(t *testing.T) Store) {
+	ctx := context.Background()
+	step := func(d scan.Detail, name scan.StepName) scan.Step {
+		for _, st := range d.Steps {
+			if st.Name == name {
+				return st
+			}
+		}
+		return scan.Step{}
+	}
+
+	t.Run("入れる・取り出す・譲る・終える", func(t *testing.T) {
+		s := open(t)
+		sc := newScan(t, 0)
+		mustCreate(t, s, sc)
+		// 完成していないスキャンは入れられない。
+		if err := s.EnqueueSplat(ctx, sc.ID, base); !errors.Is(err, ErrConflict) {
+			t.Fatalf("queued のスキャン: %v", err)
+		}
+		finishAs(t, s, sc.ID, scan.StatusSucceeded)
+		if err := s.EnqueueSplat(ctx, sc.ID, base); err != nil {
+			t.Fatal(err)
+		}
+		d := mustGet(t, s, sc.ID)
+		if d.Splat == nil || d.Splat.Status != scan.SplatQueued || !d.Splat.QueuedAt.Equal(base) {
+			t.Fatalf("Splat = %+v", d.Splat)
+		}
+		if st := step(d, scan.StepSplat); st.Status != scan.StepPending || st.Message == "" {
+			t.Fatalf("splat のステップ = %+v", st)
+		}
+		if err := s.EnqueueSplat(ctx, sc.ID, base); !errors.Is(err, ErrConflict) {
+			t.Fatalf("二重に入れた: %v", err)
+		}
+		missing := newScan(t, 0)
+		if err := s.EnqueueSplat(ctx, missing.ID, base); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("無い ID: %v", err)
+		}
+		rows, _ := s.List(ctx, ListQuery{Limit: 10})
+		if len(rows) != 1 || !rows[0].SplatPending {
+			t.Fatalf("一覧の SplatPending = %+v", rows)
+		}
+
+		got, err := s.ClaimNextSplat(ctx, base.Add(time.Minute))
+		if err != nil || got == nil || got.ID != sc.ID {
+			t.Fatalf("ClaimNextSplat = %v, %v", got, err)
+		}
+		if d := mustGet(t, s, sc.ID); d.Splat.Status != scan.SplatRunning || d.Splat.Attempts != 1 || d.Splat.StartedAt == nil ||
+			step(d, scan.StepSOG).Message != "" {
+			t.Fatalf("実行中 = %+v / %+v（待っている間の説明は消えるはず）", d.Splat, step(d, scan.StepSOG))
+		}
+		if again, _ := s.ClaimNextSplat(ctx, base); again != nil {
+			t.Fatal("実行中のものをもう一度取り出した")
+		}
+
+		// 新しいスキャンに順番を譲る: 待ちに戻り、譲った回は着手回数に数えない。
+		if err := s.RequeueSplat(ctx, sc.ID, base); err != nil {
+			t.Fatal(err)
+		}
+		d = mustGet(t, s, sc.ID)
+		if d.Splat.Status != scan.SplatQueued || d.Splat.Attempts != 0 || step(d, scan.StepSplat).Message == "" {
+			t.Fatalf("譲った後 = %+v / %+v", d.Splat, step(d, scan.StepSplat))
+		}
+
+		if _, err := s.ClaimNextSplat(ctx, base); err != nil {
+			t.Fatal(err)
+		}
+		out := scan.Outcome{Status: scan.StatusPartial, ErrorCode: "splat_failed", ErrorMessage: "メモリ不足"}
+		if ok, err := s.FinishSplat(ctx, sc.ID, out, base); !ok || err != nil {
+			t.Fatalf("FinishSplat = %v, %v", ok, err)
+		}
+		d = mustGet(t, s, sc.ID)
+		if d.Splat != nil || d.Scan.Status != scan.StatusPartial || d.Scan.ErrorCode != "splat_failed" || !d.Scan.Saved {
+			t.Fatalf("終えた後 = %+v / %+v", d.Splat, d.Scan)
+		}
+		if ok, _ := s.FinishSplat(ctx, sc.ID, out, base); ok {
+			t.Fatal("実行中でないのに FinishSplat が効いた")
+		}
+	})
+
+	t.Run("古い順に取り出し、待ち順を数える", func(t *testing.T) {
+		s := open(t)
+		a, b := newScan(t, 0), newScan(t, time.Minute)
+		for _, sc := range []scan.Scan{a, b} {
+			mustCreate(t, s, sc)
+		}
+		finishAs(t, s, a.ID, scan.StatusSucceeded)
+		finishAs(t, s, b.ID, scan.StatusSucceeded)
+		s.EnqueueSplat(ctx, b.ID, base)
+		s.EnqueueSplat(ctx, a.ID, base.Add(time.Second))
+		if n, _ := s.SplatQueuePosition(ctx, a.ID); n != 1 {
+			t.Fatalf("a の待ち順 = %d, want 1", n)
+		}
+		if got, _ := s.ClaimNextSplat(ctx, base); got == nil || got.ID != b.ID {
+			t.Fatalf("先頭 = %v, want b（先に入れた方）", got)
+		}
+		if n, _ := s.SplatQueuePosition(ctx, a.ID); n != 0 {
+			t.Fatalf("b が実行中のときの a の待ち順 = %d, want 0", n)
+		}
+	})
+
+	t.Run("期限切れ・削除で待ち行列からも消える", func(t *testing.T) {
+		s := open(t)
+		sc := newScan(t, 0)
+		mustCreate(t, s, sc)
+		finishAs(t, s, sc.ID, scan.StatusSucceeded)
+		s.EnqueueSplat(ctx, sc.ID, base)
+		if err := s.MarkExpired(ctx, sc.ID, base); err != nil {
+			t.Fatal(err)
+		}
+		if d := mustGet(t, s, sc.ID); d.Splat != nil {
+			t.Fatalf("期限切れでも残っている: %+v", d.Splat)
+		}
+		if got, _ := s.ClaimNextSplat(ctx, base); got != nil {
+			t.Fatal("期限切れのものを取り出した")
+		}
+		other := newScan(t, 0)
+		mustCreate(t, s, other)
+		finishAs(t, s, other.ID, scan.StatusSucceeded)
+		s.EnqueueSplat(ctx, other.ID, base)
+		if err := s.Delete(ctx, other.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := s.ClaimNextSplat(ctx, base); got != nil {
+			t.Fatal("削除したものを取り出した")
+		}
+	})
+
+	t.Run("起動時の回復: 上限未満はやり直し、上限到達は失敗", func(t *testing.T) {
+		s := open(t)
+		sc := newScan(t, 0)
+		mustCreate(t, s, sc)
+		finishAs(t, s, sc.ID, scan.StatusSucceeded)
+		s.EnqueueSplat(ctx, sc.ID, base)
+		s.ClaimNextSplat(ctx, base) // 1回目の着手中に止まった
+		requeued, failed, err := s.RecoverSplats(ctx, 2, base)
+		if err != nil || len(requeued) != 1 || len(failed) != 0 {
+			t.Fatalf("1回目の回復 = %v %v %v", requeued, failed, err)
+		}
+		s.ClaimNextSplat(ctx, base) // 2回目の着手中にも止まった
+		requeued, failed, err = s.RecoverSplats(ctx, 2, base)
+		if err != nil || len(requeued) != 0 || len(failed) != 1 {
+			t.Fatalf("2回目の回復 = %v %v %v", requeued, failed, err)
+		}
+		d := mustGet(t, s, sc.ID)
+		if d.Splat != nil || d.Scan.Status != scan.StatusPartial || step(d, scan.StepSplat).Status != scan.StepFailed ||
+			step(d, scan.StepSOG).Status != scan.StepSkipped {
+			t.Fatalf("失敗の記録 = %+v / %+v", d.Scan, d.Steps)
 		}
 	})
 }

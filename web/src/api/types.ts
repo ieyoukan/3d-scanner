@@ -80,11 +80,22 @@ export interface Scan {
   resumable: boolean;
   /** この版を元にした続きの版（新しい順）。 */
   continuations: Continuation[];
+  /** あとで作る 3DGS が待ち行列にあればその状況。無ければ省略。 */
+  splatJob?: SplatJob;
   /** 自分より前に並んでいる件数。queued のときだけ入る。 */
   queuePosition?: number;
   error: ApiErrorDetail | null;
   steps: Step[];
   assets: Asset[];
+}
+
+/** あとで作る 3DGS の状況。 */
+export interface SplatJob {
+  /** queued = 順番待ち（新しいスキャンの処理が先） / running = 学習中 */
+  status: 'queued' | 'running';
+  /** 自分より前に並んでいる 3DGS の件数（順番待ちのときだけ）。 */
+  queuePosition?: number;
+  attempts: number;
 }
 
 /** 続きの版1件の概要。 */
@@ -113,6 +124,8 @@ export interface PipelineInfo {
   splatDevice: 'cpu' | 'gpu';
   colmapVersion: string;
   colmapGpu: boolean;
+  /** true なら、3DGS はメッシュの後で（手が空いたときに）作る。 */
+  splatDeferred: boolean;
 }
 
 export interface ServerConfig {
@@ -139,6 +152,8 @@ export interface GalleryItem {
   parentId?: string;
   /** 元の版から引き継いだ写真の枚数。 */
   baseFrameCount: number;
+  /** 3DGS をあとで作る予定（順番待ちか学習中）か。 */
+  splatPending: boolean;
 }
 
 export interface GalleryPage {

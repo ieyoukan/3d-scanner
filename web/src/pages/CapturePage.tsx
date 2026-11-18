@@ -138,6 +138,10 @@ function CaptureGuide({ minImages, onClose }: { minImages: number; onClose: () =
       title: 'ぶれないように、止まってから撮る',
       why: 'ぶれた写真からは輪郭が取れず、位置合わせに使えません。暗い場所は特に注意。',
     },
+    {
+      title: '「自動撮影」なら、止まるたびに撮れる',
+      why: 'ゆっくり移動しては止まる、を繰り返すと、景色が十分変わっていれば自動で撮ります。撮り忘れや撮りすぎが減ります。',
+    },
   ];
   return (
     <div role="dialog" aria-modal="true" aria-label="撮り方" className="fixed inset-0 z-20 flex flex-col bg-ink">

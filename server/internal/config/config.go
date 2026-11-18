@@ -67,6 +67,13 @@ type Jobs struct {
 	PollInterval time.Duration
 	// JanitorInterval は期限切れ掃除の間隔。
 	JanitorInterval time.Duration
+	// DeferSplat が true なら、3DGS はメッシュの後に続けて作らず、別の待ち行列に入れてあとで作る。
+	// スキャンはメッシュが出来た時点で完成になり、すぐ見られる。3DGS が CPU で数十分かかる環境向け。
+	DeferSplat bool
+	// SplatYield が true なら、あとで作る 3DGS の学習中に新しいスキャンが来たら学習を止めて順番を譲り、
+	// 後で最初からやり直す（CPU を取り合って両方が遅くなるのを避ける）。
+	// GPU で学習するなら false にすると、新しいスキャンの処理と並行して学習する。
+	SplatYield bool
 }
 
 // MeshMode はメッシュ分岐の作り方。
@@ -149,6 +156,8 @@ func Load(getenv func(string) string) (Config, error) {
 			MaxAttempts:         r.integer("MAX_ATTEMPTS", 2),
 			PollInterval:        r.duration("POLL_INTERVAL", 5*time.Second),
 			JanitorInterval:     r.duration("JANITOR_INTERVAL", 10*time.Minute),
+			DeferSplat:          r.boolean("SPLAT_DEFERRED", true),
+			SplatYield:          r.boolean("SPLAT_YIELD", true),
 		},
 		Pipeline: readPipeline(r),
 	}

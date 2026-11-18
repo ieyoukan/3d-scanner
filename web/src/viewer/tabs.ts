@@ -3,6 +3,7 @@
 // 方針: 出来なかった出力のタブも消さない。押せない状態で残し、理由を表示する。
 // 「タブが無い」だと、失敗したのか、そもそも作らない設定なのか、利用者には区別が付かない。
 import type { Asset, AssetKind, Scan, StepName } from '../api/types';
+import { splatJobText } from '../progress/stages';
 
 export type TabKey = 'mesh' | 'splat' | 'points';
 
@@ -51,7 +52,13 @@ export function buildTabs(scan: Scan): ViewerTab[] {
 
   // 3DGS は圧縮版（SOG）を優先する。SOG への変換だけ失敗した場合は、元の PLY を表示する。
   const splat = sog ?? ply;
-  const splatNote = !sog && ply ? '圧縮版（SOG）を作れなかったため、元の PLY を表示しています。読み込みに時間がかかります。' : '';
+  let splatNote = !sog && ply ? '圧縮版（SOG）を作れなかったため、元の PLY を表示しています。読み込みに時間がかかります。' : '';
+  // あとで作る 3DGS が待ち行列にある。前の 3DGS があれば（作り直し中）それを表示し、無ければ理由を出す。
+  if (scan.splatJob && splat) {
+    const now = scan.splatJob.status === 'running' ? '学習中' : '順番待ち';
+    splatNote = `作り直しています（${now}）。出来上がるまで前の 3DGS を表示します。`;
+  }
+  const splatReason = scan.splatJob ? splatJobText(scan) : whyMissing(scan, ['splat', 'sfm'], '3DGS は生成されていません。');
 
   return [
     {
@@ -65,7 +72,7 @@ export function buildTabs(scan: Scan): ViewerTab[] {
       key: 'splat',
       label: '3DGS',
       url: splat?.url ?? null,
-      reason: splat ? '' : whyMissing(scan, ['splat', 'sfm'], '3DGS は生成されていません。'),
+      reason: splat ? '' : splatReason,
       note: splatNote,
     },
     {

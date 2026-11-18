@@ -50,3 +50,32 @@ func inspectImages(dir string) (count int, sameSize bool, err error) {
 	}
 	return count, sameSize, nil
 }
+
+// imagesMatchSize は、dir の写真のうち skip に無いもの（＝今回特徴を抽出する写真）が
+// すべて w×h かどうかを返す。1枚も無ければ false。
+func imagesMatchSize(dir string, skip map[string]bool, w, h int) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() || skip[e.Name()] {
+			continue
+		}
+		f, err := os.Open(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return false
+		}
+		cfg, _, err := image.DecodeConfig(f)
+		f.Close()
+		if err != nil {
+			continue // 画像として読めないものは COLMAP も飛ばす
+		}
+		if cfg.Width != w || cfg.Height != h {
+			return false
+		}
+		n++
+	}
+	return n > 0
+}

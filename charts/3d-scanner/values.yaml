@@ -154,6 +154,12 @@ config:
     splatDownscale: 2
     # -- 3DGS を CPU で学習する。GPU 対応イメージと GPU を用意したら false にする。
     splatForceCPU: true
+    # -- 3DGS をあとで作る。メッシュが出来た時点でスキャンを完成にし、3DGS は別の待ち行列で
+    # 手が空いたときに学習する（CPU だと数十分かかるので、メッシュを先に見られるようにする）。
+    splatDeferred: true
+    # -- あとで作る 3DGS の学習中に新しいスキャンが来たら、学習を止めて順番を譲り、後でやり直す。
+    # CPU で学習するときは true（CPU を取り合わない）。GPU で学習するなら false にすると並行して動く。
+    splatYield: true
     # -- 各ステップの制限時間。
     timeouts:
       sfm: 1h

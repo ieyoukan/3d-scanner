@@ -117,7 +117,8 @@ const toneClass: Record<Tone, string> = {
 };
 
 function Card({ item }: { item: GalleryItem }) {
-  const badge = statusBadge(item.status);
+  // 完成していて 3DGS だけを待っているものは、そのことを札で示す。
+  const badge = statusBadge(item.status) ?? (item.splatPending ? { label: '3DGS 待ち', tone: 'active' as Tone } : null);
   const formats = formatLabels(item.assetKinds);
   return (
     <Link

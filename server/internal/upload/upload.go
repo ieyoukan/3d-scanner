@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/ieyoukan/3d-scanner/server/internal/config"
@@ -363,4 +364,39 @@ func (h *headBuffer) Write(p []byte) (int, error) {
 		h.buf = append(h.buf, p[:min(room, len(p))]...)
 	}
 	return len(p), nil
+}
+
+// FocalHint は、写真ごとのメタデータ（撮影側が EXIF から読んだ値）にある 35mm 換算の焦点距離から、
+// 今回の写真全体の代表値を求める。
+//
+// 手掛かりとして使うのは、次をすべて満たすときだけ:
+//   - 写真がすべて同じ寸法（1台のカメラ・同じ設定とみなせる）
+//   - 半分以上の写真に焦点距離がある
+//   - それらが中央値から ±5% に収まる（ズームを変えながら撮った写真には使わない）
+//
+// 外れた値を初期値に渡すと、渡さないより悪くなりうるので、迷ったら使わない。
+func FocalHint(frames []scan.Frame) (focal35 float64, ok bool) {
+	if len(frames) == 0 || !uniformSize(frames) {
+		return 0, false
+	}
+	var values []float64
+	for _, f := range frames {
+		var c struct {
+			FocalLength35mm float64 `json:"focalLength35mm"`
+		}
+		if len(f.Camera) > 0 && json.Unmarshal(f.Camera, &c) == nil && c.FocalLength35mm > 0 {
+			values = append(values, c.FocalLength35mm)
+		}
+	}
+	if len(values)*2 < len(frames) {
+		return 0, false
+	}
+	sort.Float64s(values)
+	median := values[len(values)/2]
+	for _, v := range values {
+		if v < median*0.95 || v > median*1.05 {
+			return 0, false
+		}
+	}
+	return median, true
 }

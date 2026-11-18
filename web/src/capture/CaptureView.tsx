@@ -7,13 +7,65 @@
 //
 // どの状況でも「写真を選ぶ」は押せる。カメラは便利な入力手段の1つであって必須ではない、
 // という作りにしておくと、権限の拒否や HTTP 接続でも行き止まりにならない。
+//
+// 撮り方の選択（カメラが使えるときに出す）:
+//   自動撮影  映像を見て、止まった瞬間に、前の写真から景色が十分変わっていれば自動で撮る（autoCapture.ts）。
+//             重なりの足りない写真やぶれた写真を減らし、「一部しか復元できない」を防ぐ。
+//   静止画    対応端末では、映像の1コマではなくカメラの静止画で撮る（解像度が高く、ぶれ・ノイズが少ない）。
+//             撮れなかったら映像の1コマに切り替え、そのことを伝える。
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import type { Limits } from '../api/types';
 import { useCamera } from '../camera/useCamera';
 import { Button, buttonClass } from '../ui/Button';
 import { AlertIcon, CameraIcon, ForwardIcon, ImagesIcon } from '../ui/icons';
-import { frameFromCapture, frameFromFile, FrameError, type Frame } from './frames';
+import { decide, initialAutoState, markCaptured, signatureOf, type AutoAdvice, type AutoState } from './autoCapture';
+import { frameFromCapture, frameFromFile, frameFromPhoto, FrameError, type Frame } from './frames';
 import { captureHint } from './validation';
+
+/** 自動撮影の判断の間隔（ミリ秒）。1秒に5回見る。 */
+const autoIntervalMs = 200;
+/** 判断に使う映像の大きさ（4:3）。 */
+const sampleWidth = 64;
+const sampleHeight = 48;
+
+/** 端末に覚えておく設定（次に開いたときも同じにする）。 */
+function usePreference(key: string, initial: boolean): [boolean, (v: boolean) => void] {
+  const [value, setValue] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem(key);
+      return saved === null ? initial : saved === '1';
+    } catch {
+      return initial;
+    }
+  });
+  const set = useCallback(
+    (v: boolean) => {
+      setValue(v);
+      try {
+        window.localStorage.setItem(key, v ? '1' : '0');
+      } catch {
+        // 保存できない（プライベートモードなど）ときは、この画面の間だけ覚える。
+      }
+    },
+    [key],
+  );
+  return [value, set];
+}
+
+/** 自動撮影の案内。 */
+function autoHint(advice: AutoAdvice | null, tooFar: boolean): string {
+  if (tooFar) return '前の写真から離れすぎました。少し戻って、間を埋める写真も撮ると確実です。';
+  switch (advice) {
+    case 'flat':
+      return '模様のある所を写してください。無地だと位置を合わせられません。';
+    case 'move':
+      return '少し横へ移動してください。止まると自動で撮ります。';
+    case 'capture':
+      return '撮りました。そのまま少しずつ移動してください。';
+    default:
+      return 'ゆっくり移動して、止まると自動で撮ります。';
+  }
+}
 
 interface Props {
   frames: readonly Frame[];
@@ -37,6 +89,14 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
   const fileInput = useRef<HTMLInputElement>(null);
   const full = frames.length >= limits.maxImages;
 
+  const [auto, setAuto] = usePreference('capture.auto', false);
+  const [still, setStill] = usePreference('capture.still', true);
+  // 静止画で撮れなかったら、この画面の間は映像の1コマに切り替える（写真の寸法が混ざらないように）。
+  const stillBroken = useRef(false);
+  const stillAvailable = camera.state.kind === 'ready' && camera.state.still && !stillBroken.current;
+  const [advice, setAdvice] = useState<AutoAdvice | null>(null);
+  const [tooFar, setTooFar] = useState(false);
+
   // 以前にカメラを許可済みなら、ボタンを押させずにすぐ開始する。
   // 未許可のときは勝手に始めない: ページを開いた途端に許可ダイアログが出ると、
   // 何に使うのか分からないまま「拒否」されやすい。説明を読んでから押してもらう。
@@ -57,24 +117,84 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
     };
   }, [start]);
 
-  /** シャッター。いまの映像を1枚取り込み、一覧に足す。 */
-  const shoot = useCallback(async () => {
-    if (busy || full) return;
+  // 自動撮影のループから最新の値を読むための控え（ループを作り直さずに済むように）。
+  const busyRef = useRef(false);
+  const fullRef = useRef(full);
+  fullRef.current = full;
+
+  /** 1枚撮って一覧に足す。静止画が使えれば静止画、だめなら映像の1コマ。撮れたら true。 */
+  const shoot = useCallback(async (): Promise<boolean> => {
+    if (busyRef.current || fullRef.current) return false;
+    busyRef.current = true;
     setBusy(true);
     setNotice(null);
     try {
-      const blob = await camera.capture();
+      let frame: Frame;
+      if (still && stillAvailable) {
+        try {
+          frame = await frameFromPhoto(await camera.takePhoto());
+        } catch {
+          stillBroken.current = true;
+          setNotice('静止画で撮れなかったため、映像から切り出す方法に切り替えました。');
+          frame = await frameFromCapture(await camera.capture());
+        }
+      } else {
+        frame = await frameFromCapture(await camera.capture());
+      }
       setFlash(true);
       window.setTimeout(() => setFlash(false), 90);
       // 対応端末では短く振動させる（画面を見ていなくても撮れたと分かる）。
       navigator.vibrate?.(12);
-      onAdd([await frameFromCapture(blob)]);
+      onAdd([frame]);
+      return true;
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '撮影に失敗しました。');
+      return false;
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, full, camera, onAdd]);
+  }, [camera, onAdd, still, stillAvailable]);
+
+  // 自動撮影のループからは最新の shoot を呼ぶ（設定を切り替えても、ループと判断の記録を作り直さない）。
+  const shootRef = useRef(shoot);
+  shootRef.current = shoot;
+
+  // 自動撮影: 一定間隔で映像を見て、撮るべき瞬間なら撮る。
+  const ready = camera.state.kind === 'ready';
+  const { sample } = camera;
+  useEffect(() => {
+    if (!auto || !ready) {
+      setAdvice(null);
+      return;
+    }
+    let state: AutoState = initialAutoState;
+    let tooFarTimer: number | undefined;
+    const timer = window.setInterval(() => {
+      // 撮影中（静止画は時間がかかる）はプレビューが止まることがあるので、判断しない。
+      if (busyRef.current || fullRef.current || document.hidden) return;
+      const gray = sample(sampleWidth, sampleHeight);
+      if (!gray) return;
+      const sig = signatureOf(gray, sampleWidth, sampleHeight);
+      const now = performance.now();
+      const d = decide(state, sig, now);
+      state = d.state;
+      setAdvice(d.advice);
+      if (d.advice !== 'capture') return;
+      // 撮った時点で記録する（撮影に時間がかかっても、同じ景色をもう一度撮らない）。
+      state = markCaptured(state, sig, now);
+      if (d.tooFar) {
+        setTooFar(true);
+        window.clearTimeout(tooFarTimer);
+        tooFarTimer = window.setTimeout(() => setTooFar(false), 3000);
+      }
+      void shootRef.current();
+    }, autoIntervalMs);
+    return () => {
+      window.clearInterval(timer);
+      window.clearTimeout(tooFarTimer);
+    };
+  }, [auto, ready, sample]);
 
   /** 端末から選んだ写真を取り込む。 */
   const pickFiles = useCallback(
@@ -103,8 +223,6 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
     [onAdd, limits.maxImages],
   );
 
-  const ready = camera.state.kind === 'ready';
-
   return (
     <div className="flex h-full flex-col">
       {/* 映像の領域。写真が主役なので、画面の残り全部を使う。 */}
@@ -125,7 +243,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
           <>
             <FrameCorners />
             <p className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
-              {hint ?? captureHint(frames.length, limits)}
+              {auto ? autoHint(advice, tooFar) : (hint ?? captureHint(frames.length, limits))}
             </p>
           </>
         )}
@@ -179,8 +297,18 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
         </p>
       )}
 
+      {/* 撮り方の選択。カメラが使えるときだけ出す。 */}
+      {ready && (
+        <div className="flex items-center justify-center gap-2 border-t border-line bg-panel px-4 pt-2.5">
+          <Toggle on={auto} onChange={setAuto} label="自動撮影" />
+          {camera.state.kind === 'ready' && camera.state.still && (
+            <Toggle on={still && !stillBroken.current} onChange={setStill} label="静止画" />
+          )}
+        </div>
+      )}
+
       {/* 操作は下にまとめる。片手で持ったとき、親指が届く場所。 */}
-      <div className="pad-safe-b grid grid-cols-[1fr_auto_1fr] items-center gap-3 border-t border-line bg-panel px-4 pt-3">
+      <div className="pad-safe-b grid grid-cols-[1fr_auto_1fr] items-center gap-3 bg-panel px-4 pt-3">
         <div className="justify-self-start">
           {/*
             <input type="file"> は見た目を変えにくいので隠し、ボタンから click() で開く。
@@ -222,6 +350,23 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
         </div>
       </div>
     </div>
+  );
+}
+
+/** 撮り方の切り替え（押すたびに入・切）。 */
+function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boolean) => void; label: string }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={on}
+      onClick={() => onChange(!on)}
+      className={`flex min-h-9 items-center gap-1.5 rounded-full border px-3 text-sm ${
+        on ? 'border-amber text-amber' : 'border-line text-mute'
+      }`}
+    >
+      <span className={`size-2 rounded-full ${on ? 'bg-amber' : 'bg-line'}`} aria-hidden="true" />
+      {label}
+    </button>
   );
 }
 

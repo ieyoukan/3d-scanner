@@ -376,8 +376,19 @@ func TestRunCommandArguments(t *testing.T) {
 	if got := run.args["opensplat"]; got[0] != ws.Dir() {
 		t.Errorf("opensplat の第1引数 = %q, want %q", got[0], ws.Dir())
 	}
-	check("opensplat", "-n 300", "-d 2", "-o "+filepath.Join(ws.OutputDir(), "splat.ply"), "--cpu")
-	check("splat-transform", "-w -g cpu "+filepath.Join(ws.OutputDir(), "splat.ply")+" "+filepath.Join(ws.OutputDir(), "scene.sog"))
+	// 学習と圧縮は別の名前に書いてから置き換える（作り直しの途中で前の 3DGS を壊さない）。
+	check("opensplat", "-n 300", "-d 2", "-o "+filepath.Join(ws.OutputDir(), "splat.new.ply"), "--cpu")
+	check("splat-transform", "-w -g cpu "+filepath.Join(ws.OutputDir(), "splat.ply")+" "+filepath.Join(ws.OutputDir(), "scene.new.sog"))
+	for _, name := range []string{"splat.ply", "scene.sog"} {
+		if _, err := os.Stat(filepath.Join(ws.OutputDir(), name)); err != nil {
+			t.Errorf("%s が置き換わっていない: %v", name, err)
+		}
+	}
+	for _, name := range []string{"splat.new.ply", "scene.new.sog"} {
+		if _, err := os.Stat(filepath.Join(ws.OutputDir(), name)); !os.IsNotExist(err) {
+			t.Errorf("%s が残っている", name)
+		}
+	}
 }
 
 // TestRunMixedImageSizesDisablesSingleCamera: 寸法の違う写真が混ざっていたらカメラを共有しない。
@@ -845,5 +856,109 @@ func TestNewScanDoesNotUseResumeOptions(t *testing.T) {
 	args := run.args["colmap mapper"]
 	if argValue(args, "--input_path") != "" || argValue(args, "--output_path") != job.WS.SparseDir() {
 		t.Fatalf("mapper の引数 = %v", args)
+	}
+}
+
+// TestDeferSplatStopsAfterMesh: あとで作る設定では、メッシュが出来たら 3DGS を実行せずに戻る。
+func TestDeferSplatStopsAfterMesh(t *testing.T) {
+	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
+	job.DeferSplat = true
+	if err := New(testPipelineConfig(), run, Capabilities{}, nil).Run(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	if _, called := run.args["opensplat"]; called {
+		t.Fatal("あとで作るはずの 3DGS を実行した")
+	}
+	if _, done := rep.finished[scan.StepSplat]; done {
+		t.Fatalf("splat のステップを記録した: %s", rep.finished[scan.StepSplat])
+	}
+	// メッシュがあるので、この時点で見られる（succeeded）。
+	if out := rep.outcome(); out.Status != scan.StatusSucceeded {
+		t.Fatalf("全体 = %+v", out)
+	}
+
+	// 後から RunSplat で 3DGS 分岐だけを実行する。
+	if err := New(testPipelineConfig(), run, Capabilities{}, nil).RunSplat(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.finished[scan.StepSplat] != scan.StepSucceeded || rep.finished[scan.StepSOG] != scan.StepSucceeded {
+		t.Fatalf("3DGS = %s / %s", rep.finished[scan.StepSplat], rep.finished[scan.StepSOG])
+	}
+	if _, ok := rep.assets[scan.AssetGaussianSOG]; !ok {
+		t.Fatal("SOG が登録されていない")
+	}
+}
+
+// TestDeferSplatRunsInlineWhenMeshFails: メッシュが出来なかったら、見られるものを作るため 3DGS もその場で作る。
+func TestDeferSplatRunsInlineWhenMeshFails(t *testing.T) {
+	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
+	job.DeferSplat = true
+	run.fail["colmap delaunay_mesher"] = errors.New("失敗")
+	if err := New(testPipelineConfig(), run, Capabilities{}, nil).Run(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.finished[scan.StepSplat] != scan.StepSucceeded {
+		t.Fatalf("3DGS = %s（その場で作るはず）", rep.finished[scan.StepSplat])
+	}
+}
+
+// TestFailedSplatKeepsPreviousFile: 作り直しに失敗しても、前の 3DGS のファイルは残る。
+func TestFailedSplatKeepsPreviousFile(t *testing.T) {
+	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
+	prev := filepath.Join(job.WS.OutputDir(), "splat.ply")
+	if err := os.WriteFile(prev, []byte("前の 3DGS"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	run.garbage["opensplat"] = true
+	if err := New(testPipelineConfig(), run, Capabilities{}, nil).RunSplat(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.finished[scan.StepSplat] != scan.StepFailed {
+		t.Fatalf("3DGS = %s", rep.finished[scan.StepSplat])
+	}
+	if b, _ := os.ReadFile(prev); string(b) != "前の 3DGS" {
+		t.Fatalf("前のファイルが書き換わった: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(job.WS.OutputDir(), "splat.new.ply")); !os.IsNotExist(err) {
+		t.Fatal("作りかけのファイルが残っている")
+	}
+}
+
+func TestCameraHintFocalPixels(t *testing.T) {
+	// 26mm 相当・4000×3000 の写真: 対角 5000px ÷ 43.27mm × 26mm ≒ 3004px。
+	h := CameraHint{FocalLength35mm: 26, Width: 4000, Height: 3000}
+	if got := h.FocalPixels(); got < 3003 || got > 3006 {
+		t.Fatalf("FocalPixels = %v", got)
+	}
+	for _, bad := range []CameraHint{{FocalLength35mm: 0, Width: 1, Height: 1}, {FocalLength35mm: 26}, {FocalLength35mm: 5000, Width: 1, Height: 1}} {
+		if bad.Valid() {
+			t.Errorf("%+v が有効とされた", bad)
+		}
+	}
+}
+
+// TestCameraHintPassedToColmap: 焦点距離の手掛かりがあり、写真がその寸法なら COLMAP に初期値として渡す。
+func TestCameraHintPassedToColmap(t *testing.T) {
+	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t) // 写真は 64×48
+	if err := WriteCameraHint(job.WS, CameraHint{FocalLength35mm: 26, Width: 64, Height: 48}); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(testPipelineConfig(), run, Capabilities{}, nil).Run(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	// 対角 80px ÷ 43.27 × 26 ≒ 48.07px、中心は (32, 24)。
+	if got := argValue(run.args["colmap feature_extractor"], "--ImageReader.camera_params"); got != "48.07,32.0,24.0,0" {
+		t.Fatalf("camera_params = %q", got)
+	}
+	if msg := rep.messages[scan.StepSfM]; !strings.Contains(msg, "35mm 換算 26mm") {
+		t.Fatalf("SfM の補足 = %q", msg)
+	}
+
+	// 寸法が合わなければ使わない。
+	run, rep, job = newFakeRunner(), newFakeReporter(), newJob(t)
+	WriteCameraHint(job.WS, CameraHint{FocalLength35mm: 26, Width: 4000, Height: 3000})
+	New(testPipelineConfig(), run, Capabilities{}, nil).Run(context.Background(), job, rep)
+	if got := argValue(run.args["colmap feature_extractor"], "--ImageReader.camera_params"); got != "" {
+		t.Fatalf("寸法が違うのに渡した: %q", got)
 	}
 }

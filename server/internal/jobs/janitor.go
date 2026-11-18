@@ -73,6 +73,8 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 			// 状態は cancelled になったので、次回の掃除で expired に進む。
 			continue
 		}
+		// あとで作る 3DGS を学習中なら止める（保存しない設定のとき、完成したスキャンも期限で消える）。
+		s.stopSplat(id)
 		if err := ws.Remove(); err != nil {
 			s.log.Error("期限切れのファイルを削除できません", "scan", id, "error", err)
 			continue

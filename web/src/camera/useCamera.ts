@@ -14,8 +14,22 @@ import { checkCameraSupport, describeCameraError, type CameraFailure } from './c
 export type CameraState =
   | { kind: 'idle' }
   | { kind: 'starting' }
-  | { kind: 'ready'; width: number; height: number; label: string }
+  // still: 静止画で撮れるか（ImageCapture に対応しているか。Android の Chrome などが対応）。
+  | { kind: 'ready'; width: number; height: number; label: string; still: boolean }
   | { kind: 'unavailable'; failure: CameraFailure };
+
+/**
+ * ImageCapture（静止画の撮影）の最小限の型。TypeScript の標準の型定義には含まれていないので自分で書く。
+ * takePhoto はカメラの静止画の仕組みで撮るので、映像の1コマより解像度が高く、ぶれ・圧縮ノイズも少ない。
+ */
+interface ImageCaptureLike {
+  takePhoto(): Promise<Blob>;
+}
+type ImageCaptureConstructor = new (track: MediaStreamTrack) => ImageCaptureLike;
+
+function imageCaptureConstructor(): ImageCaptureConstructor | undefined {
+  return (globalThis as { ImageCapture?: ImageCaptureConstructor }).ImageCapture;
+}
 
 /**
  * カメラに求める条件。
@@ -40,11 +54,15 @@ export function useCamera() {
   // MediaStream は画面の描画に関係しない値なので、state ではなく ref に持つ
   // （変えても再描画を起こさない）。
   const streamRef = useRef<MediaStream | null>(null);
+  const imageCaptureRef = useRef<ImageCaptureLike | null>(null);
+  // 自動撮影の判断に使う、小さな映像を描くための canvas（毎回作らず使い回す）。
+  const sampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   /** カメラを止めて解放する。止めないと、端末のカメラ使用中ランプが点いたままになる。 */
   const stop = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    imageCaptureRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
     setState((prev) => (prev.kind === 'unavailable' ? prev : { kind: 'idle' }));
   }, []);
@@ -77,12 +95,22 @@ export function useCamera() {
       await video.play();
 
       const track = stream.getVideoTracks()[0];
+      const ImageCapture = imageCaptureConstructor();
+      imageCaptureRef.current = null;
+      if (ImageCapture && track) {
+        try {
+          imageCaptureRef.current = new ImageCapture(track);
+        } catch {
+          // 作れない端末では、映像の1コマを使う。
+        }
+      }
       setState({
         kind: 'ready',
         // videoWidth/Height は実際に流れてくる映像の大きさ（希望どおりとは限らない）。
         width: video.videoWidth,
         height: video.videoHeight,
         label: track?.label ?? '',
+        still: imageCaptureRef.current !== null,
       });
     } catch (err) {
       streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -117,6 +145,37 @@ export function useCamera() {
     });
   }, []);
 
+  /**
+   * 静止画を撮る（ImageCapture.takePhoto）。対応していなければ例外。
+   * 端末によっては 0.5〜2 秒ほどかかり、その間プレビューが止まることがある。
+   */
+  const takePhoto = useCallback(async (): Promise<Blob> => {
+    const ic = imageCaptureRef.current;
+    if (!ic) throw new Error('この端末では静止画で撮れません。');
+    return ic.takePhoto();
+  }, []);
+
+  /**
+   * いまの映像を width×height の白黒に縮めて返す（自動撮影の判断用）。映像がまだ無ければ null。
+   * 判断には景色の大まかな形が分かれば足りるので、とても小さくして計算を軽くする。
+   */
+  const sample = useCallback((width: number, height: number): Float32Array | null => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth === 0 || video.paused) return null;
+    const canvas = (sampleCanvasRef.current ??= document.createElement('canvas'));
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(video, 0, 0, width, height);
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+    const gray = new Float32Array(width * height);
+    for (let i = 0; i < gray.length; i++) {
+      gray[i] = 0.299 * (rgba[i * 4] ?? 0) + 0.587 * (rgba[i * 4 + 1] ?? 0) + 0.114 * (rgba[i * 4 + 2] ?? 0);
+    }
+    return gray;
+  }, []);
+
   // 画面を離れる（コンポーネントが消える）ときは必ずカメラを解放する。
   useEffect(() => stop, [stop]);
 
@@ -137,5 +196,5 @@ export function useCamera() {
     return () => document.removeEventListener('visibilitychange', onVisibility);
   }, [start, stop]);
 
-  return { state, videoRef, start, stop, capture };
+  return { state, videoRef, start, stop, capture, takePhoto, sample };
 }

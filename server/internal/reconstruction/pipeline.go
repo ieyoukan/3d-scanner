@@ -41,6 +41,10 @@ type Job struct {
 	ID string
 	// WS は作業ディレクトリ。images/ に写真が入っている。
 	WS *workspace.Scan
+	// DeferSplat が true なら、メッシュが出来たときは 3DGS 分岐を実行せずに戻る
+	// （splat / sog のステップは pending のまま残る。呼び出し側が待ち行列に入れ、後で RunSplat を呼ぶ）。
+	// メッシュが出来なかったときは、見られるものを1つでも作るため、そのまま 3DGS も実行する。
+	DeferSplat bool
 }
 
 // Reporter はパイプラインの進行状況を受け取る側（本番ではワーカーが DB に書く）。
@@ -141,10 +145,25 @@ func (p *Pipeline) Run(ctx context.Context, job Job, rep Reporter) error {
 
 	// 2つの分岐は並列ではなく順番に実行する。どちらも全コアとメモリを使うので、
 	// 同時に走らせると互いに遅くなり、メモリ不足で落ちやすくなる。
-	p.runMeshBranch(ctx, job, rep)
+	meshOK := p.runMeshBranch(ctx, job, rep)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if job.DeferSplat && meshOK && p.cfg.EnableSplat {
+		// 3DGS はあとで（RunSplat）。メッシュが出来ているので、スキャンはこの時点で見られる。
+		return nil
+	}
+	p.runSplatBranch(ctx, job, rep)
+	return ctx.Err()
+}
+
+// RunSplat は 3DGS 分岐（学習 → SOG への圧縮）だけを実行する。あとで作る 3DGS の待ち行列から呼ぶ。
+//
+// 入力: SfM が済んだ作業ディレクトリ（images/ と sparse/0/）。
+// 副作用: output/splat.ply と output/scene.sog を作り直す。前の版のファイルは、新しいものが
+// 出来上がって検証を通るまで残す（作り直しに失敗しても、前の 3DGS は見られるまま）。
+// 失敗条件: ctx が取り消されたときだけ、そのエラーを返す（Run と同じ）。
+func (p *Pipeline) RunSplat(ctx context.Context, job Job, rep Reporter) error {
 	p.runSplatBranch(ctx, job, rep)
 	return ctx.Err()
 }
@@ -230,6 +249,16 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		"--ImageReader.single_camera", boolArg(sameSize),
 		"--FeatureExtraction.use_gpu", boolArg(p.cfg.ColmapUseGPU),
 		"--FeatureExtraction.max_image_size", strconv.Itoa(p.cfg.ColmapMaxImageSize),
+	}
+	//   camera_params: 撮影側が写真の EXIF から読んだ焦点距離があれば、初期値（事前値）として渡す。
+	//     ブラウザで縮小し直した写真には EXIF が残らないので、渡さないと COLMAP は長辺の 1.2 倍という
+	//     仮の値から始める。値は SIMPLE_RADIAL の順（f, cx, cy, k）。中心は写真の真ん中、歪みは 0 から。
+	//     今回抽出する写真がすべてその寸法のときだけ使う（寸法が違えば焦点距離の画素数も違う）。
+	hint, hasHint := ReadCameraHint(ws)
+	hasHint = hasHint && imagesMatchSize(ws.ImagesDir(), inherited, hint.Width, hint.Height)
+	if hasHint {
+		args = append(args, "--ImageReader.camera_params", fmt.Sprintf("%.2f,%.1f,%.1f,0",
+			hint.FocalPixels(), float64(hint.Width)/2, float64(hint.Height)/2))
 	}
 	args = p.withThreads(args, "--FeatureExtraction.num_threads")
 	if err := p.colmap(ctx, logPath, p.cfg.SfMTimeout, args...); err != nil {
@@ -328,6 +357,10 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		return "", err
 	}
 
+	focalNote := ""
+	if hasHint {
+		focalNote = fmt.Sprintf("写真に記録された焦点距離（35mm 換算 %gmm）を手掛かりにしました。", hint.FocalLength35mm)
+	}
 	if resume {
 		msg := fmt.Sprintf("今回の%d枚中%d枚を、保存済みの3Dデータの位置に合わせて追加しました。"+
 			"全体で%d枚のカメラ位置と%d個の3D点になりました（平均再投影誤差 %.2f px）。",
@@ -335,14 +368,14 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		if added < addedTotal {
 			msg += "位置を合わせられなかった写真は、以降の処理では使われません。"
 		}
-		return msg, nil
+		return msg + focalNote, nil
 	}
 	msg := fmt.Sprintf("%d枚中%d枚のカメラ位置を推定し、%d個の3D点を得ました（平均再投影誤差 %.2f px）。",
 		info.TotalImages, info.RegisteredImages, info.Points, info.MeanReprojectionError)
 	if info.RegisteredImages < info.TotalImages {
 		msg += "位置を推定できなかった写真は、以降の処理では使われません。"
 	}
-	return msg, nil
+	return msg + focalNote, nil
 }
 
 // noNewImagesMessage は、続きの版で今回の写真を1枚も地図に合わせられなかったときの説明。
@@ -435,11 +468,12 @@ func (p *Pipeline) selectBestModel(ctx context.Context, ws *workspace.Scan, logP
 // メッシュ分岐（MVS → Mesh）
 // ---------------------------------------------------------------------------
 
-func (p *Pipeline) runMeshBranch(ctx context.Context, job Job, rep Reporter) {
+// runMeshBranch はメッシュ分岐を実行し、メッシュ（GLB）が出来たかを返す。
+func (p *Pipeline) runMeshBranch(ctx context.Context, job Job, rep Reporter) bool {
 	if !p.cfg.EnableMesh {
 		rep.StepFinished(ctx, scan.StepMVS, scan.StepSkipped, "設定でメッシュ生成が無効になっています。")
 		rep.StepFinished(ctx, scan.StepMesh, scan.StepSkipped, "設定でメッシュ生成が無効になっています。")
-		return
+		return false
 	}
 
 	dense := p.DenseMesh()
@@ -448,7 +482,7 @@ func (p *Pipeline) runMeshBranch(ctx context.Context, job Job, rep Reporter) {
 			if ctx.Err() == nil {
 				rep.StepFinished(ctx, scan.StepMesh, scan.StepSkipped, "MVS が失敗したため実行していません。")
 			}
-			return
+			return false
 		}
 	} else {
 		// 「実行しなかった」ことと理由を隠さず記録する。
@@ -458,7 +492,7 @@ func (p *Pipeline) runMeshBranch(ctx context.Context, job Job, rep Reporter) {
 	}
 
 	// メッシュ分岐の失敗は 3DGS 分岐を止めない。エラーは step が Reporter に伝え済み。
-	_ = p.step(ctx, rep, scan.StepMesh, func() (string, error) { return p.runMesh(ctx, job, rep, dense) })
+	return p.step(ctx, rep, scan.StepMesh, func() (string, error) { return p.runMesh(ctx, job, rep, dense) }) == nil
 }
 
 // undistort は「レンズの歪みを取り除いた画像」と、それに対応するカメラ（歪みなしの PINHOLE）を作る。
@@ -661,13 +695,17 @@ func (p *Pipeline) runSplatBranch(ctx context.Context, job Job, rep Reporter) {
 func (p *Pipeline) runSplat(ctx context.Context, job Job, rep Reporter) (string, error) {
 	ws := job.WS
 	out := filepath.Join(ws.OutputDir(), "splat.ply")
+	// 学習中は別の名前に書き、出来上がって検証を通ってから置き換える。作り直しの途中や失敗で、
+	// 前の 3DGS（閲覧中かもしれない）を壊さないため。
+	tmp := filepath.Join(ws.OutputDir(), "splat.new.ply")
+	defer os.Remove(tmp)
 
 	// -n: 学習の反復回数。-d: 画像を 1/d に縮小して学習（速くなるが細部は甘くなる）。
 	// -o: 出力先。指定しないと入力の隣に書かれるので、必ず output/ を明示する。
 	args := []string{ws.Dir(),
 		"-n", strconv.Itoa(p.cfg.SplatIterations),
 		"-d", strconv.FormatFloat(p.cfg.SplatDownscale, 'g', -1, 64),
-		"-o", out,
+		"-o", tmp,
 	}
 	if p.cfg.SplatForceCPU {
 		// --cpu: GPU を探さず CPU で実行する。OpenSplat の README によれば GPU の約100倍遅い。
@@ -686,6 +724,9 @@ func (p *Pipeline) runSplat(ctx context.Context, job Job, rep Reporter) (string,
 	}
 	if _, err := p.run.Run(ctx, cmd); err != nil {
 		return "", err
+	}
+	if err := replaceChecked(tmp, out, 1024, []byte("ply")); err != nil {
+		return "", fmt.Errorf("成果物 %s の検証に失敗: %w", scan.AssetGaussianPLY, err)
 	}
 	if err := p.publish(ctx, rep, scan.AssetGaussianPLY, out, 1024, []byte("ply")); err != nil {
 		return "", err
@@ -708,13 +749,16 @@ func (p *Pipeline) runSOG(ctx context.Context, job Job, rep Reporter) (string, e
 	ws := job.WS
 	in := filepath.Join(ws.OutputDir(), "splat.ply")
 	out := filepath.Join(ws.OutputDir(), "scene.sog")
+	// 学習と同じく、別の名前に書いてから置き換える（拡張子で形式が決まるので .sog で終わる名前にする）。
+	tmp := filepath.Join(ws.OutputDir(), "scene.new.sog")
+	defer os.Remove(tmp)
 
 	// -w: 出力ファイルがあれば上書き（やり直しのとき用）。
 	// -g cpu: 圧縮の中で唯一 GPU を使う処理（球面調和係数の k-means）を CPU で行う。
 	//         公式ドキュメントに「GPU が無くても動くが 5〜10 倍遅い」とある。
 	if _, err := p.run.Run(ctx, cmdrun.Command{
 		Name:    p.cfg.SplatTransformBin,
-		Args:    []string{"-w", "-g", "cpu", in, out},
+		Args:    []string{"-w", "-g", "cpu", in, tmp},
 		Dir:     ws.Dir(),
 		Timeout: p.cfg.SOGTimeout,
 		LogPath: ws.LogPath(scan.StepSOG),
@@ -722,6 +766,9 @@ func (p *Pipeline) runSOG(ctx context.Context, job Job, rep Reporter) (string, e
 		return "", err
 	}
 	// バンドル版の .sog は ZIP なので、先頭は "PK"。
+	if err := replaceChecked(tmp, out, 100, []byte("PK")); err != nil {
+		return "", fmt.Errorf("成果物 %s の検証に失敗: %w", scan.AssetGaussianSOG, err)
+	}
 	if err := p.publish(ctx, rep, scan.AssetGaussianSOG, out, 100, []byte("PK")); err != nil {
 		return "", err
 	}
@@ -763,6 +810,14 @@ func (p *Pipeline) publish(ctx context.Context, rep Reporter, kind scan.AssetKin
 	}
 	rep.AssetReady(ctx, kind, path, size)
 	return nil
+}
+
+// replaceChecked は tmp を検証し、通れば dst に置き換える（同じディレクトリ内の名前の変更なので一瞬で切り替わる）。
+func replaceChecked(tmp, dst string, minBytes int64, magic []byte) error {
+	if _, err := checkFile(tmp, minBytes, magic); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 // checkFile はファイルが存在し、minBytes 以上で、先頭が magic で始まることを確かめる。

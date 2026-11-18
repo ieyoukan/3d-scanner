@@ -34,6 +34,8 @@ export function buildMetadata(frames: readonly Frame[], client: Record<string, u
       source: f.source,
       width: f.width,
       height: f.height,
+      // 写真の EXIF にあった焦点距離（35mm 換算）。サーバーが SfM の初期値に使う。
+      ...(f.focalLength35mm ? { focalLength35mm: f.focalLength35mm } : {}),
     })),
   });
 }

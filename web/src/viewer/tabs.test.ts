@@ -92,3 +92,23 @@ describe('buildDownloads', () => {
     expect(downloads[0]?.href.endsWith('?download=1')).toBe(true);
   });
 });
+
+describe('あとで作る 3DGS', () => {
+  it('順番待ちなら、3DGS のタブにその旨を出し、メッシュは見られる', () => {
+    const s = { ...scan(['sparse_ply', 'mesh_glb'], { splat: { status: 'pending' }, sog: { status: 'pending' } }), status: 'succeeded' as const };
+    s.splatJob = { status: 'queued', queuePosition: 2, attempts: 0 };
+    const tabs = byKey(s);
+    expect(tabs.mesh?.url).not.toBeNull();
+    expect(tabs.splat?.url).toBeNull();
+    expect(tabs.splat?.reason).toContain('前に2件');
+    expect(defaultTab(buildTabs(s))).toBe('mesh');
+  });
+
+  it('作り直し中は前の 3DGS を表示し、その旨を添える', () => {
+    const s = scan(['mesh_glb', 'gaussian_sog'], { splat: { status: 'running' } });
+    s.splatJob = { status: 'running', attempts: 1 };
+    const tabs = byKey(s);
+    expect(tabs.splat?.url).toContain('gaussian_sog');
+    expect(tabs.splat?.note).toContain('作り直しています');
+  });
+});

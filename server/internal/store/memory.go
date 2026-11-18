@@ -23,6 +23,8 @@ type memScan struct {
 	frames []scan.Frame
 	steps  []scan.Step
 	assets map[scan.AssetKind]scan.Asset
+	// splat は 3DGS の待ち行列の行（無ければ nil）。行と一緒に消えるので ON DELETE CASCADE と同じ。
+	splat *scan.SplatJob
 }
 
 // NewMemory は空の Memory を返す。
@@ -54,6 +56,10 @@ func (m *Memory) Get(_ context.Context, id string) (scan.Detail, error) {
 		return scan.Detail{}, ErrNotFound
 	}
 	d := scan.Detail{Scan: ms.scan, Steps: append([]scan.Step(nil), ms.steps...)}
+	if ms.splat != nil {
+		j := *ms.splat
+		d.Splat = &j
+	}
 	for _, a := range ms.assets {
 		d.Assets = append(d.Assets, a)
 	}
@@ -181,7 +187,7 @@ func (m *Memory) List(_ context.Context, q ListQuery) ([]scan.Summary, error) {
 		if i >= q.Limit {
 			break
 		}
-		sum := scan.Summary{Scan: ms.scan}
+		sum := scan.Summary{Scan: ms.scan, SplatPending: ms.splat != nil}
 		for k := range ms.assets {
 			sum.AssetKinds = append(sum.AssetKinds, k)
 		}
@@ -361,7 +367,138 @@ func (m *Memory) MarkExpired(_ context.Context, id string, now time.Time) error 
 		ms.scan.FinishedAt = &t
 	}
 	ms.assets = map[scan.AssetKind]scan.Asset{}
+	ms.splat = nil
 	return nil
+}
+
+// ---- あとで作る 3DGS の待ち行列 ----
+
+// resetSplatSteps は splat / sog のステップを「待ち」に戻す。m.mu を持った状態で呼ぶ。
+func (ms *memScan) resetSplatSteps(message string) {
+	for i := range ms.steps {
+		if ms.steps[i].Name == scan.StepSplat || ms.steps[i].Name == scan.StepSOG {
+			ms.steps[i] = scan.Step{Name: ms.steps[i].Name, Status: scan.StepPending, Message: message}
+		}
+	}
+}
+
+func (m *Memory) EnqueueSplat(_ context.Context, id string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ms, ok := m.scans[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if !ms.scan.Status.Keepable() || ms.splat != nil {
+		return ErrConflict
+	}
+	ms.splat = &scan.SplatJob{Status: scan.SplatQueued, QueuedAt: now}
+	ms.resetSplatSteps(splatQueuedStep)
+	return nil
+}
+
+func (m *Memory) ClaimNextSplat(_ context.Context, now time.Time) (*scan.Scan, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var next *memScan
+	for _, ms := range m.scans {
+		if ms.splat == nil || ms.splat.Status != scan.SplatQueued || !ms.scan.Status.Keepable() {
+			continue
+		}
+		if next == nil || ms.splat.QueuedAt.Before(next.splat.QueuedAt) ||
+			(ms.splat.QueuedAt.Equal(next.splat.QueuedAt) && ms.scan.ID < next.scan.ID) {
+			next = ms
+		}
+	}
+	if next == nil {
+		return nil, nil
+	}
+	t := now
+	next.splat.Status, next.splat.StartedAt = scan.SplatRunning, &t
+	next.splat.Attempts++
+	next.resetSplatSteps("")
+	sc := next.scan
+	return &sc, nil
+}
+
+func (m *Memory) FinishSplat(_ context.Context, id string, out scan.Outcome, now time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ms, ok := m.scans[id]
+	if !ok || ms.splat == nil || ms.splat.Status != scan.SplatRunning {
+		return false, nil
+	}
+	ms.splat = nil
+	if ms.scan.Status.Keepable() {
+		ms.scan.Status, ms.scan.ErrorCode, ms.scan.ErrorMessage = out.Status, out.ErrorCode, out.ErrorMessage
+		ms.scan.UpdatedAt = now
+	}
+	return true, nil
+}
+
+func (m *Memory) RequeueSplat(_ context.Context, id string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ms, ok := m.scans[id]
+	if !ok || ms.splat == nil || ms.splat.Status != scan.SplatRunning {
+		return ErrNotFound
+	}
+	ms.splat.Status, ms.splat.StartedAt = scan.SplatQueued, nil
+	ms.splat.Attempts = max(ms.splat.Attempts-1, 0)
+	ms.resetSplatSteps(splatYieldedStep)
+	return nil
+}
+
+func (m *Memory) SplatQueuePosition(_ context.Context, id string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	me, ok := m.scans[id]
+	if !ok || me.splat == nil {
+		return 0, nil
+	}
+	n := 0
+	for _, ms := range m.scans {
+		if ms.splat == nil || ms.splat.Status != scan.SplatQueued {
+			continue
+		}
+		a, b := ms.splat.QueuedAt, me.splat.QueuedAt
+		if a.Before(b) || (a.Equal(b) && ms.scan.ID < me.scan.ID) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *Memory) RecoverSplats(_ context.Context, maxAttempts int, now time.Time) (requeued, failed []string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := now
+	for id, ms := range m.scans {
+		if ms.splat == nil || ms.splat.Status != scan.SplatRunning {
+			continue
+		}
+		if ms.splat.Attempts >= maxAttempts {
+			ms.splat = nil
+			for i := range ms.steps {
+				switch {
+				case ms.steps[i].Name == scan.StepSplat:
+					ms.steps[i].Status, ms.steps[i].FinishedAt, ms.steps[i].ErrorMessage = scan.StepFailed, &t, interruptedStep
+				case ms.steps[i].Name == scan.StepSOG && (ms.steps[i].Status == scan.StepPending || ms.steps[i].Status == scan.StepRunning):
+					ms.steps[i].Status, ms.steps[i].FinishedAt, ms.steps[i].Message = scan.StepSkipped, &t, notRunStep
+				}
+			}
+			if ms.scan.Status.Keepable() {
+				ms.scan.Status, ms.scan.ErrorCode, ms.scan.ErrorMessage = scan.StatusPartial, splatFailedCode, splatFailedMessage
+				ms.scan.UpdatedAt = now
+			}
+			failed = append(failed, id)
+			continue
+		}
+		ms.splat.Status, ms.splat.StartedAt = scan.SplatQueued, nil
+		ms.resetSplatSteps(splatQueuedStep)
+		requeued = append(requeued, id)
+	}
+	return requeued, failed, nil
 }
 
 func (m *Memory) PurgeExpired(_ context.Context, expiredBefore time.Time) (int, error) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Scan, ScanStatus, Step, StepName, StepStatus } from '../api/types';
-import { buildStages, formatDuration, headline, stepDuration } from './stages';
+import { buildStages, formatDuration, headline, splatJobText, stepDuration } from './stages';
 
 function step(name: StepName, status: StepStatus, extra: Partial<Step> = {}): Step {
   return { name, status, startedAt: null, finishedAt: null, message: '', error: '', hasLog: false, ...extra };
@@ -120,5 +120,23 @@ describe('時間の表示', () => {
     expect(stepDuration(step('sfm', 'succeeded', { startedAt: start, finishedAt: '2026-11-16T00:01:30Z' }), now)).toBe(90_000);
     expect(stepDuration(step('sfm', 'running', { startedAt: start }), now)).toBe(300_000);
     expect(stepDuration(step('sfm', 'pending'), now)).toBeNull();
+  });
+});
+
+describe('あとで作る 3DGS', () => {
+  it('完成していて 3DGS を待っている間は、見出しでそれを伝える', () => {
+    const s = scan('succeeded', { sfm: 'succeeded', mvs: 'skipped', mesh: 'succeeded', splat: 'pending', sog: 'pending' }, {
+      splatJob: { status: 'queued', queuePosition: 0, attempts: 0 },
+    });
+    const h = headline(s);
+    expect(h.tone).toBe('good');
+    expect(h.detail).toContain('3DGS はあとで作ります');
+    expect(buildStages(s).find((st) => st.key === 'splat')?.status).toBe('pending');
+  });
+
+  it('学習中・順番待ちの言い方', () => {
+    expect(splatJobText({ splatJob: { status: 'running', attempts: 1 } })).toContain('学習しています');
+    expect(splatJobText({ splatJob: { status: 'queued', queuePosition: 3, attempts: 0 } })).toContain('前に3件');
+    expect(splatJobText({})).toBe('');
   });
 });
