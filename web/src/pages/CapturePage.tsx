@@ -122,6 +122,10 @@ export function CapturePage({ config }: Props) {
 function CaptureGuide({ minImages, onClose }: { minImages: number; onClose: () => void }) {
   const tips: { title: string; why: string }[] = [
     {
+      title: 'いちばん簡単なのは、動画で1周',
+      why: '対象のまわりを、歩きながら10〜30秒かけて1周撮るだけです。「動画から作る」で選ぶと、1秒に3枚、ぶれの少ないコマを選んで写真にします。',
+    },
+    {
       title: '対象のまわりを、少しずつ移動しながら撮る',
       why: '同じ場所で向きだけ変えても奥行きは分かりません。カメラの位置が動くことで、立体の手掛かり（視差）が生まれます。',
     },
@@ -154,7 +158,7 @@ function CaptureGuide({ minImages, onClose }: { minImages: number; onClose: () =
       </div>
       <div className="mx-auto w-full max-w-xl flex-1 overflow-y-auto px-4 pb-8">
         <p className="mb-5 text-sm text-mute">
-          最低{minImages}枚、できれば20〜60枚。対象を中心に、円を描くように歩きながら撮るのが基本です。
+          写真なら最低{minImages}枚、できれば20〜60枚。対象を中心に、円を描くように歩きながら撮るのが基本です。
         </p>
         <ol className="space-y-5">
           {tips.map((tip, i) => (

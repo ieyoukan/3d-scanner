@@ -210,3 +210,52 @@ func TestReadCameras(t *testing.T) {
 		t.Fatal("壊れた行を受け付けた")
 	}
 }
+
+// ring は、点 target のまわりに半径 r で n 台のカメラを水平に並べ、全部が target を向く姿勢を作る。
+func ring(target [3]float64, r float64, n int) []ImagePose {
+	poses := make([]ImagePose, 0, n)
+	for i := 0; i < n; i++ {
+		a := 2 * math.Pi * float64(i) / float64(n)
+		c := [3]float64{target[0] + r*math.Cos(a), target[1] + 0.5, target[2] + r*math.Sin(a)}
+		f, _ := normalize([3]float64{target[0] - c[0], target[1] - c[1], target[2] - c[2]})
+		poses = append(poses, ImagePose{Center: c, Forward: f})
+	}
+	return poses
+}
+
+// TestFocusPoint: 1周撮影では視線が集まる点を中心にし、視線が集まらない撮り方では使わないこと。
+func TestFocusPoint(t *testing.T) {
+	target := [3]float64{2, 1, 3}
+	got, ok := focusPoint(ring(target, 4, 12))
+	if !ok || !nearVec(got, target) {
+		t.Errorf("1周: focusPoint = %v, %v, want %v", got, ok, target)
+	}
+
+	// 4分の1周（90°）でも、視線は十分に交わる。
+	quarter := ring(target, 4, 36)[:10]
+	if got, ok := focusPoint(quarter); !ok || !nearVec(got, target) {
+		t.Errorf("4分の1周: focusPoint = %v, %v", got, ok)
+	}
+
+	// 壁に沿って歩いた（全部が同じ向き）: 点が決まらない。
+	var wall []ImagePose
+	for i := 0; i < 10; i++ {
+		wall = append(wall, ImagePose{Center: [3]float64{float64(i), 0, 0}, Forward: [3]float64{0, 0, 1}})
+	}
+	if _, ok := focusPoint(wall); ok {
+		t.Error("視線が平行なのに中心が決まった")
+	}
+
+	// 外向きに並んだカメラ（部屋の中から周りの壁を撮った）: 交点がカメラの後ろにあるので使わない。
+	out := ring(target, 4, 12)
+	for i := range out {
+		out[i].Forward = [3]float64{-out[i].Forward[0], -out[i].Forward[1], -out[i].Forward[2]}
+	}
+	if _, ok := focusPoint(out); ok {
+		t.Error("全カメラの後ろにある点を中心にした")
+	}
+
+	if _, ok := focusPoint(ring(target, 4, 2)); ok {
+		t.Error("2台だけで中心を決めた")
+	}
+}

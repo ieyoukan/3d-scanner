@@ -55,9 +55,14 @@ const blurryRatio = 0.35;
 /**
  * 他の写真と比べて極端にくっきり度が低い写真の id を返す。
  * 基準に平均ではなく中央値を使うのは、極端に高い・低い写真に基準が引っ張られないようにするため。
+ *
+ * 動画から選んだコマ（source: 'video'）は比べない。区間の中で一番くっきりしたコマを選び済みで、
+ * それでも値が低いのは、白い天板のような模様の少ない物が大きく写っているためであることが多い
+ * （1周の動画で、ぶれていないコマの7枚に誤って「ぼけ」と出た）。消すと1周の中に抜けができる。
  */
-export function findBlurry(frames: readonly { id: string; sharpness: number }[]): Set<string> {
+export function findBlurry(frames: readonly { id: string; sharpness: number; source?: string }[]): Set<string> {
   const blurry = new Set<string>();
+  frames = frames.filter((f) => f.source !== 'video');
   if (frames.length < minFramesToCompare) return blurry;
   const sorted = frames.map((f) => f.sharpness).sort((a, b) => a - b);
   const median = sorted[Math.floor(sorted.length / 2)] ?? 0;

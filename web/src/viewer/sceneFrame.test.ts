@@ -54,14 +54,17 @@ describe('computeViewFrame', () => {
 
   it('カメラの初期位置は、実際に写真を撮った位置（1枚目）', () => {
     const frame = computeViewFrame(info());
-    // 1枚目のカメラは中心から 10 離れている（radius 4 の 1.5〜8 倍の範囲内なので、そのまま使う）。
+    // 1枚目のカメラは中心から 10 離れている（radius 4 の 0.5〜8 倍の範囲内なので、そのまま使う）。
     close(frame.cameraPosition, toView(frame, [1, 2, 0]));
     expect(Math.hypot(...frame.cameraPosition)).toBeCloseTo(10, 6);
   });
 
   it('カメラが近すぎる・遠すぎるときは、見やすい距離に収める（方向は保つ）', () => {
     const near = computeViewFrame(info({ cameraPositions: [[1, 2, 9]] })); // 中心から 1
-    expect(Math.hypot(...near.cameraPosition)).toBeCloseTo(4 * 1.5, 6);
+    expect(Math.hypot(...near.cameraPosition)).toBeCloseTo(4 * 0.5, 6);
+    // 点の広がり（radius）より内側でも、極端でなければ撮った位置のまま（床や背景の点が多い場合）。
+    const inside = computeViewFrame(info({ cameraPositions: [[1, 2, 7]] })); // 中心から 3
+    expect(Math.hypot(...inside.cameraPosition)).toBeCloseTo(3, 6);
     const far = computeViewFrame(info({ cameraPositions: [[1, 2, -990]] })); // 中心から 1000
     expect(Math.hypot(...far.cameraPosition)).toBeCloseTo(4 * 8, 6);
     // どちらも中心から見て同じ方向（同じ直線上）。

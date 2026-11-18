@@ -6,7 +6,7 @@
 //
 // 手掛かり（サーバーが scene.json に計算してくれている）:
 //   up      写真を撮ったときのカメラの「上」の平均。人はスマホをほぼ水平に持つので、重力の逆向きに近い。
-//   center  疎な点群の中央値。被写体のおおよその中心。
+//   center  被写体のおおよその中心（全カメラの視線が集まる点。集まらなければ疎な点群の中央値）。
 //   radius  中心からの広がり。
 //   cameraPositions  写真を撮った位置。
 //
@@ -118,7 +118,10 @@ export function computeViewFrame(info: SceneInfo | null): ViewFrame {
  *
  * 実際に写真を撮った位置の1つ（1枚目）を使う。そこからは必ず被写体が写っているので、
  * 「開いたら何も見えない」「裏側から見ている」といった事故が起きない。
- * 近すぎ・遠すぎの場合だけ、中心からの距離を見やすい範囲に収める。
+ * 3DGS は撮った位置から見たときに一番正しく見えるので、できるだけその位置のまま使う。
+ * 極端に近い・遠い場合だけ、中心からの距離を見やすい範囲に収める。
+ * （radius は点の広がりで、床や背景の点が多いと被写体より大きくなる。1周の動画では、
+ *   撮影位置までの距離が radius の 0.7 倍ほどのことがあった。下限は radius の半分にしてある。）
  */
 function initialCamera(info: SceneInfo, rotation: Quat, position: Vec3, radius: number): Vec3 {
   const first = info.cameraPositions[0];
@@ -127,7 +130,7 @@ function initialCamera(info: SceneInfo, rotation: Quat, position: Vec3, radius: 
   const p: Vec3 = [r[0] + position[0], r[1] + position[1], r[2] + position[2]];
   const dir = normalize(p);
   if (!dir) return [0, 0, radius * 3];
-  const distance = Math.min(Math.max(length(p), radius * 1.5), radius * 8);
+  const distance = Math.min(Math.max(length(p), radius * 0.5), radius * 8);
   return [dir[0] * distance, dir[1] * distance, dir[2] * distance];
 }
 
