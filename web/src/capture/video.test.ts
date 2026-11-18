@@ -27,7 +27,7 @@ describe('windowOf', () => {
 
 describe('BestPerWindow', () => {
   it('区間で一番くっきりしたコマだけを控え、次の区間に進んだら確定する', () => {
-    const p = new BestPerWindow(3, 3); // 1秒ずつ3区間
+    const p = BestPerWindow.forDuration(3, 3); // 1秒ずつ3区間
     expect(p.offer(0.0, 10)).toEqual({ window: 0, keep: true, closed: [] });
     expect(p.offer(0.3, 5)).toEqual({ window: 0, keep: false, closed: [] });
     expect(p.offer(0.6, 20)).toEqual({ window: 0, keep: true, closed: [] });
@@ -40,14 +40,14 @@ describe('BestPerWindow', () => {
   });
 
   it('確定した区間に戻ってきたコマは使わない', () => {
-    const p = new BestPerWindow(2, 2);
+    const p = BestPerWindow.forDuration(2, 2);
     p.offer(0.1, 1);
     p.offer(1.2, 1);
     expect(p.offer(0.2, 100)).toEqual({ window: 0, keep: false, closed: [] });
   });
 
   it('コマが1枚も来なかった区間は、後から埋められる', () => {
-    const p = new BestPerWindow(4, 4);
+    const p = BestPerWindow.forDuration(4, 4);
     p.offer(0.5, 1);
     expect(p.offer(3.5, 1).closed).toEqual([0]);
     expect(p.finish()).toEqual([3]);
@@ -58,3 +58,15 @@ describe('BestPerWindow', () => {
     expect(p.missing()).toEqual([2]);
   });
 });
+
+describe('BestPerWindow.every', () => {
+  it('一定の秒数で区切り、終わりは決まっていない', () => {
+    const p = BestPerWindow.every(0.5);
+    expect(p.offer(0.1, 1).window).toBe(0);
+    expect(p.offer(0.6, 1)).toEqual({ window: 1, keep: true, closed: [0] });
+    expect(p.offer(10.2, 1)).toEqual({ window: 20, keep: true, closed: [1] });
+    expect(p.missing()).toEqual([]);
+    expect(p.finish()).toEqual([20]);
+  });
+});
+

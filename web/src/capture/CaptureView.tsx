@@ -8,10 +8,15 @@
 // どの状況でも動画と写真は選べる。カメラは便利な入力手段の1つであって必須ではない、
 // という作りにしておくと、権限の拒否や HTTP 接続でも行き止まりにならない。
 //
-// 動画から作る（video.ts）:
-//   対象のまわりを歩きながら1周撮った動画を選ぶと、映像の領域で動画を再生しながら、
-//   1秒に3枚、ぶれの少ないコマを選んで写真の一覧に足し、確認画面へ進む。
-//   読んでいる間は撮影しない（自動撮影も止める）。
+// 撮り方は「動画」と「写真」の2つ（既定は動画。端末に覚える）:
+//   動画で撮る（liveVideo.ts）: 録画ボタンを押して、対象のまわりを歩きながら1周し、停止する。
+//     撮っている間にカメラの映像を見て、1/3 秒ごとの区間で一番くっきりしたコマを写真にしていく。
+//     停止したら写真の一覧に足し、確認画面へ進む。
+//   写真で撮る: シャッターで1枚ずつ（自動撮影・静止画を選べる）。
+//
+// 動画を選ぶ（video.ts）:
+//   撮ってある動画を選ぶと、映像の領域で動画を再生しながら、1秒に3枚、ぶれの少ないコマを選んで
+//   写真の一覧に足し、確認画面へ進む。読んでいる間は撮影しない（自動撮影も止める）。
 //
 // 撮り方の選択（カメラが使えるときに出す）:
 //   自動撮影  映像を見て、止まった瞬間に、前の写真から景色が十分変わっていれば自動で撮る（autoCapture.ts）。
@@ -26,6 +31,7 @@ import { AlertIcon, CameraIcon, ForwardIcon, ImagesIcon, VideoIcon } from '../ui
 import { decide, initialAutoState, markCaptured, signatureOf, type AutoAdvice, type AutoState } from './autoCapture';
 import { frameFromCapture, frameFromFile, frameFromPhoto, FrameError, type Frame } from './frames';
 import { captureHint } from './validation';
+import { startLiveRecording, type LiveProgress, type LiveRecording } from './liveVideo';
 import { framesFromVideo, type VideoProgress } from './video';
 
 /** 自動撮影の判断の間隔（ミリ秒）。1秒に5回見る。 */
@@ -127,8 +133,17 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importProgress, setImportProgress] = useState<VideoProgress | null>(null);
   const importing = importFile !== null;
-  // 送信中と、動画を読んでいる間は撮影しない。
-  const blocked = paused || importing;
+
+  // 撮り方（true: 動画で撮る / false: 写真で撮る）と、動画で撮っている最中の状態。
+  const [videoMode, setVideoMode] = usePreference('capture.video', true);
+  const recorderRef = useRef<LiveRecording | null>(null);
+  const [recording, setRecording] = useState<LiveProgress | null>(null);
+  // 停止してから、最後の写真ができあがるまで。
+  const [finishing, setFinishing] = useState(false);
+  const isRecording = recording !== null;
+
+  // 送信中・動画を読んでいる間・動画で撮っている間は、ほかの方法で撮らない。
+  const blocked = paused || importing || isRecording || finishing;
 
   const [auto, setAuto] = usePreference('capture.auto', false);
   const [still, setStill] = usePreference('capture.still', true);
@@ -208,7 +223,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const ready = camera.state.kind === 'ready';
   const { sample, videoRef } = camera;
   useEffect(() => {
-    if (!auto || !ready || blocked) {
+    if (!auto || videoMode || !ready || blocked) {
       setAdvice(null);
       return;
     }
@@ -247,7 +262,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
       window.clearInterval(timer);
       window.clearTimeout(tooFarTimer);
     };
-  }, [auto, ready, blocked, sample, videoRef]);
+  }, [auto, videoMode, ready, blocked, sample, videoRef]);
 
   // 動画の読み込みから、最新の値を読むための控え（値が変わるたびに読み込みをやり直さないように）。
   const onAddRef = useRef(onAdd);
@@ -309,6 +324,83 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   }, []);
   const openVideo = () => videoInput.current?.click();
 
+  // 動画で撮っている間は画面を消さない（1周に30秒ほどかかり、その間は画面に触れないため）。
+  const wakeLock = useRef<WakeLockSentinel | null>(null);
+  const releaseWakeLock = useCallback(() => {
+    void wakeLock.current?.release().catch(() => {});
+    wakeLock.current = null;
+  }, []);
+
+  /** 動画で撮る: 撮影を始める。 */
+  const startRecording = () => {
+    const video = camera.videoRef.current;
+    if (!video || !ready || blocked || full) return;
+    setNotice(null);
+    let rec: LiveRecording;
+    try {
+      rec = startLiveRecording(video, {
+        room: limits.maxImages - frames.length,
+        // 毎コマ描き直さないよう、秒か枚数が変わったときだけ表示を更新する。
+        onProgress: (p) =>
+          setRecording((prev) =>
+            prev && Math.floor(prev.elapsed) === Math.floor(p.elapsed) && prev.picked === p.picked ? prev : p,
+          ),
+      });
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '撮影を始められませんでした。');
+      return;
+    }
+    recorderRef.current = rec;
+    setRecording({ elapsed: 0, picked: 0, intervalSec: 0 });
+    navigator.vibrate?.(12);
+    (navigator as Partial<Navigator>).wakeLock
+      ?.request('screen')
+      .then((lock) => {
+        wakeLock.current = lock;
+      })
+      .catch(() => {});
+  };
+
+  /** 動画で撮る: 撮影を止め、選んだ写真を一覧に足して確認画面へ進む。 */
+  const stopRecording = useCallback(async () => {
+    const rec = recorderRef.current;
+    if (!rec) return;
+    recorderRef.current = null;
+    setFinishing(true);
+    releaseWakeLock();
+    navigator.vibrate?.(12);
+    try {
+      const loaded = await rec.stop();
+      if (loaded.length === 0) {
+        setNotice('写真を選べませんでした。対象のまわりを歩きながら、もう少し長く撮ってください。');
+        return;
+      }
+      const rejected = onAddRef.current(loaded);
+      if (rejected > 0) setNotice(`上限を超えた${rejected}枚は追加しませんでした。`);
+      onReviewRef.current();
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '写真にできませんでした。');
+    } finally {
+      setRecording(null);
+      setFinishing(false);
+    }
+  }, [releaseWakeLock]);
+
+  // カメラが止まったら（画面を裏に回した等）、そこまでの分で撮影を終える。
+  useEffect(() => {
+    if (!ready && recorderRef.current) void stopRecording();
+  }, [ready, stopRecording]);
+
+  // 画面を離れたら、撮影をやめて写真も捨てる（受け取る一覧が無くなるため）。
+  useEffect(
+    () => () => {
+      recorderRef.current?.cancel();
+      recorderRef.current = null;
+      releaseWakeLock();
+    },
+    [releaseWakeLock],
+  );
+
   /** 端末から選んだ写真を取り込む。 */
   const pickFiles = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -356,12 +448,15 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           <>
             <FrameCorners />
             <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
-              {auto && !blocked && <AutoMeter advice={advice} progress={progress} />}
+              {auto && !videoMode && !blocked && <AutoMeter advice={advice} progress={progress} />}
+              {isRecording && <RecordingBadge progress={recording} />}
               {paused
                 ? '写真を送信しています。送信が終わるまで撮影を止めています。'
-                : auto
-                  ? autoHint(advice, tooFar)
-                  : (hint ?? captureHint(frames.length, limits))}
+                : videoMode
+                  ? videoHint(isRecording, finishing)
+                  : auto
+                    ? autoHint(advice, tooFar)
+                    : (hint ?? captureHint(frames.length, limits))}
             </div>
           </>
         )}
@@ -373,20 +468,38 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           <Overlay>
             <VideoIcon width={36} height={36} className="text-mute" />
             <p className="max-w-xs text-center text-sm text-mute">
-              対象のまわりを歩きながら1周撮った動画から作れます。カメラで1枚ずつ撮ることもできます（カメラの使用許可が必要です）。
+              いちばん簡単なのは、対象のまわりを歩きながら動画で1周撮ることです。写真を1枚ずつ撮ることもできます。
             </p>
-            <Button variant="primary" onClick={openVideo}>
-              <VideoIcon />
-              動画から作る
-            </Button>
-            <Button onClick={() => void camera.start()}>
-              <CameraIcon />
-              カメラを開始
-            </Button>
-            <Button onClick={() => fileInput.current?.click()}>
-              <ImagesIcon />
-              写真を選ぶ
-            </Button>
+            <div className="grid w-full max-w-xs grid-cols-2 gap-2">
+              <Button
+                variant="primary"
+                onClick={() => {
+                  setVideoMode(true);
+                  void camera.start();
+                }}
+              >
+                <VideoIcon />
+                動画で撮る
+              </Button>
+              <Button onClick={openVideo}>
+                <VideoIcon />
+                動画を選ぶ
+              </Button>
+              <Button
+                onClick={() => {
+                  setVideoMode(false);
+                  void camera.start();
+                }}
+              >
+                <CameraIcon />
+                写真で撮る
+              </Button>
+              <Button onClick={() => fileInput.current?.click()}>
+                <ImagesIcon />
+                写真を選ぶ
+              </Button>
+            </div>
+            <p className="text-xs text-mute">撮るにはカメラの使用許可が必要です。</p>
           </Overlay>
         )}
 
@@ -402,7 +515,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
             <p className="max-w-xs text-center text-sm">{camera.state.failure.message}</p>
             <Button variant="primary" onClick={openVideo}>
               <VideoIcon />
-              動画から作る
+              動画を選ぶ
             </Button>
             <Button onClick={() => fileInput.current?.click()}>
               <ImagesIcon />
@@ -434,19 +547,25 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
       {/* 撮り方の選択。カメラが使えるときだけ出す。 */}
       {ready && (
         <div className="flex items-center justify-center gap-2 border-t border-line bg-panel px-4 pt-2.5">
-          <Toggle on={auto} onChange={setAuto} label="自動撮影" />
-          {camera.state.kind === 'ready' && camera.state.still && (
-            <Toggle on={still && !stillBroken.current} onChange={setStill} label="静止画" />
+          <ModeSwitch video={videoMode} onChange={setVideoMode} disabled={isRecording || finishing} />
+          {videoMode ? (
+            <button
+              type="button"
+              onClick={openVideo}
+              disabled={blocked || full}
+              className="flex min-h-9 items-center gap-1.5 rounded-full border border-line px-3 text-sm disabled:text-mute"
+            >
+              <VideoIcon width={16} height={16} />
+              動画を選ぶ
+            </button>
+          ) : (
+            <>
+              <Toggle on={auto} onChange={setAuto} label="自動撮影" />
+              {camera.state.kind === 'ready' && camera.state.still && (
+                <Toggle on={still && !stillBroken.current} onChange={setStill} label="静止画" />
+              )}
+            </>
           )}
-          <button
-            type="button"
-            onClick={openVideo}
-            disabled={blocked || full}
-            className="flex min-h-9 items-center gap-1.5 rounded-full border border-line px-3 text-sm disabled:text-mute"
-          >
-            <VideoIcon width={16} height={16} />
-            動画から作る
-          </button>
         </div>
       )}
 
@@ -472,22 +591,39 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           </button>
         </div>
 
-        <button
-          type="button"
-          onClick={() => void shoot()}
-          disabled={!ready || busy || full || blocked}
-          aria-label="撮影する"
-          className="group grid size-[72px] place-items-center rounded-full border-[3px] border-paper disabled:border-line"
-        >
-          <span className="size-[56px] rounded-full bg-paper transition-transform group-active:scale-90 group-disabled:bg-line" />
-        </button>
+        {videoMode ? (
+          // 録画ボタン: 押すと撮り始め、もう一度押すと止める（赤い丸 → 赤い四角）。
+          <button
+            type="button"
+            onClick={() => (isRecording ? void stopRecording() : startRecording())}
+            disabled={!ready || finishing || (!isRecording && (busy || full || blocked))}
+            aria-label={isRecording ? '撮影を止める' : '動画で撮り始める'}
+            className="group grid size-[72px] place-items-center rounded-full border-[3px] border-paper disabled:border-line"
+          >
+            <span
+              className={`bg-bad transition-all group-disabled:bg-line ${
+                isRecording ? 'size-[28px] rounded-md' : 'size-[56px] rounded-full group-active:scale-90'
+              }`}
+            />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => void shoot()}
+            disabled={!ready || busy || full || blocked}
+            aria-label="撮影する"
+            className="group grid size-[72px] place-items-center rounded-full border-[3px] border-paper disabled:border-line"
+          >
+            <span className="size-[56px] rounded-full bg-paper transition-transform group-active:scale-90 group-disabled:bg-line" />
+          </button>
+        )}
 
         <div className="justify-self-end">
           <button
             type="button"
             className={buttonClass(frames.length >= limits.minImages ? 'primary' : 'secondary', 'px-3')}
             onClick={onReview}
-            disabled={frames.length === 0 || importing}
+            disabled={frames.length === 0 || importing || isRecording || finishing}
           >
             <span className="tabular text-sm">確認 {frames.length}枚</span>
             <ForwardIcon />
@@ -501,6 +637,61 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
 /** 要素が画面に出ているか（自分か祖先が display: none なら false）。 */
 function isShown(el: HTMLElement | null): boolean {
   return el !== null && el.getClientRects().length > 0;
+}
+
+/** 動画で撮るときの案内。 */
+function videoHint(recording: boolean, finishing: boolean): string {
+  if (finishing) return '写真にしています…';
+  if (recording) return '対象のまわりを、歩きながらゆっくり1周してください。1周したら停止します。';
+  return '録画ボタンを押して、対象のまわりを歩きながら1周撮ります（10〜30秒）。';
+}
+
+/** 動画で撮っている間の表示（経過時間と、写真にした枚数）。 */
+function RecordingBadge({ progress }: { progress: LiveProgress | null }) {
+  if (!progress) return null;
+  const s = Math.floor(progress.elapsed);
+  return (
+    <div className="mx-auto mb-2 flex w-fit items-center gap-2 rounded-full bg-black/60 px-3 py-1 text-sm">
+      <span className="size-2.5 animate-pulse rounded-full bg-bad" aria-hidden="true" />
+      <span className="tabular">
+        {Math.floor(s / 60)}:{String(s % 60).padStart(2, '0')}
+      </span>
+      <span className="tabular text-mute">・{progress.picked}枚</span>
+    </div>
+  );
+}
+
+/** 撮り方の切り替え（動画 / 写真）。 */
+function ModeSwitch({
+  video,
+  onChange,
+  disabled,
+}: {
+  video: boolean;
+  onChange: (video: boolean) => void;
+  disabled: boolean;
+}) {
+  const options: [string, boolean][] = [
+    ['動画', true],
+    ['写真', false],
+  ];
+  return (
+    <div role="radiogroup" aria-label="撮り方" className="flex rounded-full border border-line p-0.5 text-sm">
+      {options.map(([label, value]) => (
+        <button
+          key={label}
+          type="button"
+          role="radio"
+          aria-checked={video === value}
+          disabled={disabled}
+          onClick={() => onChange(value)}
+          className={`min-h-8 rounded-full px-3 ${video === value ? 'bg-amber font-semibold text-ink' : 'text-mute'}`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 /** 動画の読み込みの進み具合と「中止」。 */
