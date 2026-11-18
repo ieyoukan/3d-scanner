@@ -61,21 +61,50 @@ describe('decide', () => {
     return advices;
   }
 
+  // 合成の景色では、1画素ずらすと違いは約 0.08（steady 0.13 ≒ 1.6画素、looseSteady 0.22 ≒ 2.8画素、minChange 0.17 ≒ 2.2画素）。
+
   it('止まったら1枚目を撮る。同じ景色のままなら撮らず、移動を促す', () => {
-    // 1コマ目は比べる相手がいないので待つ。2コマ目から止まり始め、0.25 秒続いた所で撮る。
-    expect(run([0, 0, 0, 0, 0, 0, 0, 0])).toEqual(['hold', 'hold', 'hold', 'capture', 'hold', 'hold', 'hold', 'move']);
+    // 1コマ目は比べる相手がいないので待つ。2コマ目から止まり始め、0.15 秒続いた所で撮る。
+    expect(run([0, 0, 0, 0, 0, 0])).toEqual(['stop', 'stop', 'capture', 'move', 'move', 'move']);
   });
 
-  it('動いている間は撮らず、止まって景色が変わっていたら撮る', () => {
-    const advices = run([0, 0, 0, 0, 2, 4, 6, 6, 6, 6]);
-    expect(advices.slice(0, 4)).toEqual(['hold', 'hold', 'hold', 'capture']);
-    expect(advices.slice(4, 7)).toEqual(['hold', 'hold', 'hold']); // 移動中
+  it('動いている間は撮らず、景色が変わってから止まったら撮る', () => {
+    // 3画素ずつ動く → 景色が十分変わる（撮影の間隔も空く）と「止めて」→ 止まって 0.15 秒で撮る。
+    expect(run([0, 0, 0, 3, 6, 9, 9, 9])).toEqual(['stop', 'stop', 'capture', 'move', 'move', 'stop', 'stop', 'capture']);
+  });
+
+  it('手が震えて止まりきれなくても、少し待てば基準を緩めて撮る', () => {
+    // 2画素の揺れ（約 0.16）は「止まっている」には足りないが、緩めた基準（0.22）には収まる。
+    const advices = run([0, 0, 0, 6, 8, 6, 8, 6, 8, 6, 8]);
+    expect(advices.slice(5, 10)).toEqual(['stop', 'stop', 'stop', 'stop', 'stop']);
     expect(advices.at(-1)).toBe('capture');
   });
 
+  it('大きく揺れている間は、待っても撮らない', () => {
+    const advices = run([0, 0, 0, 6, 10, 6, 10, 6, 10, 6, 10, 6, 10]);
+    expect(advices.slice(3)).not.toContain('capture');
+  });
+
   it('前の写真から離れすぎてから撮ると、そのことを知らせる', () => {
-    const advices = run([0, 0, 0, 0, 8, 16, 24, 24, 24, 24]);
-    expect(advices.at(-1)).toBe('capture!');
+    expect(run([0, 0, 0, 8, 16, 24, 24, 24]).at(-1)).toBe('capture!');
+  });
+
+  it('次の1枚までの進み具合を返す', () => {
+    let state = initialAutoState;
+    const at = (offset: number, now: number) => {
+      const d = decide(state, view(offset), now);
+      state = d.state;
+      return d;
+    };
+    at(0, 0);
+    at(0, 200);
+    const shot = at(0, 400);
+    expect(shot.advice).toBe('capture');
+    state = markCaptured(state, view(0), 400);
+    const half = at(1, 1200).progress;
+    expect(half).toBeGreaterThan(0.3);
+    expect(half).toBeLessThan(0.7);
+    expect(at(4, 1400).progress).toBe(1);
   });
 
   it('無地なら撮らない', () => {
