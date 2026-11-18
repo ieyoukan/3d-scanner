@@ -5,7 +5,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Button } from '../ui/Button';
 import { CloseIcon, TrashIcon } from '../ui/icons';
-import type { Frame } from './frames';
+import type { Frame, FrameSource } from './frames';
+
+const sourceLabel: Record<FrameSource, string> = { camera: '・カメラ', file: '・ファイル', video: '・動画' };
 
 interface Props {
   frames: readonly Frame[];
@@ -110,7 +112,7 @@ function FramePreview({ frame, index, blurry, onClose, onRemove }: PreviewProps)
       <div className="pad-safe-t flex items-center justify-between px-4 pb-2">
         <p className="tabular text-sm text-mute">
           {index + 1}枚目・{frame.width}×{frame.height}
-          {frame.source === 'camera' ? '・カメラ' : '・ファイル'}
+          {sourceLabel[frame.source]}
         </p>
         <button type="button" onClick={onClose} aria-label="閉じる" className="grid size-11 place-items-center">
           <CloseIcon />

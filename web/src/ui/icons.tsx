@@ -150,3 +150,10 @@ export const SpinnerIcon = (p: Props) => (
     <path d="M12 3a9 9 0 1 0 9 9" />
   </Icon>
 );
+
+export const VideoIcon = (p: Props) => (
+  <Icon {...p}>
+    <rect x="3" y="6" width="13" height="12" rx="2" />
+    <path d="M16 10.5l5-3v9l-5-3z" />
+  </Icon>
+);

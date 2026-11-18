@@ -71,6 +71,14 @@ describe('toGray', () => {
 describe('findBlurry', () => {
   const frames = (values: number[]) => values.map((sharpness, i) => ({ id: `f${i}`, sharpness }));
 
+  it('動画から選んだコマは比べない（模様の少ないコマを誤って「ぼけ」にしない）', () => {
+    const video = [100, 100, 100, 100, 100, 10].map((sharpness, i) => ({ id: `v${i}`, sharpness, source: 'video' }));
+    expect(findBlurry(video).size).toBe(0);
+    // 写真と混ざっていても、写真どうしだけで比べる。
+    const mixed = [...frames([100, 100, 100, 100, 10]), ...video];
+    expect([...findBlurry(mixed)]).toEqual(['f4']);
+  });
+
   it('他と比べて極端に低い写真だけを選ぶ', () => {
     const blurry = findBlurry(frames([100, 110, 95, 105, 20, 98]));
     expect([...blurry]).toEqual(['f4']);

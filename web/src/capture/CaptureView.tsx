@@ -1,12 +1,17 @@
-// 撮影画面。カメラの映像・シャッター・写真の追加をまとめる。
+// 撮影画面。カメラの映像・シャッター・写真の追加・動画の取り込みをまとめる。
 //
 // この部品が扱う状況は3つ:
-//   1. カメラを使う前    →「カメラを開始」と「写真を選ぶ」を並べて選んでもらう
+//   1. カメラを使う前    →「動画から作る」「カメラを開始」「写真を選ぶ」を並べて選んでもらう
 //   2. カメラが使える    → 映像とシャッターを出す
-//   3. カメラが使えない  → 理由を説明し、「写真を選ぶ」に切り替えてもらう
+//   3. カメラが使えない  → 理由を説明し、「動画から作る」か「写真を選ぶ」に切り替えてもらう
 //
-// どの状況でも「写真を選ぶ」は押せる。カメラは便利な入力手段の1つであって必須ではない、
+// どの状況でも動画と写真は選べる。カメラは便利な入力手段の1つであって必須ではない、
 // という作りにしておくと、権限の拒否や HTTP 接続でも行き止まりにならない。
+//
+// 動画から作る（video.ts）:
+//   対象のまわりを歩きながら1周撮った動画を選ぶと、映像の領域で動画を再生しながら、
+//   1秒に3枚、ぶれの少ないコマを選んで写真の一覧に足し、確認画面へ進む。
+//   読んでいる間は撮影しない（自動撮影も止める）。
 //
 // 撮り方の選択（カメラが使えるときに出す）:
 //   自動撮影  映像を見て、止まった瞬間に、前の写真から景色が十分変わっていれば自動で撮る（autoCapture.ts）。
@@ -17,10 +22,11 @@ import { useCallback, useEffect, useRef, useState, type ChangeEvent, type ReactN
 import type { Limits } from '../api/types';
 import { useCamera } from '../camera/useCamera';
 import { Button, buttonClass } from '../ui/Button';
-import { AlertIcon, CameraIcon, ForwardIcon, ImagesIcon } from '../ui/icons';
+import { AlertIcon, CameraIcon, ForwardIcon, ImagesIcon, VideoIcon } from '../ui/icons';
 import { decide, initialAutoState, markCaptured, signatureOf, type AutoAdvice, type AutoState } from './autoCapture';
 import { frameFromCapture, frameFromFile, frameFromPhoto, FrameError, type Frame } from './frames';
 import { captureHint } from './validation';
+import { framesFromVideo, type VideoProgress } from './video';
 
 /** 自動撮影の判断の間隔（ミリ秒）。1秒に5回見る。 */
 const autoIntervalMs = 200;
@@ -115,6 +121,15 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const fileInput = useRef<HTMLInputElement>(null);
   const full = frames.length >= limits.maxImages;
 
+  // 動画から写真を選んでいる最中の状態。importFile が入ると読み込みを始める（下の useEffect）。
+  const videoInput = useRef<HTMLInputElement>(null);
+  const importVideoRef = useRef<HTMLVideoElement>(null);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importProgress, setImportProgress] = useState<VideoProgress | null>(null);
+  const importing = importFile !== null;
+  // 送信中と、動画を読んでいる間は撮影しない。
+  const blocked = paused || importing;
+
   const [auto, setAuto] = usePreference('capture.auto', false);
   const [still, setStill] = usePreference('capture.still', true);
   // 静止画で撮れなかったら、この画面の間は映像の1コマに切り替える（写真の寸法が混ざらないように）。
@@ -148,8 +163,8 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const busyRef = useRef(false);
   const fullRef = useRef(full);
   fullRef.current = full;
-  const pausedRef = useRef(paused);
-  pausedRef.current = paused;
+  const pausedRef = useRef(blocked);
+  pausedRef.current = blocked;
 
   /** 1枚撮って一覧に足す。静止画が使えれば静止画、だめなら映像の1コマ。撮れたら true。 */
   const shoot = useCallback(async (): Promise<boolean> => {
@@ -193,7 +208,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const ready = camera.state.kind === 'ready';
   const { sample, videoRef } = camera;
   useEffect(() => {
-    if (!auto || !ready || paused) {
+    if (!auto || !ready || blocked) {
       setAdvice(null);
       return;
     }
@@ -232,7 +247,67 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
       window.clearInterval(timer);
       window.clearTimeout(tooFarTimer);
     };
-  }, [auto, ready, paused, sample, videoRef]);
+  }, [auto, ready, blocked, sample, videoRef]);
+
+  // 動画の読み込みから、最新の値を読むための控え（値が変わるたびに読み込みをやり直さないように）。
+  const onAddRef = useRef(onAdd);
+  onAddRef.current = onAdd;
+  const onReviewRef = useRef(onReview);
+  onReviewRef.current = onReview;
+  const roomRef = useRef(limits.maxImages - frames.length);
+  roomRef.current = limits.maxImages - frames.length;
+
+  // 動画から写真を選ぶ。再生に使う <video> は、importFile が入ったときに描かれる（読み込み中の表示の中）。
+  useEffect(() => {
+    const video = importVideoRef.current;
+    if (!importFile || !video) return;
+    const controller = new AbortController();
+    let active = true;
+    setNotice(null);
+    framesFromVideo(importFile, {
+      video,
+      room: roomRef.current,
+      signal: controller.signal,
+      onProgress: (p) => {
+        if (active) setImportProgress(p);
+      },
+    })
+      .then((loaded) => {
+        if (!active) return;
+        const rejected = onAddRef.current(loaded);
+        if (rejected > 0) setNotice(`上限（${limits.maxImages}枚）を超えた${rejected}枚は追加しませんでした。`);
+        // 選んだ写真を確かめてもらう（ぼけ・不要な写真を外せる）。
+        onReviewRef.current();
+      })
+      .catch((err: unknown) => {
+        if (!active || (err instanceof DOMException && err.name === 'AbortError')) return;
+        setNotice(err instanceof Error ? err.message : '動画を読み込めませんでした。');
+      })
+      .finally(() => {
+        if (!active) return;
+        setImportFile(null);
+        setImportProgress(null);
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+    // limits.maxImages は案内の文言にだけ使う。変わっても読み込みをやり直さない。
+  }, [importFile]);
+
+  const cancelImport = useCallback(() => {
+    setImportFile(null);
+    setImportProgress(null);
+  }, []);
+
+  /** 動画を選んだら読み込みを始める。 */
+  const pickVideo = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    // 同じ動画をもう一度選べるよう、入力欄を空に戻す。
+    event.target.value = '';
+    if (file) setImportFile(file);
+  }, []);
+  const openVideo = () => videoInput.current?.click();
 
   /** 端末から選んだ写真を取り込む。 */
   const pickFiles = useCallback(
@@ -281,7 +356,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           <>
             <FrameCorners />
             <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
-              {auto && !paused && <AutoMeter advice={advice} progress={progress} />}
+              {auto && !blocked && <AutoMeter advice={advice} progress={progress} />}
               {paused
                 ? '写真を送信しています。送信が終わるまで撮影を止めています。'
                 : auto
@@ -296,11 +371,15 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
 
         {camera.state.kind === 'idle' && (
           <Overlay>
-            <CameraIcon width={36} height={36} className="text-mute" />
+            <VideoIcon width={36} height={36} className="text-mute" />
             <p className="max-w-xs text-center text-sm text-mute">
-              対象のまわりを少しずつ移動しながら、たくさん撮ります。撮影にはカメラの使用許可が必要です。
+              対象のまわりを歩きながら1周撮った動画から作れます。カメラで1枚ずつ撮ることもできます（カメラの使用許可が必要です）。
             </p>
-            <Button variant="primary" onClick={() => void camera.start()}>
+            <Button variant="primary" onClick={openVideo}>
+              <VideoIcon />
+              動画から作る
+            </Button>
+            <Button onClick={() => void camera.start()}>
               <CameraIcon />
               カメラを開始
             </Button>
@@ -321,7 +400,11 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           <Overlay>
             <AlertIcon width={32} height={32} className="text-amber" />
             <p className="max-w-xs text-center text-sm">{camera.state.failure.message}</p>
-            <Button variant="primary" onClick={() => fileInput.current?.click()}>
+            <Button variant="primary" onClick={openVideo}>
+              <VideoIcon />
+              動画から作る
+            </Button>
+            <Button onClick={() => fileInput.current?.click()}>
               <ImagesIcon />
               写真を選ぶ
             </Button>
@@ -330,6 +413,14 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
               <Button onClick={() => void camera.start()}>もう一度カメラを試す</Button>
             )}
           </Overlay>
+        )}
+
+        {/* 動画の読み込み中は、映像の領域でその動画を再生して見せる（どこまで読んだかが分かる）。 */}
+        {importing && (
+          <div className="absolute inset-0 z-20 flex flex-col bg-black">
+            <video ref={importVideoRef} muted playsInline className="min-h-0 w-full flex-1 object-contain" />
+            <VideoImportStatus progress={importProgress} onCancel={cancelImport} />
+          </div>
         )}
       </div>
 
@@ -347,6 +438,15 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           {camera.state.kind === 'ready' && camera.state.still && (
             <Toggle on={still && !stillBroken.current} onChange={setStill} label="静止画" />
           )}
+          <button
+            type="button"
+            onClick={openVideo}
+            disabled={blocked || full}
+            className="flex min-h-9 items-center gap-1.5 rounded-full border border-line px-3 text-sm disabled:text-mute"
+          >
+            <VideoIcon width={16} height={16} />
+            動画から作る
+          </button>
         </div>
       )}
 
@@ -359,11 +459,13 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
             capture 属性は付けない: 付けるとカメラアプリが直接開き、撮影済みの写真を選べなくなる端末がある。
           */}
           <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => void pickFiles(e)} />
+          {/* 動画は1本ずつ。スマホでは、この場でカメラアプリを開いて撮ることもできる。 */}
+          <input ref={videoInput} type="file" accept="video/*" hidden onChange={pickVideo} />
           <button
             type="button"
             className={buttonClass('secondary', 'px-3')}
             onClick={() => fileInput.current?.click()}
-            disabled={busy || full || paused}
+            disabled={busy || full || blocked}
           >
             <ImagesIcon />
             <span className="text-sm">追加</span>
@@ -373,7 +475,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
         <button
           type="button"
           onClick={() => void shoot()}
-          disabled={!ready || busy || full || paused}
+          disabled={!ready || busy || full || blocked}
           aria-label="撮影する"
           className="group grid size-[72px] place-items-center rounded-full border-[3px] border-paper disabled:border-line"
         >
@@ -385,7 +487,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
             type="button"
             className={buttonClass(frames.length >= limits.minImages ? 'primary' : 'secondary', 'px-3')}
             onClick={onReview}
-            disabled={frames.length === 0}
+            disabled={frames.length === 0 || importing}
           >
             <span className="tabular text-sm">確認 {frames.length}枚</span>
             <ForwardIcon />
@@ -399,6 +501,40 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
 /** 要素が画面に出ているか（自分か祖先が display: none なら false）。 */
 function isShown(el: HTMLElement | null): boolean {
   return el !== null && el.getClientRects().length > 0;
+}
+
+/** 動画の読み込みの進み具合と「中止」。 */
+function VideoImportStatus({ progress, onCancel }: { progress: VideoProgress | null; onCancel: () => void }) {
+  const percent = progress && progress.duration > 0 ? Math.round((progress.time / progress.duration) * 100) : 0;
+  return (
+    <div className="space-y-2 border-t border-line bg-panel px-4 py-3">
+      <div className="flex items-baseline justify-between text-sm">
+        <span>動画から写真を選んでいます</span>
+        {progress && (
+          <span className="tabular text-mute">
+            {progress.picked} / {progress.count}枚
+          </span>
+        )}
+      </div>
+      <div
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+        className="h-1.5 overflow-hidden rounded-full bg-raised"
+      >
+        <div className="h-full bg-amber transition-[width] duration-200" style={{ width: `${percent}%` }} />
+      </div>
+      <p className="text-xs text-mute">
+        {progress
+          ? `動画を最後まで再生しながら、1秒に3枚、ぶれの少ないコマを選びます（約${Math.ceil(progress.duration)}秒）。`
+          : '動画を読み込んでいます…'}
+      </p>
+      <Button className="w-full" onClick={onCancel}>
+        中止
+      </Button>
+    </div>
+  );
 }
 
 /** 撮り方の切り替え（押すたびに入・切）。 */

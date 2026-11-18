@@ -12,7 +12,7 @@
 import { focalLength35mmOf } from './exif';
 import { laplacianVariance, toGray } from './sharpness';
 
-export type FrameSource = 'camera' | 'file';
+export type FrameSource = 'camera' | 'file' | 'video';
 
 export interface Frame {
   id: string;
@@ -27,7 +27,7 @@ export interface Frame {
   /**
    * 写真の EXIF にあった 35mm 換算の焦点距離（mm）。無ければ null。
    * 縮小し直すと EXIF は消えるので、その前に読んでおいてメタデータで送る（SfM の初期値になる）。
-   * 映像から切り出したコマには EXIF が無いので、いつも null。
+   * 映像や動画から切り出したコマには EXIF が無いので、いつも null。
    */
   focalLength35mm: number | null;
 }
@@ -95,6 +95,27 @@ export async function frameFromFile(file: File): Promise<Frame> {
  */
 export async function frameFromPhoto(blob: Blob): Promise<Frame> {
   return frameFromImage(blob, { name: '撮った写真', source: 'camera', capturedAt: new Date().toISOString() });
+}
+
+/**
+ * 動画の1コマ（再生中に createImageBitmap で写し取ったもの）から Frame を作る（video.ts から使う）。
+ * bitmap は呼び出し側が閉じる。
+ */
+export async function frameFromVideoFrame(bitmap: ImageBitmap, capturedAt: string): Promise<Frame> {
+  const size = fit(bitmap.width, bitmap.height, maxUploadEdge);
+  const blob = await toJpeg(draw(bitmap, size.width, size.height), 0.9);
+  const { thumbUrl, sharpness } = await preview(bitmap);
+  return {
+    id: newId(),
+    blob,
+    thumbUrl,
+    width: size.width,
+    height: size.height,
+    capturedAt,
+    source: 'video',
+    sharpness,
+    focalLength35mm: null,
+  };
 }
 
 async function frameFromImage(

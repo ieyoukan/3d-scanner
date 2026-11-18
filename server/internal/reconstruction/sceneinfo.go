@@ -47,7 +47,8 @@ type SceneInfo struct {
 
 	// Up は世界座標での「上」方向（単位ベクトル）。
 	Up [3]float64 `json:"up"`
-	// Center は被写体の中心の推定値（疎な点群の座標ごとの中央値）。
+	// Center は被写体の中心の推定値。全カメラの視線が集まる点（focusPoint）。
+	// 視線が集まらない撮り方（壁に沿って歩いた等）では、疎な点群の座標ごとの中央値。
 	Center [3]float64 `json:"center"`
 	// Radius は中心から点までの距離の 75 パーセンタイル。表示範囲の目安。
 	Radius float64 `json:"radius"`
@@ -115,15 +116,110 @@ func ReadSceneInfo(txtDir string, totalImages int) (*SceneInfo, error) {
 
 	if len(points) > 0 {
 		info.Center = medianPoint(points)
-		info.Radius = percentileDistance(points, info.Center, 0.75)
 	} else {
 		// 点が無い（ほぼ起きない）ときはカメラ位置の中央値を中心にする。
 		info.Center = medianPoint(info.CameraPositions)
+	}
+	// 対象のまわりを1周撮ったなら、被写体はカメラの視線が集まる所にある。
+	// 点の中央値は、模様があって点の多い床や背景に引っ張られる（1周の動画3本で、被写体から
+	// カメラまでの距離の 0.22〜0.95 倍ずれ、ビューアが床を見下ろす向きで開いていた）。
+	if focus, ok := focusPoint(poses); ok {
+		info.Center = focus
+	}
+	if len(points) > 0 {
+		info.Radius = percentileDistance(points, info.Center, 0.75)
 	}
 	if info.Radius <= 0 || math.IsNaN(info.Radius) {
 		info.Radius = 1
 	}
 	return info, nil
+}
+
+// focusPoint は、全カメラの視線（カメラ位置から「奥」へ伸びる直線）に最も近い点を返す。
+//
+// 求め方（最小二乗）: 点 x から視線 i までの距離の2乗は |(I − dᵢdᵢᵀ)(x − cᵢ)|²
+// （cᵢ はカメラ位置、dᵢ は視線の向き。I − ddᵀ は「視線に垂直な成分だけを残す」射影）。
+// これを全カメラで足して x で微分すると、3元の連立方程式  (Σ Pᵢ) x = Σ Pᵢ cᵢ  （Pᵢ = I − dᵢdᵢᵀ）になる。
+//
+// 使えない場合は ok = false:
+//   - 視線がほぼ平行（壁に沿って歩いた、同じ方向ばかり撮った）。方程式の行列がほぼ特異になり、
+//     点が1つに決まらない。行列を枚数で割ったものの行列式で判定する（1周なら約 0.27〜0.30、
+//     平行なら 0）。
+//   - 求めた点が、カメラの2割より多くの「後ろ」にある（被写体を囲んでいない）。
+func focusPoint(poses []ImagePose) ([3]float64, bool) {
+	const minPoses = 3
+	const minDet = 0.02
+	const minInFront = 0.8
+	if len(poses) < minPoses {
+		return [3]float64{}, false
+	}
+	var a [3][3]float64
+	var b [3]float64
+	for _, p := range poses {
+		d := p.Forward
+		for i := 0; i < 3; i++ {
+			for j := 0; j < 3; j++ {
+				m := -d[i] * d[j]
+				if i == j {
+					m++
+				}
+				a[i][j] += m
+				b[i] += m * p.Center[j]
+			}
+		}
+	}
+	n := float64(len(poses))
+	var an [3][3]float64
+	for i := range a {
+		for j := range a[i] {
+			an[i][j] = a[i][j] / n
+		}
+	}
+	if det3(an) < minDet {
+		return [3]float64{}, false
+	}
+	x, ok := solve3(a, b)
+	if !ok {
+		return [3]float64{}, false
+	}
+	front := 0
+	for _, p := range poses {
+		if (x[0]-p.Center[0])*p.Forward[0]+(x[1]-p.Center[1])*p.Forward[1]+(x[2]-p.Center[2])*p.Forward[2] > 0 {
+			front++
+		}
+	}
+	if float64(front) < minInFront*n {
+		return [3]float64{}, false
+	}
+	return x, true
+}
+
+func det3(m [3][3]float64) float64 {
+	return m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1]) -
+		m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0]) +
+		m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0])
+}
+
+// solve3 は 3元連立一次方程式 m x = v をクラメルの公式で解く。
+func solve3(m [3][3]float64, v [3]float64) ([3]float64, bool) {
+	d := det3(m)
+	if d == 0 || math.IsNaN(d) || math.IsInf(d, 0) {
+		return [3]float64{}, false
+	}
+	var x [3]float64
+	for k := 0; k < 3; k++ {
+		mk := m
+		for i := 0; i < 3; i++ {
+			mk[i][k] = v[i]
+		}
+		x[k] = det3(mk) / d
+	}
+	for _, c := range x {
+		if math.IsNaN(c) || math.IsInf(c, 0) {
+			return [3]float64{}, false
+		}
+	}
+	return x, true
 }
 
 // WriteSceneInfo は SceneInfo を JSON ファイルに書く。
