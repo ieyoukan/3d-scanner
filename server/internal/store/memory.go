@@ -148,6 +148,54 @@ func (m *Memory) PutAsset(_ context.Context, scanID string, a scan.Asset) error 
 	return nil
 }
 
+func (m *Memory) List(_ context.Context, q ListQuery) ([]scan.Summary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// newer は一覧の並び（作成時刻の新しい順、同時刻なら ID の降順）で a が b より前かを返す。
+	newer := func(a, b scan.Scan) bool {
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.After(b.CreatedAt)
+		}
+		return a.ID > b.ID
+	}
+	var hit []*memScan
+	for _, ms := range m.scans {
+		if ms.scan.Status == scan.StatusExpired {
+			continue
+		}
+		if q.After != nil && !newer(scan.Scan{CreatedAt: q.After.CreatedAt, ID: q.After.ID}, ms.scan) {
+			continue
+		}
+		hit = append(hit, ms)
+	}
+	sort.Slice(hit, func(i, j int) bool { return newer(hit[i].scan, hit[j].scan) })
+	var out []scan.Summary
+	for i, ms := range hit {
+		if i >= q.Limit {
+			break
+		}
+		sum := scan.Summary{Scan: ms.scan}
+		for k := range ms.assets {
+			sum.AssetKinds = append(sum.AssetKinds, k)
+		}
+		sort.Slice(sum.AssetKinds, func(i, j int) bool { return sum.AssetKinds[i] < sum.AssetKinds[j] })
+		out = append(out, sum)
+	}
+	return out, nil
+}
+
+func (m *Memory) SetTitle(_ context.Context, id, title string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ms, ok := m.scans[id]
+	if !ok || ms.scan.Status == scan.StatusExpired {
+		return ErrNotFound
+	}
+	ms.scan.Title = title
+	ms.scan.UpdatedAt = now
+	return nil
+}
+
 func (m *Memory) Finish(_ context.Context, id string, out scan.Outcome, now time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -157,6 +205,7 @@ func (m *Memory) Finish(_ context.Context, id string, out scan.Outcome, now time
 	}
 	t := now
 	ms.scan.Status = out.Status
+	ms.scan.Saved = out.Saved
 	ms.scan.ErrorCode, ms.scan.ErrorMessage = out.ErrorCode, out.ErrorMessage
 	ms.scan.FinishedAt, ms.scan.UpdatedAt = &t, now
 	return true, nil
@@ -247,7 +296,7 @@ func (m *Memory) ListExpired(_ context.Context, now time.Time, limit int) ([]str
 	defer m.mu.Unlock()
 	var hit []scan.Scan
 	for _, ms := range m.scans {
-		if ms.scan.ExpiresAt.Before(now) && ms.scan.Status != scan.StatusExpired {
+		if ms.scan.ExpiresAt.Before(now) && ms.scan.Status != scan.StatusExpired && !ms.scan.Saved {
 			hit = append(hit, ms.scan)
 		}
 	}

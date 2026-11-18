@@ -26,6 +26,7 @@ data:
   DB_SSLMODE: {{ .Values.externalDatabase.sslmode | quote }}
   {{- end }}
   RETENTION: {{ .Values.config.retention | quote }}
+  KEEP_COMPLETED: {{ .Values.config.keepCompleted | quote }}
   {{- with .Values.config.limits }}
   MIN_IMAGES: {{ .minImages | quote }}
   MAX_IMAGES: {{ .maxImages | quote }}

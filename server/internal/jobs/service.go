@@ -200,12 +200,20 @@ func (s *Service) runJob(ctx context.Context, sc scan.Scan) {
 		kinds = append(kinds, a.Kind)
 	}
 	out := scan.Summarize(detail.Steps, kinds)
+	// 見られる3Dデータが出来たものはギャラリーに保存する（保存期限で消さない）。
+	out.Saved = s.cfg.KeepCompleted && out.Status.Keepable()
 	if !s.finish(ctx, sc.ID, out) {
 		// (d) 記録の直前にキャンセルされていた。
 		s.removeFiles(ws, log)
 		return
 	}
-	log.Info("ジョブが終了", "status", out.Status, "duration", s.now().Sub(start).Round(time.Second))
+	if out.Saved {
+		// 長く残すので、表示に要らない中間ファイルを消して容量を空ける。失敗しても結果には影響しない。
+		if err := ws.PruneIntermediate(); err != nil {
+			log.Warn("中間ファイルを消せません", "error", err)
+		}
+	}
+	log.Info("ジョブが終了", "status", out.Status, "saved", out.Saved, "duration", s.now().Sub(start).Round(time.Second))
 }
 
 // finish は終了状態を記録する。running でなかった場合は false。

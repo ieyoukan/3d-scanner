@@ -66,6 +66,12 @@ export interface Scan {
   startedAt: string | null;
   finishedAt: string | null;
   frameCount: number;
+  /** ギャラリーに保存されているか（true なら保存期限で消えない）。 */
+  saved: boolean;
+  /** 利用者が付けた名前。空なら撮影日時を名前の代わりに出す。 */
+  title: string;
+  /** ギャラリー用の縮小画像。無ければ省略。 */
+  thumbnailUrl?: string;
   /** 自分より前に並んでいる件数。queued のときだけ入る。 */
   queuePosition?: number;
   error: ApiErrorDetail | null;
@@ -96,7 +102,29 @@ export interface PipelineInfo {
 export interface ServerConfig {
   limits: Limits;
   retentionHours: number;
+  /** true なら、完成したスキャンはギャラリーに保存され、保存期限で消えない。 */
+  keepCompleted: boolean;
   pipeline: PipelineInfo;
+}
+
+/** ギャラリーの一覧の1件（GET /api/scans）。 */
+export interface GalleryItem {
+  id: string;
+  status: ScanStatus;
+  title: string;
+  createdAt: string;
+  finishedAt: string | null;
+  expiresAt: string;
+  saved: boolean;
+  frameCount: number;
+  assetKinds: AssetKind[];
+  thumbnailUrl?: string;
+}
+
+export interface GalleryPage {
+  items: GalleryItem[];
+  /** 続きを読むときに渡す値。続きが無ければ省略。 */
+  nextCursor?: string;
 }
 
 export interface CreateScanResult {

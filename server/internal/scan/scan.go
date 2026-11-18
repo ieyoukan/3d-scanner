@@ -130,6 +130,20 @@ type Scan struct {
 	// CaptureMeta は撮影側が送ってきた付加情報（端末・カメラ等）を JSON のまま保持する。
 	// MVP では使わないが、VPS/ARCore を足すときに列を増やさず項目を追加できる。
 	CaptureMeta json.RawMessage
+	// Saved はギャラリーに保存されているか。true なら保存期限（ExpiresAt）を過ぎても消さない。
+	Saved bool
+	// Title は利用者が付けた名前（空なら画面は撮影日時を出す）。
+	Title string
+}
+
+// MaxTitleLength はスキャンの名前の最大文字数（DB の CHECK 制約と同じ値）。
+const MaxTitleLength = 80
+
+// Summary はギャラリーの一覧に出す1件。本体と、登録済みの成果物の種類だけを持つ
+// （ステップの詳細は一覧では使わないので読まない）。
+type Summary struct {
+	Scan       Scan
+	AssetKinds []AssetKind
 }
 
 // Frame はアップロードされた写真1枚。DB の scan_frames テーブル1行に対応する。
@@ -185,6 +199,13 @@ type Outcome struct {
 	Status       Status
 	ErrorCode    string
 	ErrorMessage string
+	// Saved はギャラリーに保存するか。Summarize は決めない（設定によるため、呼び出し側が入れる）。
+	Saved bool
+}
+
+// Keepable は、この終了状態のスキャンをギャラリーに保存する価値があるか（見られる3Dデータがあるか）。
+func (s Status) Keepable() bool {
+	return s == StatusSucceeded || s == StatusPartial
 }
 
 // Summarize は、全ステップが終わった時点のステップ状態と成果物から、スキャン全体の状態を決める。

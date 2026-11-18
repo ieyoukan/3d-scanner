@@ -8,10 +8,13 @@
 //	GET    /healthz                       生存確認（依存先を見ない）
 //	GET    /readyz                        準備完了の確認（DB と保存先を見る）
 //	GET    /api/config                    画面が使う設定（上限など）。認証不要
+//	GET    /api/scans                     ギャラリーの一覧（新しい順。?limit= と ?after= で続きを読む）
 //	POST   /api/scans                     写真をアップロードして復元ジョブを登録（202 Accepted）
 //	GET    /api/scans/{id}                状態・ステップ・成果物の一覧
 //	GET    /api/scans/{id}/logs?step=sfm  ステップの処理ログ（テキスト）
 //	GET    /api/scans/{id}/assets/{kind}  成果物のダウンロード（末尾に /scene.sog 等のファイル名を付けてもよい）
+//	GET    /api/scans/{id}/thumbnail      ギャラリー用の縮小画像（1枚目の写真から作る）
+//	PATCH  /api/scans/{id}                名前の変更（{"title": "..."}）
 //	DELETE /api/scans/{id}                キャンセル／削除
 //	それ以外                               ビルド済み Web（SPA）を返す
 package httpapi
@@ -83,6 +86,7 @@ func (s *Server) Handler() http.Handler {
 	// s.protect は、状態を変えるリクエストが自分のページから来たものかだけを確かめる。
 	mux.HandleFunc("GET /api/config", s.handleConfig)
 
+	mux.Handle("GET /api/scans", s.protect(s.handleListScans))
 	mux.Handle("POST /api/scans", s.protect(s.handleCreateScan))
 	mux.Handle("GET /api/scans/{id}", s.protect(s.handleGetScan))
 	mux.Handle("GET /api/scans/{id}/logs", s.protect(s.handleGetLogs))
@@ -91,6 +95,8 @@ func (s *Server) Handler() http.Handler {
 	// 3Dライブラリには URL の拡張子で形式を見分けるものがあるため。{name} は種類ごとに決まった
 	// 名前と一致するときだけ受け付け、ファイルの場所を決めるのには使わない。
 	mux.Handle("GET /api/scans/{id}/assets/{kind}/{name}", s.protect(s.handleGetAsset))
+	mux.Handle("GET /api/scans/{id}/thumbnail", s.protect(s.handleGetThumbnail))
+	mux.Handle("PATCH /api/scans/{id}", s.protect(s.handleUpdateScan))
 	mux.Handle("DELETE /api/scans/{id}", s.protect(s.handleDeleteScan))
 
 	// 上のどれにも当たらない /api/... は JSON の 404 を返す（SPA の HTML を返さない）。

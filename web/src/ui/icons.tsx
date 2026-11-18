@@ -103,6 +103,22 @@ export const ResetViewIcon = (p: Props) => (
   </Icon>
 );
 
+export const GridIcon = (p: Props) => (
+  <Icon {...p}>
+    <rect x="4" y="4" width="7" height="7" rx="1.5" />
+    <rect x="13" y="4" width="7" height="7" rx="1.5" />
+    <rect x="4" y="13" width="7" height="7" rx="1.5" />
+    <rect x="13" y="13" width="7" height="7" rx="1.5" />
+  </Icon>
+);
+
+export const PencilIcon = (p: Props) => (
+  <Icon {...p}>
+    <path d="M15.5 5.5l3 3L9 18l-4 1 1-4z" />
+    <path d="M13.5 7.5l3 3" />
+  </Icon>
+);
+
 export const CubeIcon = (p: Props) => (
   <Icon {...p}>
     <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z" />

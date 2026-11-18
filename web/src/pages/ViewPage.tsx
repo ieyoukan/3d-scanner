@@ -5,13 +5,14 @@
 //   中: 3D の表示領域（画面のほとんどを使う）
 //   下: 読み込み状況、視点リセット、ダウンロード
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import { fetchSceneInfo } from '../api/client';
+import { Link, useLocation, useParams } from 'react-router-dom';
+import { fetchSceneInfo, renameScan } from '../api/client';
 import type { Scan, SceneInfo } from '../api/types';
 import { formatBytes } from '../capture/validation';
+import { displayTitle } from '../gallery/gallery';
 import { useScan } from '../progress/useScan';
 import { Button, buttonClass } from '../ui/Button';
-import { AlertIcon, BackIcon, CloseIcon, DownloadIcon, ResetViewIcon, SpinnerIcon } from '../ui/icons';
+import { AlertIcon, BackIcon, CloseIcon, DownloadIcon, PencilIcon, ResetViewIcon, SpinnerIcon } from '../ui/icons';
 import { MeshViewer } from '../viewer/MeshViewer';
 import { PointCloudViewer } from '../viewer/PointCloudViewer';
 import { computeViewFrame } from '../viewer/sceneFrame';
@@ -76,10 +77,14 @@ function Viewer({ scan }: { scan: Scan }) {
   // 生成できなかった出力。隠さずに一覧で示す。
   const missing = tabs.filter((t) => t.url === null);
 
+  // ギャラリーから開いたときは、戻る先もギャラリーにする（それ以外は処理状況の画面）。
+  const fromGallery = (useLocation().state as { from?: string } | null)?.from === 'gallery';
+  const backTo = fromGallery ? '/gallery' : `/scans/${scan.id}`;
+
   return (
     <div className="flex h-dvh flex-col">
       <header className="pad-safe-t flex items-center gap-2 border-b border-line bg-panel px-2 pb-2">
-        <Link to={`/scans/${scan.id}`} aria-label="処理状況に戻る" className="grid size-11 shrink-0 place-items-center">
+        <Link to={backTo} aria-label={fromGallery ? 'ギャラリーに戻る' : '処理状況に戻る'} className="grid size-11 shrink-0 place-items-center">
           <BackIcon />
         </Link>
         <Tabs tabs={tabs} active={activeKey} onSelect={setChosen} />
@@ -120,6 +125,7 @@ function Viewer({ scan }: { scan: Scan }) {
       </div>
 
       <footer className="pad-safe-b space-y-2 border-t border-line bg-panel px-4 pt-2.5">
+        <TitleRow scan={scan} />
         {active?.note && <p className="text-xs text-amber">{active.note}</p>}
         {missing.length > 0 && (
           <ul className="space-y-1">
@@ -183,6 +189,39 @@ function Viewer({ scan }: { scan: Scan }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** 名前と、名前の変更。名前はギャラリーの一覧に出る。 */
+function TitleRow({ scan }: { scan: Scan }) {
+  // サーバーに保存できた名前。変更のたびにスキャン全体を読み直さず、ここだけ書き換える。
+  const [title, setTitle] = useState(scan.title);
+  const [error, setError] = useState<string | null>(null);
+  const name = displayTitle({ title, createdAt: scan.createdAt });
+
+  const rename = async () => {
+    // window.prompt は見た目を選べないが、スマホでも確実に文字入力欄とキーボードが出る。
+    const next = window.prompt('名前（80文字まで。空にすると撮影日時を表示します）', title);
+    if (next === null) return; // キャンセル
+    setError(null);
+    try {
+      setTitle(await renameScan(scan.id, next));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '名前を変更できませんでした。');
+    }
+  };
+
+  return (
+    <div>
+      <div className="flex items-center gap-1">
+        <p className="min-w-0 flex-1 truncate text-sm font-semibold">{name}</p>
+        <button type="button" onClick={() => void rename()} className="-mr-2 flex min-h-11 shrink-0 items-center gap-1 px-2 text-xs text-mute">
+          <PencilIcon width={16} height={16} />
+          名前を変更
+        </button>
+      </div>
+      {error && <p className="text-xs text-bad">{error}</p>}
     </div>
   );
 }

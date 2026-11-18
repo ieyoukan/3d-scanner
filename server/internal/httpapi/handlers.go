@@ -8,11 +8,16 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/ieyoukan/3d-scanner/server/internal/scan"
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
+	"github.com/ieyoukan/3d-scanner/server/internal/thumbnail"
 	"github.com/ieyoukan/3d-scanner/server/internal/upload"
 )
 
@@ -74,7 +79,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 type configResponse struct {
 	Limits         limitsResponse `json:"limits"`
 	RetentionHours float64        `json:"retentionHours"`
-	Pipeline       PipelineInfo   `json:"pipeline"`
+	// KeepCompleted が true なら、完成したスキャンはギャラリーに保存され、保存期限で消えない。
+	KeepCompleted bool         `json:"keepCompleted"`
+	Pipeline      PipelineInfo `json:"pipeline"`
 }
 
 type limitsResponse struct {
@@ -99,6 +106,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			MaxUploadBytes: l.MaxUploadBytes, MaxImagePixels: l.MaxImagePixels, MinImageSide: l.MinImageSide,
 		},
 		RetentionHours: s.cfg.Jobs.Retention.Hours(),
+		KeepCompleted:  s.cfg.Jobs.KeepCompleted,
 		Pipeline:       s.pipeline,
 	})
 }
@@ -214,6 +222,13 @@ func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ギャラリー用の縮小画像を、1枚目の写真から作っておく。失敗しても受付は続ける（一覧で画像が出ないだけ）。
+	if len(res.Frames) > 0 {
+		if err := thumbnail.Make(filepath.Join(ws.ImagesDir(), res.Frames[0].FileName), ws.ThumbnailPath(), thumbnailSide); err != nil {
+			s.log.Warn("サムネイルを作れません", "scan", id, "error", err)
+		}
+	}
+
 	now := s.now().UTC()
 	sc := scan.Scan{
 		ID:          id,
@@ -251,6 +266,11 @@ type scanResponse struct {
 	StartedAt  *time.Time  `json:"startedAt"`
 	FinishedAt *time.Time  `json:"finishedAt"`
 	FrameCount int         `json:"frameCount"`
+	// Saved はギャラリーに保存されているか（true なら期限で消えない）。
+	Saved bool   `json:"saved"`
+	Title string `json:"title"`
+	// ThumbnailURL は縮小画像の URL。無ければ省略。
+	ThumbnailURL string `json:"thumbnailUrl,omitempty"`
 	// QueuePosition は自分より前に並んでいる件数（queued のときだけ入る）。
 	QueuePosition *int            `json:"queuePosition,omitempty"`
 	Error         *errorDetail    `json:"error"`
@@ -307,6 +327,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	resp := scanResponse{
 		ID: sc.ID, Status: sc.Status, CreatedAt: sc.CreatedAt, UpdatedAt: sc.UpdatedAt, ExpiresAt: sc.ExpiresAt,
 		StartedAt: sc.StartedAt, FinishedAt: sc.FinishedAt, FrameCount: sc.FrameCount,
+		Saved: sc.Saved, Title: sc.Title, ThumbnailURL: s.thumbnailURL(sc),
 		Steps: []stepResponse{}, Assets: []assetResponse{},
 	}
 	if sc.ErrorCode != "" || sc.ErrorMessage != "" {
@@ -458,6 +479,200 @@ func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
 	// ServeContent はファイルを少しずつ送り（全体をメモリに載せない）、
 	// Range リクエスト（途中からの再開）にも対応する。
 	http.ServeContent(w, r, info.DownloadName, fi.ModTime(), f)
+}
+
+// ---------------------------------------------------------------------------
+// ギャラリー（一覧・サムネイル・名前の変更）
+// ---------------------------------------------------------------------------
+
+// thumbnailSide はサムネイルの長辺（画素）。一覧のカードは幅 200 前後なので、高精細な画面でも足りる大きさ。
+const thumbnailSide = 480
+
+// thumbnailURL はサムネイルがあればその URL を、無ければ空文字を返す。
+func (s *Server) thumbnailURL(sc scan.Scan) string {
+	if sc.Status == scan.StatusExpired || sc.Status == scan.StatusCancelled {
+		return ""
+	}
+	ws, err := s.root.Scan(sc.ID)
+	if err != nil {
+		return ""
+	}
+	if fi, err := os.Stat(ws.ThumbnailPath()); err != nil || !fi.Mode().IsRegular() {
+		return ""
+	}
+	return "/api/scans/" + sc.ID + "/thumbnail"
+}
+
+type galleryItem struct {
+	ID         string      `json:"id"`
+	Status     scan.Status `json:"status"`
+	Title      string      `json:"title"`
+	CreatedAt  time.Time   `json:"createdAt"`
+	FinishedAt *time.Time  `json:"finishedAt"`
+	ExpiresAt  time.Time   `json:"expiresAt"`
+	Saved      bool        `json:"saved"`
+	FrameCount int         `json:"frameCount"`
+	// AssetKinds は登録済みの成果物の種類（メッシュ・3DGS があるかを一覧で示すため）。
+	AssetKinds   []scan.AssetKind `json:"assetKinds"`
+	ThumbnailURL string           `json:"thumbnailUrl,omitempty"`
+}
+
+type galleryResponse struct {
+	Items []galleryItem `json:"items"`
+	// NextCursor は続きを読むときに ?after= に渡す値。続きが無ければ省略。
+	NextCursor string `json:"nextCursor,omitempty"`
+}
+
+const (
+	galleryDefaultLimit = 24
+	galleryMaxLimit     = 60
+)
+
+// handleListScans はギャラリーの一覧を新しい順に返す（GET /api/scans）。
+// 期限切れのものは含めない。処理中・失敗したものも含める（あとから進み具合や理由を確かめられるように）。
+func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
+	q := store.ListQuery{Limit: galleryDefaultLimit}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > galleryMaxLimit {
+			writeError(w, http.StatusBadRequest, "bad_limit", fmt.Sprintf("limit は 1〜%d で指定してください。", galleryMaxLimit))
+			return
+		}
+		q.Limit = n
+	}
+	if v := r.URL.Query().Get("after"); v != "" {
+		c, ok := parseCursor(v)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "bad_cursor", "after の値が正しくありません。")
+			return
+		}
+		q.After = &c
+	}
+	// 1件多く読み、あふれたら「続きがある」と分かる（件数を数える問い合わせを別にしない）。
+	q.Limit++
+	rows, err := s.store.List(r.Context(), q)
+	if err != nil {
+		s.log.Error("一覧を読めません", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal", "サーバー内部でエラーが発生しました。")
+		return
+	}
+	resp := galleryResponse{Items: []galleryItem{}}
+	limit := q.Limit - 1
+	for i, row := range rows {
+		if i == limit {
+			last := rows[limit-1].Scan
+			resp.NextCursor = formatCursor(store.Cursor{CreatedAt: last.CreatedAt, ID: last.ID})
+			break
+		}
+		sc := row.Scan
+		kinds := row.AssetKinds
+		if kinds == nil {
+			kinds = []scan.AssetKind{}
+		}
+		resp.Items = append(resp.Items, galleryItem{
+			ID: sc.ID, Status: sc.Status, Title: sc.Title, CreatedAt: sc.CreatedAt, FinishedAt: sc.FinishedAt,
+			ExpiresAt: sc.ExpiresAt, Saved: sc.Saved, FrameCount: sc.FrameCount, AssetKinds: kinds,
+			ThumbnailURL: s.thumbnailURL(sc),
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// カーソルは「作成時刻（UNIX ナノ秒）_ID」という文字列にする。
+// 中身を画面が解釈する必要は無く、そのまま次の要求に付けて返すだけ。
+func formatCursor(c store.Cursor) string {
+	return strconv.FormatInt(c.CreatedAt.UnixNano(), 10) + "_" + c.ID
+}
+
+func parseCursor(v string) (store.Cursor, bool) {
+	ts, id, ok := strings.Cut(v, "_")
+	if !ok || !scan.ValidID(id) {
+		return store.Cursor{}, false
+	}
+	n, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return store.Cursor{}, false
+	}
+	return store.Cursor{CreatedAt: time.Unix(0, n).UTC(), ID: id}, true
+}
+
+// handleGetThumbnail はサムネイル（JPEG）を返す。
+func (s *Server) handleGetThumbnail(w http.ResponseWriter, r *http.Request) {
+	d, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	if d.Scan.Status == scan.StatusExpired || d.Scan.Status == scan.StatusCancelled {
+		writeError(w, http.StatusGone, "thumbnail_unavailable", "このスキャンの写真は削除されています。")
+		return
+	}
+	ws, err := s.root.Scan(d.Scan.ID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "サムネイルがありません。")
+		return
+	}
+	f, err := os.Open(ws.ThumbnailPath())
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "サムネイルがありません。")
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		writeError(w, http.StatusNotFound, "not_found", "サムネイルがありません。")
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	// 一度作ったら変わらない。一覧を開くたびに取り直さないよう、ブラウザ内に1日キャッシュさせる。
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	http.ServeContent(w, r, "thumbnail.jpg", fi.ModTime(), f)
+}
+
+// handleUpdateScan はスキャンの名前を変える（PATCH /api/scans/{id}、本文は {"title": "..."}）。
+func (s *Server) handleUpdateScan(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !scan.ValidID(id) {
+		writeError(w, http.StatusNotFound, "not_found", "スキャンが見つかりません。")
+		return
+	}
+	var body struct {
+		Title *string `json:"title"`
+	}
+	// 名前1つを送るだけの小さな本文。巨大な JSON を読まされないよう上限を付ける。
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Title == nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "title を JSON で指定してください。")
+		return
+	}
+	title, ok := cleanTitle(*body.Title)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "bad_title", fmt.Sprintf("名前は%d文字以内で、改行などの制御文字を含めないでください。", scan.MaxTitleLength))
+		return
+	}
+	err := s.store.SetTitle(r.Context(), id, title, s.now().UTC())
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "スキャンが見つかりません。")
+		return
+	}
+	if err != nil {
+		s.log.Error("名前を変更できません", "scan", id, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal", "名前を変更できませんでした。")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"title": title})
+}
+
+// cleanTitle は名前の前後の空白を除き、長さと文字を検証する。空文字は「名前なし」として受け付ける。
+func cleanTitle(v string) (string, bool) {
+	v = strings.TrimSpace(v)
+	if !utf8.ValidString(v) || utf8.RuneCountInString(v) > scan.MaxTitleLength {
+		return "", false
+	}
+	for _, c := range v {
+		if unicode.IsControl(c) {
+			return "", false
+		}
+	}
+	return v, true
 }
 
 // ---------------------------------------------------------------------------

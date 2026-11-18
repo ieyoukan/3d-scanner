@@ -52,7 +52,13 @@ type Store interface {
 	// PutAsset は検証済みの成果物を登録する（同じ種類があれば置き換える）。
 	PutAsset(ctx context.Context, scanID string, a scan.Asset) error
 
-	// Finish は running のスキャンを終了状態にする。
+	// List はギャラリーの一覧を新しい順に返す（期限切れは含めない）。
+	List(ctx context.Context, q ListQuery) ([]scan.Summary, error)
+
+	// SetTitle はスキャンの名前を変える。無ければ ErrNotFound。
+	SetTitle(ctx context.Context, id, title string, now time.Time) error
+
+	// Finish は running のスキャンを終了状態にする。out.Saved が true ならギャラリーに保存する。
 	// 戻り値 false は「running ではなかった（＝キャンセル済みなど）ので何もしなかった」。
 	Finish(ctx context.Context, id string, out scan.Outcome, now time.Time) (bool, error)
 
@@ -74,6 +80,7 @@ type Store interface {
 	RecoverInterrupted(ctx context.Context, maxAttempts int, now time.Time) (requeued, failed []string, err error)
 
 	// ListExpired は保存期限を過ぎ、まだ expired になっていないスキャンの ID を返す。
+	// ギャラリーに保存されたもの（saved）は含めない。
 	ListExpired(ctx context.Context, now time.Time, limit int) ([]string, error)
 
 	// MarkExpired はスキャンを expired にし、成果物の目録を消す（ファイルの削除は呼び出し側）。
@@ -84,6 +91,22 @@ type Store interface {
 
 	// Close は接続を閉じる。
 	Close() error
+}
+
+// ListQuery は一覧の取得条件。
+type ListQuery struct {
+	// Limit は最大件数。
+	Limit int
+	// After が nil でなければ、この位置より後（＝より古いもの）だけを返す（続きの読み込み）。
+	After *Cursor
+}
+
+// Cursor は一覧の並び（作成時刻の新しい順、同時刻なら ID の降順）の中の位置。
+// 「何件目から」ではなく「どの行の次から」で表すので、途中で新しいスキャンが増えても
+// 続きの読み込みで同じ行が二度出たり、行が飛ばされたりしない。
+type Cursor struct {
+	CreatedAt time.Time
+	ID        string
 }
 
 // 中断・再開時に画面へ出す文言。Postgres と Memory の両実装で同じものを使う。

@@ -19,12 +19,14 @@ interface Props {
   check: Check;
   limits: Limits;
   retentionHours: number;
+  /** true なら、完成した3Dデータはギャラリーに保存され、期限で消えない。 */
+  keepCompleted: boolean;
   pipeline: PipelineInfo;
   /** サーバーが受け付けたら呼ばれる。 */
   onCreated: (result: CreateScanResult) => void;
 }
 
-export function UploadPanel({ frames, check, limits, retentionHours, pipeline, onCreated }: Props) {
+export function UploadPanel({ frames, check, limits, retentionHours, keepCompleted, pipeline, onCreated }: Props) {
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const handle = useRef<UploadHandle | null>(null);
@@ -114,7 +116,9 @@ export function UploadPanel({ frames, check, limits, retentionHours, pipeline, o
         <InfoIcon width={16} height={16} className="mt-0.5 shrink-0" />
         <span>
           {describePipeline(pipeline)}
-          写真と結果は{formatHours(retentionHours)}後に自動で削除されます。
+          {keepCompleted
+            ? `完成した3Dデータはギャラリーに保存されます。失敗したものは${formatHours(retentionHours)}後に自動で削除されます。`
+            : `写真と結果は${formatHours(retentionHours)}後に自動で削除されます。`}
         </span>
       </p>
     </section>

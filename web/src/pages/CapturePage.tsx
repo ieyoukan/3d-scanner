@@ -6,7 +6,7 @@
 //
 // 送信が受け付けられたら /scans/<id> に移動する。以降の進行状況はそちらの画面が担当する。
 import { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import type { ServerConfig } from '../api/types';
 import { CaptureView } from '../capture/CaptureView';
 import { FrameGallery } from '../capture/FrameGallery';
@@ -14,7 +14,7 @@ import { findBlurry } from '../capture/sharpness';
 import { useFrames } from '../capture/useFrames';
 import { checkFrames } from '../capture/validation';
 import { Button } from '../ui/Button';
-import { BackIcon, InfoIcon } from '../ui/icons';
+import { BackIcon, GridIcon, InfoIcon } from '../ui/icons';
 import { UploadPanel } from '../upload/UploadPanel';
 
 type Phase = 'capture' | 'review';
@@ -54,14 +54,20 @@ export function CapturePage({ config }: Props) {
         ) : (
           <h1 className="text-base font-semibold tracking-wide">3D Scanner</h1>
         )}
-        <button
-          type="button"
-          onClick={() => setShowGuide(true)}
-          className="-mr-2 flex min-h-11 items-center gap-1.5 px-2 text-sm text-mute"
-        >
-          <InfoIcon />
-          撮り方
-        </button>
+        <div className="-mr-2 flex items-center">
+          <button
+            type="button"
+            onClick={() => setShowGuide(true)}
+            className="flex min-h-11 items-center gap-1.5 px-2 text-sm text-mute"
+          >
+            <InfoIcon />
+            撮り方
+          </button>
+          <Link to="/gallery" className="flex min-h-11 items-center gap-1.5 px-2 text-sm">
+            <GridIcon />
+            ギャラリー
+          </Link>
+        </div>
       </header>
 
       {/*
@@ -92,6 +98,7 @@ export function CapturePage({ config }: Props) {
               check={check}
               limits={limits}
               retentionHours={config.retentionHours}
+              keepCompleted={config.keepCompleted}
               pipeline={config.pipeline}
               onCreated={(result) => {
                 // 送信済みの写真はもう不要。メモリを空けてから移動する。

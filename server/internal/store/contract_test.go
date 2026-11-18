@@ -387,4 +387,105 @@ func runContract(t *testing.T, open func(t *testing.T) Store) {
 			t.Fatalf("削除後の Get: %v", err)
 		}
 	})
+
+	t.Run("ギャラリー: 保存したものは期限で消えない", func(t *testing.T) {
+		s := open(t)
+		kept, failed := newScan(t, -48*time.Hour), newScan(t, -47*time.Hour)
+		for _, sc := range []scan.Scan{kept, failed} {
+			mustCreate(t, s, sc)
+		}
+		// 2件とも running にしてから終了させる（古い順に取られる）。
+		for range 2 {
+			if _, err := s.ClaimNext(ctx, base); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if ok, err := s.Finish(ctx, kept.ID, scan.Outcome{Status: scan.StatusSucceeded, Saved: true}, base); !ok || err != nil {
+			t.Fatalf("Finish(kept) = %v, %v", ok, err)
+		}
+		if ok, err := s.Finish(ctx, failed.ID, scan.Outcome{Status: scan.StatusFailed, ErrorCode: "x"}, base); !ok || err != nil {
+			t.Fatalf("Finish(failed) = %v, %v", ok, err)
+		}
+		if d := mustGet(t, s, kept.ID); !d.Scan.Saved {
+			t.Fatal("保存したはずが saved=false")
+		}
+		// 期限は2件とも過ぎているが、掃除の対象は保存していない方だけ。
+		ids, err := s.ListExpired(ctx, base, 10)
+		if err != nil || len(ids) != 1 || ids[0] != failed.ID {
+			t.Fatalf("ListExpired = %v, %v（保存していない方だけのはず）", ids, err)
+		}
+	})
+
+	t.Run("ギャラリー: 一覧は新しい順で、続きを読める", func(t *testing.T) {
+		s := open(t)
+		var ids []string
+		for i := range 5 {
+			sc := newScan(t, time.Duration(i)*time.Minute)
+			mustCreate(t, s, sc)
+			ids = append(ids, sc.ID)
+		}
+		// 同じ時刻のものが複数あっても、続きの読み込みで重複・欠落しないこと。
+		same1, same2 := newScan(t, 2*time.Minute), newScan(t, 2*time.Minute)
+		mustCreate(t, s, same1)
+		mustCreate(t, s, same2)
+		s.PutAsset(ctx, ids[4], scan.Asset{Kind: scan.AssetMeshGLB, RelativePath: "output/mesh.glb", SizeBytes: 10})
+		s.PutAsset(ctx, ids[4], scan.Asset{Kind: scan.AssetGaussianSOG, RelativePath: "output/scene.sog", SizeBytes: 10})
+		// 期限切れは一覧に出ない。
+		if err := s.MarkExpired(ctx, ids[0], base); err != nil {
+			t.Fatal(err)
+		}
+
+		var all []scan.Summary
+		var after *Cursor
+		for page := 0; page < 10; page++ {
+			rows, err := s.List(ctx, ListQuery{Limit: 2, After: after})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) == 0 {
+				break
+			}
+			all = append(all, rows...)
+			last := rows[len(rows)-1].Scan
+			after = &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}
+		}
+		if len(all) != 6 {
+			t.Fatalf("件数 = %d, want 6（7件中、期限切れの1件を除く）", len(all))
+		}
+		seen := map[string]bool{}
+		for i, row := range all {
+			if seen[row.Scan.ID] {
+				t.Fatalf("同じ行が二度出た: %s", row.Scan.ID)
+			}
+			seen[row.Scan.ID] = true
+			if i > 0 && row.Scan.CreatedAt.After(all[i-1].Scan.CreatedAt) {
+				t.Fatalf("新しい順になっていない: %v の後に %v", all[i-1].Scan.CreatedAt, row.Scan.CreatedAt)
+			}
+		}
+		if all[0].Scan.ID != ids[4] {
+			t.Fatalf("先頭 = %s, want %s（最も新しいもの）", all[0].Scan.ID, ids[4])
+		}
+		if k := all[0].AssetKinds; len(k) != 2 || k[0] != scan.AssetGaussianSOG || k[1] != scan.AssetMeshGLB {
+			t.Fatalf("AssetKinds = %v", k)
+		}
+		if seen[ids[0]] {
+			t.Fatal("期限切れが一覧に出た")
+		}
+	})
+
+	t.Run("名前を変えられる", func(t *testing.T) {
+		s := open(t)
+		sc := newScan(t, 0)
+		mustCreate(t, s, sc)
+		if err := s.SetTitle(ctx, sc.ID, "机の上のマグカップ", base); err != nil {
+			t.Fatal(err)
+		}
+		if got := mustGet(t, s, sc.ID).Scan.Title; got != "机の上のマグカップ" {
+			t.Fatalf("Title = %q", got)
+		}
+		missing := newScan(t, 0)
+		if err := s.SetTitle(ctx, missing.ID, "x", base); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("無い ID: %v", err)
+		}
+	})
 }

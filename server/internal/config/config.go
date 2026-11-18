@@ -54,8 +54,11 @@ type Limits struct {
 
 // Jobs はジョブ管理の設定。
 type Jobs struct {
-	// Retention は受付から削除までの保存期間。
+	// Retention は受付から削除までの保存期間。ギャラリーに保存されたスキャンには効かない。
 	Retention time.Duration
+	// KeepCompleted が true なら、完成したスキャン（succeeded / partial）をギャラリーに保存し、
+	// 保存期限で消さない。失敗・中止したものは Retention で消える。
+	KeepCompleted bool
 	// ExpiredRowRetention は「期限切れ」と表示するための行を残しておく期間。
 	ExpiredRowRetention time.Duration
 	// MaxAttempts は1ジョブの最大着手回数（再起動で中断→やり直しの上限）。
@@ -141,6 +144,7 @@ func Load(getenv func(string) string) (Config, error) {
 		},
 		Jobs: Jobs{
 			Retention:           r.duration("RETENTION", 24*time.Hour),
+			KeepCompleted:       r.boolean("KEEP_COMPLETED", true),
 			ExpiredRowRetention: r.duration("EXPIRED_ROW_RETENTION", 7*24*time.Hour),
 			MaxAttempts:         r.integer("MAX_ATTEMPTS", 2),
 			PollInterval:        r.duration("POLL_INTERVAL", 5*time.Second),
