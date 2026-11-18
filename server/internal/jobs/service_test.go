@@ -588,3 +588,66 @@ func TestSweepRemovesOnlyOldOrphans(t *testing.T) {
 		t.Error("古い孤児ディレクトリが残っている")
 	}
 }
+
+// TestGalleryKeepsCompletedScans: KeepCompleted のとき、完成したものはギャラリーに保存され、
+// 中間ファイル（dense/）だけが消え、保存期限を過ぎても消されない。失敗したものはこれまでどおり消える。
+func TestGalleryKeepsCompletedScans(t *testing.T) {
+	var failing atomic.Bool
+	e := newEnv(t, pipelineFunc(func(ctx context.Context, job reconstruction.Job, rep reconstruction.Reporter) error {
+		// 中間ファイルの代わり。保存時に消えることを確かめる。
+		os.MkdirAll(filepath.Join(job.WS.DenseDir(), "images"), 0o750)
+		os.WriteFile(filepath.Join(job.WS.DenseDir(), "images", "frame_0001.jpg"), []byte("undistorted"), 0o640)
+		if failing.Load() {
+			rep.StepFinished(ctx, scan.StepSfM, scan.StepFailed, "写真どうしが重なっていません。")
+			return nil
+		}
+		return succeedAll(t)(ctx, job, rep)
+	}))
+	e.svc.cfg.KeepCompleted = true
+	e.start()
+
+	keptID, keptWS := e.enqueue()
+	e.svc.Notify()
+	d := e.waitStatus(keptID, scan.StatusSucceeded)
+	if !d.Scan.Saved {
+		t.Fatal("完成したのに保存されていない")
+	}
+	if exists(keptWS.DenseDir()) {
+		t.Error("中間ファイル（dense/）が残っている")
+	}
+	for _, p := range []string{keptWS.ImagesDir(), filepath.Join(keptWS.OutputDir(), "mesh.glb")} {
+		if !exists(p) {
+			t.Errorf("%s が消えた（残すはず）", p)
+		}
+	}
+
+	failing.Store(true)
+	failedID, failedWS := e.enqueue()
+	e.svc.Notify()
+	if d := e.waitStatus(failedID, scan.StatusFailed); d.Scan.Saved {
+		t.Error("失敗したものが保存された")
+	}
+
+	// 期限（24時間）を過ぎても、保存したものは消えない。失敗したものは消える。
+	e.clock.Advance(25 * time.Hour)
+	res, err := e.svc.Sweep(context.Background())
+	if err != nil || res.Expired != 1 {
+		t.Fatalf("Sweep = %+v, %v（失敗した1件だけが期限切れのはず）", res, err)
+	}
+	if got := e.get(keptID).Scan.Status; got != scan.StatusSucceeded || !exists(keptWS.Dir()) {
+		t.Errorf("保存したものが消えた: status=%q", got)
+	}
+	if exists(failedWS.Dir()) || e.get(failedID).Scan.Status != scan.StatusExpired {
+		t.Error("失敗したものが期限で消えていない")
+	}
+}
+
+// TestGalleryOffKeepsOldBehaviour: KeepCompleted=false なら、完成したものも期限で消える（従来どおり）。
+func TestGalleryOffKeepsOldBehaviour(t *testing.T) {
+	e := newEnv(t, succeedAll(t))
+	id, _ := e.enqueue()
+	e.start()
+	if d := e.waitStatus(id, scan.StatusSucceeded); d.Scan.Saved {
+		t.Fatal("KeepCompleted=false なのに保存された")
+	}
+}

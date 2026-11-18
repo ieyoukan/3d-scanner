@@ -600,3 +600,76 @@ func TestPanicDoesNotKillServer(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
 	wantError(t, rec, http.StatusInternalServerError, "internal")
 }
+
+// TestGalleryListAndThumbnail: 一覧は新しい順で、続きを読め、サムネイルが付く。
+func TestGalleryListAndThumbnail(t *testing.T) {
+	// ワーカーを動かさないので3件とも queued のまま残る。受付の上限（既定 2）を上げておく。
+	e := newTestEnv(t, func(c *config.Config) { c.Limits.MaxQueuedScans = 5 })
+	var ids []string
+	for range 3 {
+		ids = append(ids, e.createScan(3))
+		time.Sleep(2 * time.Millisecond) // 作成時刻をずらして並び順を決める
+	}
+
+	page := decode[galleryResponse](t, e.do("GET", "/api/scans?limit=2", nil))
+	if len(page.Items) != 2 || page.NextCursor == "" {
+		t.Fatalf("1ページ目 = %d件, next=%q", len(page.Items), page.NextCursor)
+	}
+	if page.Items[0].ID != ids[2] || page.Items[1].ID != ids[1] {
+		t.Fatalf("新しい順になっていない: %s, %s", page.Items[0].ID, page.Items[1].ID)
+	}
+	item := page.Items[0]
+	if item.ThumbnailURL != "/api/scans/"+ids[2]+"/thumbnail" || item.FrameCount != 3 || item.AssetKinds == nil {
+		t.Fatalf("項目 = %+v", item)
+	}
+	rest := decode[galleryResponse](t, e.do("GET", "/api/scans?limit=2&after="+page.NextCursor, nil))
+	if len(rest.Items) != 1 || rest.Items[0].ID != ids[0] || rest.NextCursor != "" {
+		t.Fatalf("2ページ目 = %+v", rest)
+	}
+
+	// サムネイルは長辺 480 以下の JPEG。
+	rec := e.do("GET", item.ThumbnailURL, nil)
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "image/jpeg" {
+		t.Fatalf("thumbnail = %d %s", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	cfg, format, err := image.DecodeConfig(rec.Body)
+	if err != nil || format != "jpeg" || max(cfg.Width, cfg.Height) > thumbnailSide {
+		t.Fatalf("thumbnail = %s %dx%d err=%v", format, cfg.Width, cfg.Height, err)
+	}
+	// 個別の取得にも名前・保存状態・サムネイルが入る。
+	if got := decode[scanResponse](t, e.do("GET", "/api/scans/"+ids[2], nil)); got.ThumbnailURL == "" || got.Saved {
+		t.Fatalf("scan = %+v（まだ完成していないので saved=false）", got)
+	}
+
+	wantError(t, e.do("GET", "/api/scans?limit=0", nil), http.StatusBadRequest, "bad_limit")
+	wantError(t, e.do("GET", "/api/scans?limit=1000", nil), http.StatusBadRequest, "bad_limit")
+	wantError(t, e.do("GET", "/api/scans?after=../../etc", nil), http.StatusBadRequest, "bad_cursor")
+
+	// 中止したものは写真が消えるので、サムネイルも出さない。
+	e.do("DELETE", "/api/scans/"+ids[0], nil)
+	wantError(t, e.do("GET", "/api/scans/"+ids[0]+"/thumbnail", nil), http.StatusGone, "thumbnail_unavailable")
+}
+
+func TestRenameScan(t *testing.T) {
+	e := newTestEnv(t, nil)
+	id := e.createScan(3)
+	rename := func(body string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
+		return e.do("PATCH", "/api/scans/"+id, strings.NewReader(body), opts...)
+	}
+	if rec := rename(`{"title":"  机の上のマグカップ  "}`); rec.Code != 200 {
+		t.Fatalf("PATCH = %d %s", rec.Code, rec.Body.String())
+	}
+	if got := decode[scanResponse](t, e.do("GET", "/api/scans/"+id, nil)).Title; got != "机の上のマグカップ" {
+		t.Fatalf("Title = %q（前後の空白は除く）", got)
+	}
+	wantError(t, rename(`{"title":"`+strings.Repeat("あ", 81)+`"}`), http.StatusBadRequest, "bad_title")
+	wantError(t, rename(`{"title":"改行\n入り"}`), http.StatusBadRequest, "bad_title")
+	wantError(t, rename(`{}`), http.StatusBadRequest, "bad_request")
+	wantError(t, rename(`{"title":"x"}`, header("Origin", "https://evil.test")), http.StatusForbidden, "cross_origin")
+	missing, _ := scan.NewID()
+	wantError(t, e.do("PATCH", "/api/scans/"+missing, strings.NewReader(`{"title":"x"}`)), http.StatusNotFound, "not_found")
+	// 81文字ちょうどではなく 80 文字は通る。
+	if rec := rename(`{"title":"` + strings.Repeat("あ", 80) + `"}`); rec.Code != 200 {
+		t.Fatalf("80文字の名前が拒否された: %d", rec.Code)
+	}
+}

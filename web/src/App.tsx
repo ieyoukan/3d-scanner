@@ -3,8 +3,9 @@
 //   2. URL に応じて表示する画面を選ぶ（ルーティング）
 // アクセス制限はこのアプリでは行わない（前段の Cloudflare Access などに任せる）。
 //
-// 画面は3つ:
+// 画面は4つ:
 //   /                 撮影・確認・送信
+//   /gallery          これまでに作った3Dデータの一覧
 //   /scans/:id        処理の進行状況
 //   /scans/:id/view   3Dビューア
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
@@ -12,6 +13,7 @@ import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { fetchConfig } from './api/client';
 import type { ServerConfig } from './api/types';
 import { CapturePage } from './pages/CapturePage';
+import { GalleryPage } from './pages/GalleryPage';
 import { ScanPage } from './pages/ScanPage';
 import { Button, buttonClass } from './ui/Button';
 import { SpinnerIcon } from './ui/icons';
@@ -54,6 +56,7 @@ export function App() {
       <Suspense fallback={<FullScreenMessage busy>3Dビューアを読み込んでいます…</FullScreenMessage>}>
         <Routes>
           <Route path="/" element={<CapturePage config={config} />} />
+          <Route path="/gallery" element={<GalleryPage />} />
           <Route path="/scans/:id" element={<ScanPage />} />
           <Route path="/scans/:id/view" element={<ViewPage />} />
           <Route

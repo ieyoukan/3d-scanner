@@ -4,9 +4,9 @@
 //   - URL やエラーの扱いが1か所にまとまる
 //   - 「どんな通信をしているか」がこのファイルを読めば分かる
 //
-// 認証は Cookie で行う。同じオリジンへの fetch には Cookie が自動で付くので、
-// ここではトークンを持ち回らない（JavaScript からトークンを読める場所に置かない）。
-import type { ApiErrorDetail, CreateScanResult, Scan, SceneInfo, ServerConfig, StepName } from './types';
+// アプリ自体には認証が無い（前段の Cloudflare Access が行う）。Access の Cookie は
+// 同じオリジンへの fetch に自動で付くので、ここで認証情報を扱うことはない。
+import type { ApiErrorDetail, CreateScanResult, GalleryPage, Scan, SceneInfo, ServerConfig, StepName } from './types';
 
 /** サーバーが返したエラー。code で原因を区別できる。 */
 export class ApiError extends Error {
@@ -79,6 +79,25 @@ export async function deleteScan(id: string): Promise<'cancelled' | 'deleted'> {
   const res = await ensureOk(await fetch(`/api/scans/${encodeURIComponent(id)}`, { method: 'DELETE' }));
   const body = (await res.json()) as { result: 'cancelled' | 'deleted' };
   return body.result;
+}
+
+/** ギャラリーの一覧を新しい順に読む。after に前回の nextCursor を渡すと続きを読む。 */
+export function fetchGallery(after?: string, signal?: AbortSignal): Promise<GalleryPage> {
+  const params = new URLSearchParams({ limit: '24' });
+  if (after) params.set('after', after);
+  return getJSON<GalleryPage>(`/api/scans?${params}`, signal);
+}
+
+/** スキャンの名前を変える。サーバーが整えた（前後の空白を除いた）名前を返す。 */
+export async function renameScan(id: string, title: string): Promise<string> {
+  const res = await ensureOk(
+    await fetch(`/api/scans/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    }),
+  );
+  return ((await res.json()) as { title: string }).title;
 }
 
 export function fetchSceneInfo(url: string, signal?: AbortSignal): Promise<SceneInfo> {

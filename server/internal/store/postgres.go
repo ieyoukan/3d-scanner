@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	// pgx を database/sql のドライバとして登録する（"pgx" という名前で使えるようになる）。
@@ -96,7 +97,7 @@ func (p *Postgres) Create(ctx context.Context, s scan.Scan, frames []scan.Frame)
 
 // scanColumns は scans を読むときの列の並び。scanRow と必ず同じ順番にする。
 const scanColumns = `id::text, status, created_at, updated_at, expires_at, started_at, finished_at,
-	frame_count, attempts, error_code, error_message, capture_meta`
+	frame_count, attempts, error_code, error_message, capture_meta, saved, title`
 
 // rowScanner は *sql.Row と *sql.Rows の共通部分（Scan だけ）を表す。
 type rowScanner interface {
@@ -109,7 +110,7 @@ func scanRow(r rowScanner) (scan.Scan, error) {
 	var started, finished sql.NullTime
 	var meta []byte
 	err := r.Scan(&s.ID, &status, &s.CreatedAt, &s.UpdatedAt, &s.ExpiresAt, &started, &finished,
-		&s.FrameCount, &s.Attempts, &s.ErrorCode, &s.ErrorMessage, &meta)
+		&s.FrameCount, &s.Attempts, &s.ErrorCode, &s.ErrorMessage, &meta, &s.Saved, &s.Title)
 	if err != nil {
 		return scan.Scan{}, err
 	}
@@ -236,13 +237,64 @@ func (p *Postgres) PutAsset(ctx context.Context, scanID string, a scan.Asset) er
 	return err
 }
 
+func (p *Postgres) List(ctx context.Context, q ListQuery) ([]scan.Summary, error) {
+	// 成果物の種類は string_agg で1つの文字列（"mesh_glb,scene_json"）にまとめて読む。
+	// 一覧の各行で scan_assets を別に問い合わせると、件数ぶん往復が増える（N+1 問題）。
+	query := `SELECT ` + scanColumns + `,
+		COALESCE((SELECT string_agg(kind, ',' ORDER BY kind) FROM scan_assets a WHERE a.scan_id = s.id), '')
+		FROM scans s WHERE status <> 'expired'`
+	args := []any{}
+	if q.After != nil {
+		// (created_at, id) の組で比べる（行値の比較）。同じ時刻の行があっても順番が一意に決まる。
+		query += ` AND (created_at, id) < ($1, $2::uuid)`
+		args = append(args, q.After.CreatedAt, q.After.ID)
+	}
+	query += fmt.Sprintf(` ORDER BY created_at DESC, id DESC LIMIT %d`, q.Limit)
+
+	rows, err := p.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []scan.Summary
+	for rows.Next() {
+		var sum scan.Summary
+		var status, kinds string
+		var started, finished sql.NullTime
+		var meta []byte
+		sc := &sum.Scan
+		if err := rows.Scan(&sc.ID, &status, &sc.CreatedAt, &sc.UpdatedAt, &sc.ExpiresAt, &started, &finished,
+			&sc.FrameCount, &sc.Attempts, &sc.ErrorCode, &sc.ErrorMessage, &meta, &sc.Saved, &sc.Title, &kinds); err != nil {
+			return nil, err
+		}
+		sc.Status = scan.Status(status)
+		sc.StartedAt, sc.FinishedAt = timePtr(started), timePtr(finished)
+		sc.CaptureMeta = json.RawMessage(meta)
+		for _, k := range strings.Split(kinds, ",") {
+			if k != "" {
+				sum.AssetKinds = append(sum.AssetKinds, scan.AssetKind(k))
+			}
+		}
+		out = append(out, sum)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) SetTitle(ctx context.Context, id, title string, now time.Time) error {
+	res, err := p.db.ExecContext(ctx, `UPDATE scans SET title = $2, updated_at = $3 WHERE id = $1 AND status <> 'expired'`, id, title, now)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res)
+}
+
 func (p *Postgres) Finish(ctx context.Context, id string, out scan.Outcome, now time.Time) (bool, error) {
 	// WHERE status = 'running' が守り。キャンセル済み（cancelled）の行は更新されない。
 	res, err := p.db.ExecContext(ctx, `
 		UPDATE scans
-		SET status = $2, error_code = $3, error_message = $4, finished_at = $5, updated_at = $5
+		SET status = $2, error_code = $3, error_message = $4, finished_at = $5, updated_at = $5, saved = $6
 		WHERE id = $1 AND status = 'running'`,
-		id, string(out.Status), out.ErrorCode, out.ErrorMessage, now)
+		id, string(out.Status), out.ErrorCode, out.ErrorMessage, now, out.Saved)
 	if err != nil {
 		return false, err
 	}
@@ -355,7 +407,7 @@ func (p *Postgres) RecoverInterrupted(ctx context.Context, maxAttempts int, now 
 func (p *Postgres) ListExpired(ctx context.Context, now time.Time, limit int) ([]string, error) {
 	return collectIDs(p.db.QueryContext(ctx, `
 		SELECT id::text FROM scans
-		WHERE expires_at < $1 AND status <> 'expired'
+		WHERE expires_at < $1 AND status <> 'expired' AND NOT saved
 		ORDER BY expires_at LIMIT $2`, now, limit))
 }
 

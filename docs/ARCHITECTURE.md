@@ -28,8 +28,9 @@
 - 自動撮影のガイド、深度センサー、3DGS の編集、Unity / VRChat への直接公開。
 - 分散ジョブキュー、複数ノードでの並列処理、分割アップロード。
 
-「履歴を保存しない」と「データを保存しない」は別。ジョブの状態は DB に、写真と成果物は PVC に
-一時保存し、保存期間（既定 24 時間）を過ぎたら削除する。
+「履歴を保存しない」と「データを保存しない」は別。ジョブの状態は DB に、写真と成果物は PVC に置く。
+完成したもの（succeeded / partial）はギャラリーに保存し（`scans.saved`）、利用者が削除するまで残す。
+このとき中間ファイル（`dense/`）だけは消す。失敗・中止したものは保存期間（既定 24 時間）を過ぎたら削除する。
 
 ## 2. 技術スタック
 
@@ -146,10 +147,13 @@ API とワーカーを同じ Pod・同じプロセスにしているのは、作
 | `GET /healthz` | 生存確認（依存先を見ない） |
 | `GET /readyz` | DB と保存先を確認 |
 | `GET /api/config` | 上限値、サーバーの構成 |
+| `GET /api/scans` | ギャラリーの一覧（新しい順、期限切れを除く）。`?limit=`（最大 60）と `?after=`（前回の `nextCursor`）で続きを読む |
 | `POST /api/scans` | `multipart/form-data`（`images` 複数＋任意の `metadata`）。`202 Accepted` |
 | `GET /api/scans/{id}` | 状態、ステップ、成果物、待ち順 |
 | `GET /api/scans/{id}/logs?step=sfm` | ステップの処理ログ（末尾 256KB） |
 | `GET /api/scans/{id}/assets/{kind}` | 成果物。末尾に `/scene.sog` のようなファイル名を付けてもよい |
+| `GET /api/scans/{id}/thumbnail` | ギャラリー用の縮小画像（受付時に1枚目の写真から作る JPEG、長辺 480） |
+| `PATCH /api/scans/{id}` | 名前の変更（`{"title": "..."}`、80 文字まで） |
 | `DELETE /api/scans/{id}` | 処理中ならキャンセル、終了済みなら削除 |
 
 成果物の種類: `sparse_ply` / `scene_json` / `mesh_glb` / `gaussian_ply` / `gaussian_sog`。
@@ -240,7 +244,8 @@ Helm chart の要点（詳細は `charts/3d-scanner/values.yaml` のコメント
 
 ## 9. MVP 後（VPS フェーズ）の見通し
 
-- スキャンの長期保存、ユーザーと空間 ID、位置情報。
+- ユーザーと空間 ID、位置情報（スキャンの長期保存はギャラリーとして実装済み。地図として使う
+  `database.db` と `sparse/0` も残している）。
 - 撮影時の端末姿勢（ARCore / VIO）の記録。`scan_frames.camera` に入れる想定。
 - 保存した SfM の特徴点と新しい画像の対応づけ、PnP + RANSAC による Relocalization。
 - 追加撮影の座標合わせ、モデルの更新。
@@ -263,3 +268,4 @@ Helm chart の要点（詳細は `charts/3d-scanner/values.yaml` のコメント
 | 成果物 | `mesh_glb, gaussian_ply, gaussian_sog, sparse_ply` | 左に加えて `scene_json` | ビューアの向きと初期視点を決めるため |
 | アップロード | 分割アップロードの検討 | 1 リクエスト＋ブラウザ側での縮小 | 長辺 2048px に縮めれば 80 枚でも 100MB に収まる。分割は必要になってから |
 | 公開 URL | `scanner.youkan.uk` は候補 | Application の values で指定 | DNS とトンネルの経路は Ingress Controller が作る。実際の公開はマージ後 |
+| 保存期間 | すべて 24 時間で削除（長期保存は範囲外） | 完成したものはギャラリーに保存して残す（`KEEP_COMPLETED`、既定 true） | 利用者の要望。撮った 3D データを手元に残したい。失敗・中止したものは従来どおり期限で消す |

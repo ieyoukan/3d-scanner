@@ -21,10 +21,12 @@
 | --- | --- |
 | `/` | カメラで撮影、または写真を選択。サムネイルで確認して不要な写真を削除し、送信する |
 | `/scans/<id>` | 処理の進行状況。段階ごとの状態・説明・所要時間・処理ログ。中止と削除 |
-| `/scans/<id>/view` | メッシュ / 3DGS / 点群をタブで切り替えて 3D 表示。GLB / PLY / SOG のダウンロード |
+| `/scans/<id>/view` | メッシュ / 3DGS / 点群をタブで切り替えて 3D 表示。GLB / PLY / SOG のダウンロード。名前の変更 |
+| `/gallery` | これまでに作った 3D データの一覧（サムネイル・名前・形式）。処理中や失敗したものも出る |
 
-出来ないこと（MVP の範囲外）: アカウント、スキャンの長期保存、再訪問スキャン、VPS、3DGS の編集。
-写真と結果は保存期間（既定 24 時間）を過ぎると自動で削除される。
+出来ないこと（範囲外）: アカウント、再訪問スキャン、VPS、3DGS の編集。
+完成した 3D データ（成功・一部成功）はギャラリーに保存され、利用者が削除するまで残る。
+失敗・中止したものは保存期間（既定 24 時間）を過ぎると自動で削除される。
 
 ### GPU が無い環境での動作
 
@@ -124,7 +126,8 @@ docker run --rm -v "$PWD/samples/sceaux:/work" -e SPLAT_ITERATIONS=300 \
 | `DATABASE_URL` | – | PostgreSQL の接続文字列。または `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` を個別に指定 |
 | `DATA_DIR` | `/data` | 作業領域（PVC のマウント先） |
 | `WEB_DIR` | – | ビルド済み Web の場所。空なら API のみ |
-| `RETENTION` | `24h` | 保存期間 |
+| `RETENTION` | `24h` | 保存期間（ギャラリーに保存したものには効かない） |
+| `KEEP_COMPLETED` | `true` | 完成したスキャン（成功・一部成功）をギャラリーに保存し、期限で消さない |
 | `MIN_IMAGES` / `MAX_IMAGES` | `8` / `80` | 写真の枚数 |
 | `MAX_IMAGE_MB` / `MAX_UPLOAD_MB` | `15` / `95` | 1 枚と全体のサイズ上限（Cloudflare の 100MB 制限より小さくする） |
 | `MAX_QUEUED_SCANS` | `5` | 順番待ち＋実行中の上限 |
@@ -153,6 +156,10 @@ curl -X POST "$BASE/api/scans" \
 
 # 状態を確認する（終わるまで数秒おきに繰り返す）
 curl "$BASE/api/scans/$ID"
+
+# ギャラリーの一覧（新しい順。続きは ?after=<nextCursor>）と、名前の変更
+curl "$BASE/api/scans?limit=24"
+curl -X PATCH "$BASE/api/scans/$ID" -H 'Content-Type: application/json' -d '{"title":"机の上のマグカップ"}'
 # → {"status":"running","steps":[{"name":"sfm","status":"succeeded","message":"11枚中11枚の..."}, ...],"assets":[...]}
 
 # 処理ログ

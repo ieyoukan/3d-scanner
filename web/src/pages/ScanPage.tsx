@@ -6,7 +6,7 @@ import { isTerminal, type Scan } from '../api/types';
 import { ReconstructionProgress } from '../progress/ReconstructionProgress';
 import { useNow, useScan } from '../progress/useScan';
 import { Button, buttonClass } from '../ui/Button';
-import { AlertIcon, BackIcon, CubeIcon, SpinnerIcon } from '../ui/icons';
+import { AlertIcon, BackIcon, CheckIcon, CubeIcon, GridIcon, SpinnerIcon } from '../ui/icons';
 
 export function ScanPage() {
   const { id = '' } = useParams();
@@ -16,10 +16,14 @@ export function ScanPage() {
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-xl flex-col">
-      <header className="pad-safe-t flex items-center px-4 pb-2">
+      <header className="pad-safe-t flex items-center justify-between px-4 pb-2">
         <Link to="/" className="-ml-2 flex min-h-11 items-center gap-1 px-2 text-sm">
           <BackIcon />
           撮影画面
+        </Link>
+        <Link to="/gallery" className="-mr-2 flex min-h-11 items-center gap-1.5 px-2 text-sm">
+          <GridIcon />
+          ギャラリー
         </Link>
       </header>
 
@@ -74,7 +78,7 @@ function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
     try {
       const result = await deleteScan(scan.id);
       if (result === 'deleted') {
-        navigate('/');
+        navigate('/gallery');
       } else {
         onChanged();
       }
@@ -92,7 +96,7 @@ function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
       {active && (
         <>
           <p className="text-xs leading-relaxed text-mute">
-            この画面を閉じても処理は続きます。この URL を開けば、あとから結果を確認できます。
+            この画面を閉じても処理は続きます。ギャラリーからいつでも進み具合と結果を確認できます。
           </p>
           <Button variant="danger" className="w-full" disabled={busy} onClick={() => void remove('処理を中止して、写真を削除します。よろしいですか？')}>
             処理を中止する
@@ -115,14 +119,21 @@ function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
 
       {!active && !gone && (
         <div className="flex items-center justify-between gap-3">
-          <p className="tabular text-xs text-mute">{expiryText(scan.expiresAt)}</p>
+          {scan.saved ? (
+            <p className="flex items-center gap-1.5 text-xs text-ok">
+              <CheckIcon width={16} height={16} />
+              ギャラリーに保存済み
+            </p>
+          ) : (
+            <p className="tabular text-xs text-mute">{expiryText(scan.expiresAt)}</p>
+          )}
           <button
             type="button"
             disabled={busy}
-            onClick={() => void remove('写真と結果をサーバーから削除します。元に戻せません。よろしいですか？')}
+            onClick={() => void remove(scan.saved ? 'ギャラリーから削除し、写真と3Dデータをサーバーから消します。元に戻せません。よろしいですか？' : '写真と結果をサーバーから削除します。元に戻せません。よろしいですか？')}
             className="min-h-11 px-2 text-sm text-bad underline underline-offset-4"
           >
-            今すぐ削除
+            {scan.saved ? '削除' : '今すぐ削除'}
           </button>
         </div>
       )}

@@ -102,6 +102,10 @@ func (s *Scan) DenseDir() string     { return filepath.Join(s.dir, "dense") }
 func (s *Scan) OutputDir() string    { return filepath.Join(s.dir, "output") }
 func (s *Scan) LogsDir() string      { return filepath.Join(s.dir, "logs") }
 
+// ThumbnailPath はギャラリー用の縮小画像（受付時に1枚目の写真から作る）の場所を返す。
+// 作業ディレクトリの直下に置くので、やり直し（ResetDerived）では消えない。
+func (s *Scan) ThumbnailPath() string { return filepath.Join(s.dir, "thumbnail.jpg") }
+
 // ModelDir は採用した SfM モデル（sparse/0）の場所を返す。
 // mapper は sparse/ の下に 0, 1, ... とモデルを書く。パイプラインは最も大きいものを 0 番に置く。
 func (s *Scan) ModelDir() string { return filepath.Join(s.dir, "sparse", "0") }
@@ -218,6 +222,19 @@ func (s *Scan) ResetDerived() error {
 		if err := os.MkdirAll(d, 0o750); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// PruneIntermediate は、ギャラリーに保存するスキャンから、もう使わない中間ファイルを消す。
+//
+// 消すのは dense/（歪みを補正した写真の複製や、メッシュを作る途中のファイル）だけ。容量の大半を占め、
+// 成果物はすべて output/ にあるので、表示にもダウンロードにも要らない。
+// 残すもの: images/（元の写真）、database.db と sparse/（特徴点とカメラ位置。VPS などで地図として使える）、
+// output/、logs/、thumbnail.jpg。
+func (s *Scan) PruneIntermediate() error {
+	if err := os.RemoveAll(s.DenseDir()); err != nil {
+		return fmt.Errorf("%s を削除できません: %w", s.DenseDir(), err)
 	}
 	return nil
 }
