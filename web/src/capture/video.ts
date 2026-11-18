@@ -53,13 +53,27 @@ export class BestPerWindow {
   private readonly best = new Map<number, number>();
   private readonly done = new Set<number>();
 
+  /**
+   * @param windowAt 時刻（秒）から区間の番号を求める関数
+   * @param count    区間の数（終わりが決まっていなければ Infinity。missing は使えない）
+   */
   constructor(
-    readonly durationSec: number,
-    readonly count: number,
+    private readonly windowAt: (t: number) => number,
+    readonly count = Infinity,
   ) {}
 
+  /** 長さの決まった動画を count 個の同じ長さの区間に分ける。 */
+  static forDuration(durationSec: number, count: number): BestPerWindow {
+    return new BestPerWindow((t) => windowOf(t, durationSec, count), count);
+  }
+
+  /** intervalSec 秒ごとに区切る（終わりの決まっていない、カメラの映像用）。 */
+  static every(intervalSec: number): BestPerWindow {
+    return new BestPerWindow((t) => Math.max(0, Math.floor(t / intervalSec)));
+  }
+
   offer(t: number, score: number): { window: number; keep: boolean; closed: number[] } {
-    const window = windowOf(t, this.durationSec, this.count);
+    const window = this.windowAt(t);
     const closed = this.close((w) => w < window);
     // 確定済みの区間に戻ってきたコマ（巻き戻りなど）は使わない。
     if (this.done.has(window)) return { window, keep: false, closed };
@@ -75,6 +89,7 @@ export class BestPerWindow {
 
   /** まだ1枚もコマを見ていない区間（確定していない区間）。 */
   missing(): number[] {
+    if (!Number.isFinite(this.count)) return [];
     return [...Array(this.count).keys()].filter((w) => !this.done.has(w) && !this.best.has(w));
   }
 
@@ -82,6 +97,100 @@ export class BestPerWindow {
     const closed = [...this.best.keys()].filter((w) => match(w) && !this.done.has(w)).sort((a, b) => a - b);
     for (const w of closed) this.done.add(w);
     return closed;
+  }
+}
+
+/**
+ * 区間ごとの候補のコマを控え、区間が確定したら順番に写真（JPEG）にする係。
+ * 動画ファイル（framesFromVideo）とカメラの映像（liveVideo.ts）の両方で使う。
+ *
+ * 控えるのは各区間で最新の候補1枚だけ（展開した画素は1枚で約8〜11MB あるので、溜めない）。
+ * 写真への変換は1枚ずつ順番に行う。1枚が失敗しても残りは続ける。
+ */
+export class FrameCollector {
+  readonly frames: Frame[] = [];
+  /** 変換に失敗した枚数。 */
+  failures = 0;
+  private readonly candidates = new Map<number, { capturedAt: string; bitmap: Promise<ImageBitmap> }>();
+  private encoding: Promise<void> = Promise.resolve();
+  private discarded = false;
+
+  /**
+   * @param source  写し取る映像
+   * @param onFrame 写真が1枚できるたびに呼ばれる
+   */
+  constructor(
+    private readonly source: HTMLVideoElement,
+    private readonly onFrame?: (frame: Frame) => void,
+  ) {}
+
+  /** いま表示されているコマを、区間 key の候補として写し取る（前の候補は捨てる）。 */
+  keep(key: number, capturedAt: string): void {
+    this.drop(key);
+    this.candidates.set(key, { capturedAt, bitmap: createImageBitmap(this.source) });
+  }
+
+  /** 確定した区間の候補を、順番に写真にする。 */
+  flush(keys: readonly number[]): void {
+    for (const key of keys) {
+      const c = this.candidates.get(key);
+      if (!c) continue;
+      this.candidates.delete(key);
+      this.encoding = this.encoding.then(async () => {
+        let bitmap: ImageBitmap | undefined;
+        try {
+          bitmap = await c.bitmap;
+          if (this.discarded) return;
+          const frame = await frameFromVideoFrame(bitmap, c.capturedAt);
+          if (this.discarded) {
+            releaseFrame(frame);
+            return;
+          }
+          this.frames.push(frame);
+          this.onFrame?.(frame);
+        } catch {
+          this.failures += 1;
+        } finally {
+          bitmap?.close();
+        }
+      });
+    }
+  }
+
+  /** 写真の一覧を入れ替える（間引いたとき）。外した写真の解放は呼び出し側が行う。 */
+  replace(frames: readonly Frame[]): void {
+    this.frames.splice(0, this.frames.length, ...frames);
+  }
+
+  /** ここまでに頼んだ変換が終わるのを待つ。 */
+  settled(): Promise<void> {
+    return this.encoding;
+  }
+
+  /** 撮影順に並べた写真の一覧（capturedAt は同じ書式の ISO 文字列なので、文字列の順が時刻の順）。 */
+  sorted(): Frame[] {
+    return [...this.frames].sort((a, b) => a.capturedAt.localeCompare(b.capturedAt));
+  }
+
+  /** 控えている候補を捨てる。 */
+  dropCandidates(): void {
+    for (const key of [...this.candidates.keys()]) this.drop(key);
+  }
+
+  /** 中止したとき: 候補も、作った写真もすべて捨てる。 */
+  async discard(): Promise<void> {
+    this.discarded = true;
+    this.dropCandidates();
+    await this.encoding;
+    for (const f of this.frames) releaseFrame(f);
+    this.frames.length = 0;
+  }
+
+  private drop(key: number): void {
+    const c = this.candidates.get(key);
+    if (!c) return;
+    this.candidates.delete(key);
+    c.bitmap.then((b) => b.close()).catch(() => {});
   }
 }
 
@@ -108,11 +217,8 @@ export interface VideoOptions {
 export async function framesFromVideo(file: File, opts: VideoOptions): Promise<Frame[]> {
   const { video, signal } = opts;
   const url = URL.createObjectURL(file);
-  const candidates = new Map<number, { t: number; bitmap: Promise<ImageBitmap> }>();
-  const frames: Frame[] = [];
+  const collector = new FrameCollector(video);
   const cleanups: (() => void)[] = [];
-  // 写真への変換（JPEG 化）を順番に行うための鎖。途中で終わっても、これを待ってから後片付けする。
-  let encoding = Promise.resolve();
   try {
     video.muted = true;
     video.playsInline = true;
@@ -129,39 +235,20 @@ export async function framesFromVideo(file: File, opts: VideoOptions): Promise<F
     const count = planCount(duration, opts.room);
     if (count < 1) throw new FrameError('これ以上写真を追加できません。');
 
-    const picker = new BestPerWindow(duration, count);
+    const picker = BestPerWindow.forDuration(duration, count);
     const scorer = makeScorer(video);
     // 動画の撮影開始の時刻（並び順の手掛かり）。ファイルの更新時刻を撮影終了とみなす。
     const startedAt = (file.lastModified || Date.now()) - duration * 1000;
-    const report = (time: number) => opts.onProgress({ time, duration, picked: frames.length, count });
+    const report = (time: number) =>
+      opts.onProgress({ time, duration, picked: collector.frames.length, count });
 
-    /** いまのコマが区間で一番なら写し取って控える。古い候補は閉じる。 */
+    /** いまのコマが区間で一番なら写し取って控え、確定した区間を写真にする。 */
     const consider = (t: number) => {
       const r = picker.offer(t, scorer());
-      if (r.keep) {
-        const old = candidates.get(r.window);
-        old?.bitmap.then((b) => b.close()).catch(() => {});
-        candidates.set(r.window, { t, bitmap: createImageBitmap(video) });
-      }
-      flush(r.closed);
+      if (r.keep) collector.keep(r.window, new Date(startedAt + t * 1000).toISOString());
+      collector.flush(r.closed);
     };
-    /** 確定した区間の候補を、順番に JPEG にする。 */
-    const flush = (windows: number[]) => {
-      for (const w of windows) {
-        const c = candidates.get(w);
-        if (!c) continue;
-        candidates.delete(w);
-        encoding = encoding.then(async () => {
-          const bitmap = await c.bitmap;
-          try {
-            if (signal.aborted) return;
-            frames.push(await frameFromVideoFrame(bitmap, new Date(startedAt + c.t * 1000).toISOString()));
-          } finally {
-            bitmap.close();
-          }
-        });
-      }
-    };
+    const flush = (windows: number[]) => collector.flush(windows);
 
     report(0);
     // 古いブラウザには requestVideoFrameCallback が無い（型の上では常にあるので、関数かどうかで確かめる）。
@@ -191,23 +278,22 @@ export async function framesFromVideo(file: File, opts: VideoOptions): Promise<F
       consider(t);
       flush(picker.finish());
     }
-    await encoding;
+    await collector.settled();
     if (signal.aborted) throw abortError();
     report(duration);
-    if (frames.length === 0) throw new FrameError('動画からコマを読み取れませんでした。');
-    // 後から埋めた区間の分も含めて、動画の中の順に並べる（capturedAt は同じ書式の ISO 文字列）。
-    return frames.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt));
+    if (collector.frames.length === 0) throw new FrameError('動画からコマを読み取れませんでした。');
+    // 後から埋めた区間の分も含めて、動画の中の順に並べる。
+    return collector.sorted();
   } catch (err) {
     // 途中で終わったら、変換中の分も含めて、作った写真を捨てる。
-    await encoding.catch(() => {});
-    for (const f of frames) releaseFrame(f);
+    await collector.discard();
     if (signal.aborted) throw abortError();
     if (err instanceof FrameError || (err instanceof DOMException && err.name === 'AbortError')) throw err;
     throw new FrameError(
       `「${file.name}」を動画として読み込めませんでした。このブラウザで再生できない形式かもしれません。`,
     );
   } finally {
-    for (const c of candidates.values()) c.bitmap.then((b) => b.close()).catch(() => {});
+    collector.dropCandidates();
     for (const fn of cleanups) fn();
     // 同じ要素で次の動画を読み始めていたら（開発時の StrictMode の再実行など）、そちらを壊さない。
     if (video.src === url) {
@@ -219,8 +305,8 @@ export async function framesFromVideo(file: File, opts: VideoOptions): Promise<F
   }
 }
 
-/** いま表示されているコマのくっきり度を測る関数を作る。 */
-function makeScorer(video: HTMLVideoElement): () => number {
+/** いま表示されているコマのくっきり度を測る関数を作る（長辺 480px に縮めたラプラシアン分散）。 */
+export function makeScorer(video: HTMLVideoElement): () => number {
   const size = fit(video.videoWidth, video.videoHeight, scoreEdge);
   const canvas = document.createElement('canvas');
   canvas.width = size.width;
