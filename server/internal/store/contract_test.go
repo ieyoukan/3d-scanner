@@ -488,4 +488,87 @@ func runContract(t *testing.T, open func(t *testing.T) Store) {
 			t.Fatalf("無い ID: %v", err)
 		}
 	})
+
+	t.Run("続きの版: 元の版を指し、完成すると古い版は一覧から外れる", func(t *testing.T) {
+		s := open(t)
+		parent := newScan(t, 0)
+		mustCreate(t, s, parent)
+		finishAs(t, s, parent.ID, scan.StatusSucceeded)
+
+		child := newScan(t, time.Minute)
+		child.ParentID, child.BaseFrameCount, child.FrameCount, child.Title = parent.ID, 2, 5, "棚"
+		mustCreate(t, s, child)
+		got := mustGet(t, s, child.ID).Scan
+		if got.ParentID != parent.ID || got.BaseFrameCount != 2 || got.FrameCount != 5 || got.Title != "棚" {
+			t.Fatalf("続きの版 = %+v", got)
+		}
+		if mustGet(t, s, parent.ID).Scan.ParentID != "" {
+			t.Fatal("元の版の ParentID は空のはず")
+		}
+
+		listed := func() map[string]bool {
+			t.Helper()
+			rows, err := s.List(ctx, ListQuery{Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids := map[string]bool{}
+			for _, r := range rows {
+				ids[r.Scan.ID] = true
+				if r.Scan.ID == child.ID && r.Scan.ParentID != parent.ID {
+					t.Fatalf("一覧の ParentID = %q", r.Scan.ParentID)
+				}
+			}
+			return ids
+		}
+		// 処理中は両方出る（続きが失敗するかもしれないので、元の版を隠さない）。
+		if ids := listed(); !ids[parent.ID] || !ids[child.ID] {
+			t.Fatalf("処理中の一覧 = %v", ids)
+		}
+		finishAs(t, s, child.ID, scan.StatusSucceeded)
+		if ids := listed(); ids[parent.ID] || !ids[child.ID] {
+			t.Fatalf("完成後の一覧 = %v（元の版は隠れるはず）", ids)
+		}
+
+		children, err := s.Children(ctx, parent.ID)
+		if err != nil || len(children) != 1 || children[0].ID != child.ID {
+			t.Fatalf("Children = %v, %v", children, err)
+		}
+
+		// 元の版を消しても、続きの版は残る（ParentID だけ空になる）。
+		if err := s.Delete(ctx, parent.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := mustGet(t, s, child.ID).Scan; got.ParentID != "" || got.BaseFrameCount != 2 {
+			t.Fatalf("元の版の削除後 = %+v", got)
+		}
+	})
+
+	t.Run("続きの版が失敗したら、古い版は一覧に残る", func(t *testing.T) {
+		s := open(t)
+		parent := newScan(t, 0)
+		mustCreate(t, s, parent)
+		finishAs(t, s, parent.ID, scan.StatusPartial)
+		child := newScan(t, time.Minute)
+		child.ParentID = parent.ID
+		mustCreate(t, s, child)
+		finishAs(t, s, child.ID, scan.StatusFailed)
+		rows, err := s.List(ctx, ListQuery{Limit: 10})
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("一覧 = %d件, %v（両方出るはず）", len(rows), err)
+		}
+	})
+}
+
+// finishAs はスキャンを取り出して、指定した終了状態にする。
+func finishAs(t *testing.T, s Store, id string, status scan.Status) {
+	t.Helper()
+	ctx := context.Background()
+	sc, err := s.ClaimNext(ctx, base)
+	if err != nil || sc == nil || sc.ID != id {
+		t.Fatalf("ClaimNext = %v, %v（%s を取り出すはず）", sc, err, id)
+	}
+	if ok, err := s.Finish(ctx, id, scan.Outcome{Status: status, Saved: status.Keepable()}, base); !ok || err != nil {
+		t.Fatalf("Finish = %v, %v", ok, err)
+	}
 }

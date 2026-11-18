@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,8 @@ import (
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
 	"github.com/ieyoukan/3d-scanner/server/internal/thumbnail"
 	"github.com/ieyoukan/3d-scanner/server/internal/upload"
+	"github.com/ieyoukan/3d-scanner/server/internal/vps"
+	"github.com/ieyoukan/3d-scanner/server/internal/workspace"
 )
 
 // ---------------------------------------------------------------------------
@@ -116,11 +119,14 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 type createResponse struct {
-	ID                string      `json:"id"`
-	Status            scan.Status `json:"status"`
-	FrameCount        int         `json:"frameCount"`
-	DuplicatesSkipped int         `json:"duplicatesSkipped"`
-	ExpiresAt         time.Time   `json:"expiresAt"`
+	ID     string      `json:"id"`
+	Status scan.Status `json:"status"`
+	// FrameCount は処理に使う写真の枚数（続きの版では、引き継いだ写真を含む）。
+	FrameCount int `json:"frameCount"`
+	// BaseFrameCount は元の版から引き継いだ写真の枚数（新規なら 0）。
+	BaseFrameCount    int       `json:"baseFrameCount"`
+	DuplicatesSkipped int       `json:"duplicatesSkipped"`
+	ExpiresAt         time.Time `json:"expiresAt"`
 }
 
 // handleCreateScan は写真を受け取り、復元ジョブを待ち行列に入れる。
@@ -135,6 +141,44 @@ type createResponse struct {
 // 副作用: PVC に写真を保存し、DB に行を作り、ワーカーを起こす。
 // 失敗時は保存しかけたファイルを必ず消す（半端なデータを残さない）。
 func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
+	s.createScan(w, r, nil)
+}
+
+// handleResumeScan は「続きを撮る」の写真を受け取り、続きの版を待ち行列に入れる
+// （POST /api/scans/{id}/resume。本文は POST /api/scans と同じ形）。
+//
+// 続きの版は新しいスキャンとして作り、元の版の写真と地図を引き継ぐ（workspace.InheritFrom）。
+// 元の版は書き換えないので、追加撮影がうまくいかなくても前の3Dデータはそのまま残る。
+// 写真は1枚から受け付ける。上限は引き継いだ写真と合わせて MAX_IMAGES 枚まで
+// （処理には全部の写真を使うので、処理時間とメモリは合計の枚数で決まる）。
+func (s *Server) handleResumeScan(w http.ResponseWriter, r *http.Request) {
+	d, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	if !s.resumable(d.Scan) {
+		writeError(w, http.StatusConflict, "not_resumable", notResumableMessage)
+		return
+	}
+	parent := d.Scan
+	s.createScan(w, r, &parent)
+}
+
+// notResumableMessage は「続きを撮る」と位置合わせができないスキャンへの説明。
+const notResumableMessage = "このスキャンには続きを撮れません。完成していて、位置合わせ用の地図（カメラ位置と特徴点）が残っているものだけが対象です。"
+
+// resumable は、スキャンが「続きを撮る」と位置合わせ（VPS）に使えるかを返す。
+// 完成していて（見られる3Dデータがある）、地図のファイルが残っているもの。
+func (s *Server) resumable(sc scan.Scan) bool {
+	if !sc.Status.Keepable() {
+		return false
+	}
+	ws, err := s.root.Scan(sc.ID)
+	return err == nil && ws.HasMap()
+}
+
+// createScan は新規と「続きを撮る」に共通の受付処理。parent が nil なら新規。
+func (s *Server) createScan(w http.ResponseWriter, r *http.Request, parent *scan.Scan) {
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if mediaType != "multipart/form-data" {
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "multipart/form-data で送信してください。")
@@ -172,7 +216,19 @@ func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 「最低限残しておく空き」＋「今回のアップロードで増えうる量」が無ければ断る。
-	if free < s.cfg.Limits.MinFreeDiskBytes+s.cfg.Limits.MaxUploadBytes {
+	// 続きの版は、処理の始めに元の版の COLMAP DB を複製するので、その大きさも見込む。
+	need := s.cfg.Limits.MinFreeDiskBytes + s.cfg.Limits.MaxUploadBytes
+	var parentWS *workspace.Scan
+	if parent != nil {
+		if parentWS, err = s.root.Scan(parent.ID); err != nil {
+			writeError(w, http.StatusNotFound, "not_found", "スキャンが見つかりません。")
+			return
+		}
+		if fi, err := os.Stat(parentWS.DatabasePath()); err == nil {
+			need += fi.Size()
+		}
+	}
+	if free < need {
 		writeError(w, http.StatusInsufficientStorage, "disk_full", "サーバーの保存領域が不足しています。時間をおいてお試しください。")
 		return
 	}
@@ -202,6 +258,24 @@ func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// 続きの版: 元の版の写真と地図を引き継ぎ、今回の写真はその続きの番号で保存する。
+	var inherited workspace.Inherited
+	opts := upload.Options{}
+	if parent != nil {
+		if inherited, err = ws.InheritFrom(parentWS); err != nil {
+			s.log.Error("元の版を引き継げません", "scan", id, "parent", parent.ID, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal", "元の3Dデータを引き継げませんでした。")
+			return
+		}
+		room := s.cfg.Limits.MaxImages - inherited.Frames
+		if room < 1 {
+			writeError(w, http.StatusBadRequest, "too_many_images",
+				fmt.Sprintf("これ以上写真を追加できません（元の写真と合わせて%d枚までです）。", s.cfg.Limits.MaxImages))
+			return
+		}
+		opts = upload.Options{FirstNumber: inherited.NextNumber, MinImages: 1, MaxImages: room}
+	}
+
 	// リクエスト全体の上限。これを超えて読もうとすると読み取りがエラーになる
 	// （Content-Length を偽ったり省略したりしても効く）。
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.Limits.MaxUploadBytes)
@@ -210,7 +284,7 @@ func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_upload", "アップロードの形式が正しくありません。")
 		return
 	}
-	res, err := upload.Receive(mr, ws.ImagesDir(), s.cfg.Limits)
+	res, err := upload.ReceiveWith(mr, ws.ImagesDir(), s.cfg.Limits, opts)
 	if err != nil {
 		var ue *upload.Error
 		if errors.As(err, &ue) {
@@ -223,7 +297,8 @@ func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ギャラリー用の縮小画像を、1枚目の写真から作っておく。失敗しても受付は続ける（一覧で画像が出ないだけ）。
-	if len(res.Frames) > 0 {
+	// 続きの版は元の版の縮小画像を引き継いでいる（一覧で同じ見た目にする）ので、無いときだけ作る。
+	if _, err := os.Stat(ws.ThumbnailPath()); err != nil && len(res.Frames) > 0 {
 		if err := thumbnail.Make(filepath.Join(ws.ImagesDir(), res.Frames[0].FileName), ws.ThumbnailPath(), thumbnailSide); err != nil {
 			s.log.Warn("サムネイルを作れません", "scan", id, "error", err)
 		}
@@ -231,11 +306,16 @@ func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 
 	now := s.now().UTC()
 	sc := scan.Scan{
-		ID:          id,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(s.cfg.Jobs.Retention),
-		FrameCount:  len(res.Frames),
-		CaptureMeta: res.ClientMeta,
+		ID:             id,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(s.cfg.Jobs.Retention),
+		FrameCount:     inherited.Frames + len(res.Frames),
+		BaseFrameCount: inherited.Frames,
+		CaptureMeta:    res.ClientMeta,
+	}
+	if parent != nil {
+		// 名前は引き継ぐ（ギャラリーで同じものの新しい版だと分かるように）。
+		sc.ParentID, sc.Title = parent.ID, parent.Title
 	}
 	if err := s.store.Create(r.Context(), sc, res.Frames); err != nil {
 		s.log.Error("スキャンを登録できません", "scan", id, "error", err)
@@ -245,10 +325,11 @@ func (s *Server) handleCreateScan(w http.ResponseWriter, r *http.Request) {
 	created = true
 	s.jobs.Notify()
 
-	s.log.Info("スキャンを受け付けました", "scan", id, "frames", len(res.Frames), "duplicates", res.DuplicatesSkipped)
+	s.log.Info("スキャンを受け付けました", "scan", id, "frames", len(res.Frames), "inherited", inherited.Frames,
+		"parent", sc.ParentID, "duplicates", res.DuplicatesSkipped)
 	w.Header().Set("Location", "/api/scans/"+id)
 	writeJSON(w, http.StatusAccepted, createResponse{
-		ID: id, Status: scan.StatusQueued, FrameCount: len(res.Frames),
+		ID: id, Status: scan.StatusQueued, FrameCount: sc.FrameCount, BaseFrameCount: sc.BaseFrameCount,
 		DuplicatesSkipped: res.DuplicatesSkipped, ExpiresAt: sc.ExpiresAt,
 	})
 }
@@ -271,11 +352,27 @@ type scanResponse struct {
 	Title string `json:"title"`
 	// ThumbnailURL は縮小画像の URL。無ければ省略。
 	ThumbnailURL string `json:"thumbnailUrl,omitempty"`
+	// ParentID は元の版（「続きを撮る」で作った場合）。新規、または元の版が削除済みなら省略。
+	ParentID string `json:"parentId,omitempty"`
+	// BaseFrameCount は元の版から引き継いだ写真の枚数（frameCount に含まれる）。
+	BaseFrameCount int `json:"baseFrameCount"`
+	// Resumable は「続きを撮る」と位置合わせ（VPS）に使えるか。
+	Resumable bool `json:"resumable"`
+	// Continuations はこの版を元にした続きの版（新しい順）。
+	Continuations []continuationResponse `json:"continuations"`
 	// QueuePosition は自分より前に並んでいる件数（queued のときだけ入る）。
 	QueuePosition *int            `json:"queuePosition,omitempty"`
 	Error         *errorDetail    `json:"error"`
 	Steps         []stepResponse  `json:"steps"`
 	Assets        []assetResponse `json:"assets"`
+}
+
+// continuationResponse は続きの版1件の概要。
+type continuationResponse struct {
+	ID         string      `json:"id"`
+	Status     scan.Status `json:"status"`
+	CreatedAt  time.Time   `json:"createdAt"`
+	FrameCount int         `json:"frameCount"`
 }
 
 type stepResponse struct {
@@ -328,7 +425,18 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		ID: sc.ID, Status: sc.Status, CreatedAt: sc.CreatedAt, UpdatedAt: sc.UpdatedAt, ExpiresAt: sc.ExpiresAt,
 		StartedAt: sc.StartedAt, FinishedAt: sc.FinishedAt, FrameCount: sc.FrameCount,
 		Saved: sc.Saved, Title: sc.Title, ThumbnailURL: s.thumbnailURL(sc),
-		Steps: []stepResponse{}, Assets: []assetResponse{},
+		ParentID: sc.ParentID, BaseFrameCount: sc.BaseFrameCount, Resumable: s.resumable(sc),
+		Continuations: []continuationResponse{},
+		Steps:         []stepResponse{}, Assets: []assetResponse{},
+	}
+	if children, err := s.store.Children(r.Context(), sc.ID); err == nil {
+		for _, c := range children {
+			resp.Continuations = append(resp.Continuations, continuationResponse{
+				ID: c.ID, Status: c.Status, CreatedAt: c.CreatedAt, FrameCount: c.FrameCount,
+			})
+		}
+	} else {
+		s.log.Warn("続きの版を読めません", "scan", sc.ID, "error", err)
 	}
 	if sc.ErrorCode != "" || sc.ErrorMessage != "" {
 		resp.Error = &errorDetail{Code: sc.ErrorCode, Message: sc.ErrorMessage}
@@ -515,6 +623,9 @@ type galleryItem struct {
 	// AssetKinds は登録済みの成果物の種類（メッシュ・3DGS があるかを一覧で示すため）。
 	AssetKinds   []scan.AssetKind `json:"assetKinds"`
 	ThumbnailURL string           `json:"thumbnailUrl,omitempty"`
+	// ParentID は元の版（「続きを撮る」で作った場合）。BaseFrameCount は引き継いだ写真の枚数。
+	ParentID       string `json:"parentId,omitempty"`
+	BaseFrameCount int    `json:"baseFrameCount"`
 }
 
 type galleryResponse struct {
@@ -572,7 +683,7 @@ func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
 		resp.Items = append(resp.Items, galleryItem{
 			ID: sc.ID, Status: sc.Status, Title: sc.Title, CreatedAt: sc.CreatedAt, FinishedAt: sc.FinishedAt,
 			ExpiresAt: sc.ExpiresAt, Saved: sc.Saved, FrameCount: sc.FrameCount, AssetKinds: kinds,
-			ThumbnailURL: s.thumbnailURL(sc),
+			ThumbnailURL: s.thumbnailURL(sc), ParentID: sc.ParentID, BaseFrameCount: sc.BaseFrameCount,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -673,6 +784,121 @@ func cleanTitle(v string) (string, bool) {
 		}
 	}
 	return v, true
+}
+
+// ---------------------------------------------------------------------------
+// 位置合わせ（VPS）
+// ---------------------------------------------------------------------------
+
+// Localizer は写真1枚を地図に位置合わせする（本番では *vps.Localizer、テストでは偽物）。
+type Localizer interface {
+	Localize(ctx context.Context, m *workspace.Scan, q vps.Query) (vps.Result, error)
+}
+
+// localizeResponse は位置合わせの結果。座標は、そのスキャンの地図（COLMAP が決めた座標系）で表す。
+// scene.json やダウンロードしたファイルと同じ座標系なので、画面はそのまま重ねて描ける。
+type localizeResponse struct {
+	Localized bool `json:"localized"`
+	// Position はカメラの位置、Forward はレンズの向き（単位ベクトル）。位置が分からなければ省略。
+	Position *[3]float64 `json:"position,omitempty"`
+	Forward  *[3]float64 `json:"forward,omitempty"`
+	// Matches は写真の特徴点のうち地図の3D点に対応づいた数（多いほど確か）。
+	Matches        int   `json:"matches"`
+	ComparedImages int   `json:"comparedImages"`
+	MapImages      int   `json:"mapImages"`
+	DurationMs     int64 `json:"durationMs"`
+	// Message はそのまま画面に出せる説明。
+	Message string `json:"message"`
+}
+
+// handleLocalize は写真1枚を受け取り、スキャンの地図のどこから撮ったものかを返す
+// （POST /api/scans/{id}/localize。multipart/form-data の項目 "image" に写真1枚）。
+//
+// 処理には10〜数十秒かかる（COLMAP で特徴抽出・マッチング・登録を行う）。202 で受けて後から
+// 問い合わせる形にしないのは、結果を残す必要がなく、1枚ぶんなら前段の時間制限（約100秒）に収まるため。
+// 制限時間（vps.Localizer.Timeout）を超えたら 504 で打ち切る。
+func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
+	d, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	if !s.resumable(d.Scan) {
+		writeError(w, http.StatusConflict, "not_resumable", notResumableMessage)
+		return
+	}
+	if mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType != "multipart/form-data" {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "multipart/form-data で送信してください。")
+		return
+	}
+	tmp, err := s.root.NewTemp("query-")
+	if err != nil {
+		s.log.Error("一時ディレクトリを作れません", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal", "サーバー内部でエラーが発生しました。")
+		return
+	}
+	defer os.RemoveAll(tmp)
+
+	// 写真1枚ぶん（＋multipart の区切りなど）より大きな本文は読まない。
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.Limits.MaxImageBytes+64*1024)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_upload", "アップロードの形式が正しくありません。")
+		return
+	}
+	res, err := upload.ReceiveWith(mr, tmp, s.cfg.Limits, upload.Options{MinImages: 1, MaxImages: 1})
+	if err != nil {
+		var ue *upload.Error
+		if errors.As(err, &ue) {
+			writeError(w, ue.Status, ue.Code, ue.Message)
+			return
+		}
+		s.log.Error("写真を保存できません", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal", "写真を受け取れませんでした。")
+		return
+	}
+	frame := res.Frames[0]
+	ws, err := s.root.Scan(d.Scan.ID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "スキャンが見つかりません。")
+		return
+	}
+
+	start := time.Now()
+	out, err := s.localizer.Localize(r.Context(), ws, vps.Query{
+		Path: filepath.Join(tmp, frame.FileName), Width: frame.Width, Height: frame.Height,
+	})
+	elapsed := time.Since(start)
+	switch {
+	case errors.Is(err, vps.ErrBusy):
+		w.Header().Set("Retry-After", "10")
+		writeError(w, http.StatusTooManyRequests, "busy", "別の位置合わせを処理中です。数秒待ってからもう一度お試しください。")
+		return
+	case errors.Is(err, vps.ErrTimeout):
+		writeError(w, http.StatusGatewayTimeout, "localize_timeout",
+			"時間内に位置を確かめられませんでした。3Dデータを作っている間は遅くなります。少し待ってからお試しください。")
+		return
+	case err != nil:
+		if r.Context().Err() != nil {
+			return // 利用者が待つのをやめた。応答を受け取る相手が居ない。
+		}
+		s.log.Error("位置合わせに失敗", "scan", d.Scan.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "localize_failed", "位置合わせの処理に失敗しました。")
+		return
+	}
+
+	resp := localizeResponse{
+		Localized: out.Localized, Matches: out.Matches, ComparedImages: out.ComparedImages,
+		MapImages: out.MapImages, DurationMs: elapsed.Milliseconds(),
+	}
+	if out.Localized {
+		resp.Position, resp.Forward = &out.Position, &out.Forward
+		resp.Message = fmt.Sprintf("位置が分かりました（地図の3D点%d個と一致）。", out.Matches)
+	} else {
+		resp.Message = "保存した3Dデータと一致する景色が見つかりませんでした。前回撮った部分が写るように向けて、もう一度お試しください。"
+	}
+	s.log.Info("位置合わせ", "scan", d.Scan.ID, "localized", out.Localized, "matches", out.Matches,
+		"compared", out.ComparedImages, "duration", elapsed.Round(time.Millisecond))
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------

@@ -158,9 +158,16 @@ func (m *Memory) List(_ context.Context, q ListQuery) ([]scan.Summary, error) {
 		}
 		return a.ID > b.ID
 	}
+	// superseded は「続きの版が完成している」古い版。一覧には出さない。
+	superseded := map[string]bool{}
+	for _, ms := range m.scans {
+		if ms.scan.ParentID != "" && ms.scan.Status.Keepable() {
+			superseded[ms.scan.ParentID] = true
+		}
+	}
 	var hit []*memScan
 	for _, ms := range m.scans {
-		if ms.scan.Status == scan.StatusExpired {
+		if ms.scan.Status == scan.StatusExpired || superseded[ms.scan.ID] {
 			continue
 		}
 		if q.After != nil && !newer(scan.Scan{CreatedAt: q.After.CreatedAt, ID: q.After.ID}, ms.scan) {
@@ -182,6 +189,34 @@ func (m *Memory) List(_ context.Context, q ListQuery) ([]scan.Summary, error) {
 		out = append(out, sum)
 	}
 	return out, nil
+}
+
+func (m *Memory) Children(_ context.Context, id string) ([]scan.Scan, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []scan.Scan
+	for _, ms := range m.scans {
+		if ms.scan.ParentID == id && ms.scan.Status != scan.StatusExpired {
+			out = append(out, ms.scan)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	return out, nil
+}
+
+// detachChildren は、消えるスキャンを指している続きの版の ParentID を空にする
+// （Postgres の ON DELETE SET NULL と同じ振る舞い）。m.mu を持った状態で呼ぶ。
+func (m *Memory) detachChildren(id string) {
+	for _, ms := range m.scans {
+		if ms.scan.ParentID == id {
+			ms.scan.ParentID = ""
+		}
+	}
 }
 
 func (m *Memory) SetTitle(_ context.Context, id, title string, now time.Time) error {
@@ -244,6 +279,7 @@ func (m *Memory) Delete(_ context.Context, id string) error {
 		return ErrNotFound
 	}
 	delete(m.scans, id)
+	m.detachChildren(id)
 	return nil
 }
 
@@ -335,6 +371,7 @@ func (m *Memory) PurgeExpired(_ context.Context, expiredBefore time.Time) (int, 
 	for id, ms := range m.scans {
 		if ms.scan.Status == scan.StatusExpired && ms.scan.ExpiresAt.Before(expiredBefore) {
 			delete(m.scans, id)
+			m.detachChildren(id)
 			n++
 		}
 	}

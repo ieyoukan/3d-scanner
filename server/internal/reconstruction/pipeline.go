@@ -182,9 +182,34 @@ func (p *Pipeline) step(ctx context.Context, rep Reporter, name scan.StepName, f
 //
 //	「同じ点が複数の写真のどこに写っているか」を手掛かりに、
 //	全カメラの位置・向き・焦点距離と、点の3D座標を同時に求める。
+//
+// 続きの版（「続きを撮る」で作ったスキャン。base/ に元の版の地図がある）では、ゼロから解かずに
+// 元の版の結果を出発点にする:
+//
+//	database.db ← base/database.db の複製（引き継いだ写真の特徴点とマッチが入っている）
+//	(1) 特徴抽出:   DB に既にある写真は COLMAP が飛ばす（IMAGE_EXISTS）。今回の写真だけを処理する。
+//	(2) マッチング: マッチ済みの組は飛ばす。今回の写真と全写真の組だけを調べる。
+//	(3) マッピング: base/model（元の版のカメラと3D点）から始め、今回の写真を1枚ずつ登録する。
+//	                元の写真のカメラ位置は固定するので、地図の座標系が版をまたいで変わらない。
+//
+// これは VPS（Visual Positioning System）の位置合わせと同じ処理を、写真の束に対して行うことに当たる。
 func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, error) {
 	ws := job.WS
 	logPath := ws.LogPath(scan.StepSfM)
+
+	resume := ws.HasBase()
+	var inherited map[string]bool
+	if resume {
+		var err error
+		if inherited, err = ws.BaseFrames(); err != nil {
+			return "", err
+		}
+		// 引き継いだ DB は元の版とハードリンクで共有している。COLMAP はその場で書き換えるので、
+		// 元の版を壊さないよう複製して使う。やり直しのときも、ここで元の状態から作り直される。
+		if err := workspace.CopyFile(ws.BaseDatabasePath(), ws.DatabasePath()); err != nil {
+			return "", fmt.Errorf("元の版の地図を複製できません: %w", err)
+		}
+	}
 
 	total, sameSize, err := inspectImages(ws.ImagesDir())
 	if err != nil {
@@ -237,7 +262,19 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 	args = []string{"mapper",
 		"--database_path", ws.DatabasePath(),
 		"--image_path", ws.ImagesDir(),
-		"--output_path", ws.SparseDir(),
+	}
+	if resume {
+		// --input_path: 既存のモデルから続ける。このとき mapper は番号付きの下位ディレクトリを作らず、
+		//   --output_path に直接書く（COLMAP 4.2.1 で確認）。
+		// fix_existing_frames: 元の写真のカメラ位置を動かさない。地図の座標系が保たれるので、
+		//   前の版で位置合わせ（VPS）した結果や、前の版からダウンロードしたデータとそのまま重なる。
+		if err := os.MkdirAll(ws.ModelDir(), 0o750); err != nil {
+			return "", err
+		}
+		args = append(args, "--input_path", ws.BaseModelDir(), "--output_path", ws.ModelDir(),
+			"--Mapper.fix_existing_frames", "1")
+	} else {
+		args = append(args, "--output_path", ws.SparseDir())
 	}
 	args = p.withThreads(args, "--Mapper.num_threads")
 	if err := p.colmap(ctx, logPath, p.cfg.SfMTimeout, args...); err != nil {
@@ -254,6 +291,20 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 	info, err := p.selectBestModel(ctx, ws, logPath, total)
 	if err != nil {
 		return "", err
+	}
+	// 続きの版では、今回の写真が1枚も地図に入らなければ失敗にする。成功にすると、
+	// 元の版と同じ3Dデータを時間をかけて作り直すだけになる。
+	var addedTotal, added int
+	if resume {
+		addedTotal = total - len(inherited)
+		for _, name := range info.names {
+			if !inherited[name] {
+				added++
+			}
+		}
+		if added == 0 {
+			return "", friendly(noNewImagesMessage)
+		}
 	}
 
 	// (5) 疎な点群を PLY に書き出す（ビューアでの確認用）。
@@ -277,6 +328,15 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		return "", err
 	}
 
+	if resume {
+		msg := fmt.Sprintf("今回の%d枚中%d枚を、保存済みの3Dデータの位置に合わせて追加しました。"+
+			"全体で%d枚のカメラ位置と%d個の3D点になりました（平均再投影誤差 %.2f px）。",
+			addedTotal, added, info.RegisteredImages, info.Points, info.MeanReprojectionError)
+		if added < addedTotal {
+			msg += "位置を合わせられなかった写真は、以降の処理では使われません。"
+		}
+		return msg, nil
+	}
 	msg := fmt.Sprintf("%d枚中%d枚のカメラ位置を推定し、%d個の3D点を得ました（平均再投影誤差 %.2f px）。",
 		info.TotalImages, info.RegisteredImages, info.Points, info.MeanReprojectionError)
 	if info.RegisteredImages < info.TotalImages {
@@ -284,6 +344,11 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 	}
 	return msg, nil
 }
+
+// noNewImagesMessage は、続きの版で今回の写真を1枚も地図に合わせられなかったときの説明。
+const noNewImagesMessage = "今回の写真を、保存済みの3Dデータの位置に合わせられませんでした。" +
+	"前回撮った部分が写るように、前回の撮影位置の近くから撮り始めて、少しずつ範囲を広げてください。" +
+	"照明や物の配置が大きく変わっていると一致しにくくなります。"
 
 // noModelMessage は、SfM がモデルを1つも作れなかったときの説明。
 const noModelMessage = "写真どうしの対応が見つからず、カメラの位置を推定できませんでした。" +

@@ -66,7 +66,7 @@ const sniffLen = 512
 //
 // 入力:
 //   - mr: リクエストボディの multipart リーダー。
-//     項目名 "images"（または "images[]"）が写真、"metadata" が任意の JSON。
+//     項目名 "images"（または "images[]"、"image"）が写真、"metadata" が任意の JSON。
 //   - imagesDir: 保存先（作成済みであること）。
 //   - lim: 枚数・サイズ・画素数の上限。
 //
@@ -79,6 +79,31 @@ const sniffLen = 512
 // あちらは全項目を読み終えてから返すので、上限を超える入力でもまず一時ファイルに書いてしまう。
 // 1項目ずつ読めば、問題のある項目に当たった時点で残りを読まずに断れる。
 func Receive(mr *multipart.Reader, imagesDir string, lim config.Limits) (Result, error) {
+	return ReceiveWith(mr, imagesDir, lim, Options{})
+}
+
+// Options は Receive の既定を変えるときに使う。ゼロ値の項目は既定のまま。
+type Options struct {
+	// FirstNumber は最初の写真に付ける番号（frame_<番号>.jpg）。既定は 1。
+	// 「続きを撮る」では、引き継いだ写真と名前が重ならないよう続きの番号から始める。
+	FirstNumber int
+	// MinImages / MaxImages は今回受け取る枚数の範囲。既定は lim の値。
+	MinImages int
+	MaxImages int
+}
+
+// ReceiveWith は Options を指定できる Receive。
+// 利用者に見せる「◯枚目」は、番号ではなく今回送られてきた順番で数える。
+func ReceiveWith(mr *multipart.Reader, imagesDir string, lim config.Limits, opts Options) (Result, error) {
+	if opts.FirstNumber <= 0 {
+		opts.FirstNumber = 1
+	}
+	if opts.MinImages <= 0 {
+		opts.MinImages = lim.MinImages
+	}
+	if opts.MaxImages <= 0 {
+		opts.MaxImages = lim.MaxImages
+	}
 	var res Result
 	var metadata []byte
 	// seen は「内容のハッシュ → 既に保存済み」。完全に同じ写真の二重送信を省くのに使う。
@@ -99,12 +124,13 @@ func Receive(mr *multipart.Reader, imagesDir string, lim config.Limits) (Result,
 		}
 
 		switch part.FormName() {
-		case "images", "images[]":
-			if len(res.Frames) >= lim.MaxImages {
+		case "images", "images[]", "image": // "image" は写真1枚だけを送る位置合わせ用
+			if len(res.Frames) >= opts.MaxImages {
 				return res, reject(http.StatusRequestEntityTooLarge, "too_many_images",
-					"写真は最大%d枚までです。枚数を減らしてください。", lim.MaxImages)
+					"写真は最大%d枚までです。枚数を減らしてください。", opts.MaxImages)
 			}
-			frame, dup, err := saveImage(part, imagesDir, len(res.Frames)+1, lim, seen)
+			seq := len(res.Frames) + 1
+			frame, dup, err := saveImage(part, imagesDir, seq, opts.FirstNumber+seq-1, lim, seen)
 			part.Close()
 			if err != nil {
 				return res, err
@@ -135,9 +161,12 @@ func Receive(mr *multipart.Reader, imagesDir string, lim config.Limits) (Result,
 		}
 	}
 
-	if len(res.Frames) < lim.MinImages {
+	if len(res.Frames) < opts.MinImages {
 		msg := fmt.Sprintf("写真が足りません（%d枚）。少なくとも%d枚、できれば20枚以上を、少しずつ位置を変えて撮ってください。",
-			len(res.Frames), lim.MinImages)
+			len(res.Frames), opts.MinImages)
+		if opts.MinImages == 1 {
+			msg = "写真がありません。少なくとも1枚送ってください。"
+		}
 		if res.DuplicatesSkipped > 0 {
 			msg += fmt.Sprintf("（同じ内容の写真%d枚は除きました）", res.DuplicatesSkipped)
 		}
@@ -151,11 +180,12 @@ func Receive(mr *multipart.Reader, imagesDir string, lim config.Limits) (Result,
 
 // saveImage は写真1枚を検証して保存する。
 //
+// 入力: number は利用者に見せる「◯枚目」、fileNumber はファイル名に付ける番号。
 // 出力: 保存した写真の記録。dup が true のときは既にある写真と同じ内容なので保存していない。
 // 失敗条件: 大きすぎる・未対応形式・壊れている・画素数や辺の長さが範囲外。
-func saveImage(part io.Reader, dir string, number int, lim config.Limits, seen map[string]bool) (frame scan.Frame, dup bool, err error) {
+func saveImage(part io.Reader, dir string, number, fileNumber int, lim config.Limits, seen map[string]bool) (frame scan.Frame, dup bool, err error) {
 	// まず一時的な名前で書く。検証を全部通ってから正式な名前に変える。
-	tmpPath := filepath.Join(dir, fmt.Sprintf("frame_%04d.part", number))
+	tmpPath := filepath.Join(dir, fmt.Sprintf("frame_%04d.part", fileNumber))
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
 	if err != nil {
 		return frame, false, fmt.Errorf("写真の保存先を開けません: %w", err)
@@ -224,13 +254,13 @@ func saveImage(part io.Reader, dir string, number int, lim config.Limits, seen m
 			number, width, height, lim.MinImageSide)
 	}
 
-	name := fmt.Sprintf("frame_%04d%s", number, ext)
+	name := fmt.Sprintf("frame_%04d%s", fileNumber, ext)
 	if err := os.Rename(tmpPath, filepath.Join(dir, name)); err != nil {
 		return frame, false, fmt.Errorf("写真を保存できません: %w", err)
 	}
 	seen[sum] = true
 	return scan.Frame{
-		Index:    number - 1,
+		Index:    fileNumber - 1,
 		FileName: name,
 		Width:    width,
 		Height:   height,

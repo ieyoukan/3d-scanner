@@ -9,6 +9,11 @@
 //	  dense/         歪みを取り除いた画像とカメラ（メッシュ・テクスチャ用の作業場）
 //	  output/        配信する成果物（sparse.ply / mesh.glb / splat.ply / scene.sog）
 //	  logs/          各ステップの外部CLIの出力
+//	  thumbnail.jpg  ギャラリー用の縮小画像
+//	  base/          「続きを撮る」で作ったスキャンだけにある。元の版から引き継いだ地図
+//	    database.db    元の版の COLMAP DB（特徴点とマッチ）
+//	    model/         元の版の SfM モデル（sparse/0 の中身）
+//	    frames.txt     元の版から引き継いだ写真のファイル名（1行1枚）
 //
 // images/ と sparse/0/ を同じ親の下に置くのは、OpenSplat が「プロジェクトのルート」を1つ受け取り、
 // その直下の images/ と sparse/0/ を読むため。
@@ -17,6 +22,7 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +37,9 @@ var ErrOutsideRoot = errors.New("作業ディレクトリの外を指すパス�
 // Root は全スキャンの作業ディレクトリの親（<DATA_DIR>/scans）を表す。
 type Root struct {
 	dir string
+	// tmp は一時作業の置き場（<DATA_DIR>/tmp）。VPS の位置合わせなど、結果を残さない処理に使う。
+	// コンテナの /tmp ではなく PVC 上に置くのは、COLMAP の DB を複製するので容量が要るため。
+	tmp string
 }
 
 // New は dataDir の下に scans/ を用意して Root を返す。
@@ -43,11 +52,33 @@ func New(dataDir string) (*Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(abs, "scans")
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return nil, fmt.Errorf("作業ディレクトリ %s を作れません: %w", dir, err)
+	r := &Root{dir: filepath.Join(abs, "scans"), tmp: filepath.Join(abs, "tmp")}
+	for _, d := range []string{r.dir, r.tmp} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			return nil, fmt.Errorf("作業ディレクトリ %s を作れません: %w", d, err)
+		}
 	}
-	return &Root{dir: dir}, nil
+	return r, nil
+}
+
+// NewTemp は一時作業用の空のディレクトリを作る。使い終わったら呼び出し側が消す。
+func (r *Root) NewTemp(prefix string) (string, error) {
+	return os.MkdirTemp(r.tmp, prefix)
+}
+
+// CleanTemp は一時作業の置き場を空にする。起動時に呼び、前回のプロセスが
+// 処理の途中で止まって消し損ねたものを片付ける（この時点では誰も使っていない）。
+func (r *Root) CleanTemp() error {
+	entries, err := os.ReadDir(r.tmp)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(r.tmp, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Dir は scans/ の絶対パスを返す。
@@ -112,6 +143,30 @@ func (s *Scan) ModelDir() string { return filepath.Join(s.dir, "sparse", "0") }
 
 // ModelTextDir は SfM モデルをテキスト形式に変換したものの置き場を返す（要約の計算用）。
 func (s *Scan) ModelTextDir() string { return filepath.Join(s.dir, "sparse_txt") }
+
+// BaseDir は「続きを撮る」で元の版から引き継いだ地図の置き場を返す。
+func (s *Scan) BaseDir() string          { return filepath.Join(s.dir, "base") }
+func (s *Scan) BaseDatabasePath() string { return filepath.Join(s.BaseDir(), "database.db") }
+func (s *Scan) BaseModelDir() string     { return filepath.Join(s.BaseDir(), "model") }
+
+// BaseFramesPath は元の版から引き継いだ写真のファイル名の一覧の場所を返す。
+func (s *Scan) BaseFramesPath() string { return filepath.Join(s.BaseDir(), "frames.txt") }
+
+// HasBase は、このスキャンが「続きを撮る」で作ったもの（引き継いだ地図がある）かを返す。
+func (s *Scan) HasBase() bool {
+	return isFile(s.BaseDatabasePath()) && isFile(filepath.Join(s.BaseModelDir(), "images.bin"))
+}
+
+// HasMap は、位置合わせ（VPS）と「続きを撮る」に使える地図（COLMAP の DB と SfM モデル）が
+// 揃っているかを返す。SfM が成功したスキャンにはあり、ギャラリーに保存しても消さない。
+func (s *Scan) HasMap() bool {
+	return isFile(s.DatabasePath()) && isFile(filepath.Join(s.ModelDir(), "images.bin"))
+}
+
+func isFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular()
+}
 
 // LogPath はステップのログファイルの場所を返す。
 func (s *Scan) LogPath(step scan.StepName) string {
@@ -228,15 +283,155 @@ func (s *Scan) ResetDerived() error {
 
 // PruneIntermediate は、ギャラリーに保存するスキャンから、もう使わない中間ファイルを消す。
 //
-// 消すのは dense/（歪みを補正した写真の複製や、メッシュを作る途中のファイル）だけ。容量の大半を占め、
-// 成果物はすべて output/ にあるので、表示にもダウンロードにも要らない。
-// 残すもの: images/（元の写真）、database.db と sparse/（特徴点とカメラ位置。VPS などで地図として使える）、
+// 消すもの:
+//   - dense/（歪みを補正した写真の複製や、メッシュを作る途中のファイル）。容量の大半を占め、
+//     成果物はすべて output/ にあるので、表示にもダウンロードにも要らない。
+//   - base/（続きの版が元の版から引き継いだ地図）。完成した時点で、自分の database.db と sparse/ が
+//     元の地図を含んでいるので要らない。
+//
+// 残すもの: images/（元の写真）、database.db と sparse/（特徴点とカメラ位置。VPS の地図として使う）、
 // output/、logs/、thumbnail.jpg。
 func (s *Scan) PruneIntermediate() error {
-	if err := os.RemoveAll(s.DenseDir()); err != nil {
-		return fmt.Errorf("%s を削除できません: %w", s.DenseDir(), err)
+	for _, d := range []string{s.DenseDir(), s.BaseDir()} {
+		if err := os.RemoveAll(d); err != nil {
+			return fmt.Errorf("%s を削除できません: %w", d, err)
+		}
 	}
 	return nil
+}
+
+// Inherited は InheritFrom の結果。
+type Inherited struct {
+	// Frames は引き継いだ写真の枚数。
+	Frames int
+	// NextNumber は、今回追加する写真に付ける最初の番号（frame_<番号>.jpg）。
+	// 引き継いだ写真と名前が重ならないよう、最大の番号の次から始める。
+	NextNumber int
+}
+
+// InheritFrom は「続きを撮る」の受付時に呼び、元の版（parent）の写真と地図をこのスキャンに引き継ぐ。
+//
+// 引き継ぐもの:
+//
+//	parent/images/*      → images/*         （写真。同じ名前のまま）
+//	parent/database.db   → base/database.db （特徴点とマッチ）
+//	parent/sparse/0/*    → base/model/*     （カメラの位置と3D点）
+//	parent/thumbnail.jpg → thumbnail.jpg    （ギャラリーで同じ見た目にする）
+//
+// コピーではなくハードリンクを使う。どれも元の版では二度と書き換えないファイルなので、
+// 同じ中身を共有しても困らず、容量も時間もほぼ使わない。ハードリンクなので、後で元の版を削除しても
+// こちらのファイルは消えない（ファイルの実体は、最後のリンクが消えたときに消える）。
+// COLMAP が書き換える database.db は、ワーカーが処理を始めるときに base/ から複製する。
+//
+// 失敗条件: 元の版に地図（DB と SfM モデル）が無い、ファイルを作れない。
+func (s *Scan) InheritFrom(parent *Scan) (Inherited, error) {
+	var res Inherited
+	if !parent.HasMap() {
+		return res, errors.New("元のスキャンに地図（COLMAP の DB と SfM モデル）がありません")
+	}
+	if err := os.MkdirAll(s.BaseModelDir(), 0o750); err != nil {
+		return res, err
+	}
+
+	entries, err := os.ReadDir(parent.ImagesDir())
+	if err != nil {
+		return res, err
+	}
+	var names []string
+	maxNumber := 0
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		if err := linkOrCopy(filepath.Join(parent.ImagesDir(), e.Name()), filepath.Join(s.ImagesDir(), e.Name())); err != nil {
+			return res, err
+		}
+		names = append(names, e.Name())
+		var n int
+		if _, err := fmt.Sscanf(e.Name(), "frame_%d.", &n); err == nil && n > maxNumber {
+			maxNumber = n
+		}
+	}
+
+	if err := linkOrCopy(parent.DatabasePath(), s.BaseDatabasePath()); err != nil {
+		return res, err
+	}
+	model, err := os.ReadDir(parent.ModelDir())
+	if err != nil {
+		return res, err
+	}
+	for _, e := range model {
+		if e.Type().IsRegular() {
+			if err := linkOrCopy(filepath.Join(parent.ModelDir(), e.Name()), filepath.Join(s.BaseModelDir(), e.Name())); err != nil {
+				return res, err
+			}
+		}
+	}
+	if isFile(parent.ThumbnailPath()) {
+		if err := linkOrCopy(parent.ThumbnailPath(), s.ThumbnailPath()); err != nil {
+			return res, err
+		}
+	}
+	list := strings.Join(names, "\n")
+	if list != "" {
+		list += "\n"
+	}
+	if err := os.WriteFile(s.BaseFramesPath(), []byte(list), 0o640); err != nil {
+		return res, err
+	}
+	return Inherited{Frames: len(names), NextNumber: maxNumber + 1}, nil
+}
+
+// BaseFrames は元の版から引き継いだ写真のファイル名を返す（続きの版でなければ空）。
+func (s *Scan) BaseFrames() (map[string]bool, error) {
+	b, err := os.ReadFile(s.BaseFramesPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]bool{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	names := map[string]bool{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			names[line] = true
+		}
+	}
+	return names, nil
+}
+
+// linkOrCopy は src を dst にハードリンクする。リンクを作れないファイルシステム（別の
+// ディスクをまたぐ、対応していない）ではコピーする。
+func linkOrCopy(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	return CopyFile(src, dst)
+}
+
+// CopyFile は src の中身を dst に複製する（dst があれば上書きする）。
+// 書きかけのファイルを残さないよう、一時ファイルに書いてから名前を変える。
+func CopyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 // List は scans/ にある作業ディレクトリの ID を返す（UUID 形式の名前だけ）。

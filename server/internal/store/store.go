@@ -52,8 +52,12 @@ type Store interface {
 	// PutAsset は検証済みの成果物を登録する（同じ種類があれば置き換える）。
 	PutAsset(ctx context.Context, scanID string, a scan.Asset) error
 
-	// List はギャラリーの一覧を新しい順に返す（期限切れは含めない）。
+	// List はギャラリーの一覧を新しい順に返す。
+	// 期限切れと、続きの版が完成した古い版（「続きを撮る」で置き換わったもの）は含めない。
 	List(ctx context.Context, q ListQuery) ([]scan.Summary, error)
+
+	// Children は、指定したスキャンを元にした続きの版を新しい順に返す（期限切れは含めない）。
+	Children(ctx context.Context, id string) ([]scan.Scan, error)
 
 	// SetTitle はスキャンの名前を変える。無ければ ErrNotFound。
 	SetTitle(ctx context.Context, id, title string, now time.Time) error

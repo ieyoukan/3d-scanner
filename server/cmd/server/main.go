@@ -30,6 +30,7 @@ import (
 	"github.com/ieyoukan/3d-scanner/server/internal/jobs"
 	"github.com/ieyoukan/3d-scanner/server/internal/reconstruction"
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
+	"github.com/ieyoukan/3d-scanner/server/internal/vps"
 	"github.com/ieyoukan/3d-scanner/server/internal/workspace"
 )
 
@@ -102,7 +103,13 @@ func run(log *slog.Logger) error {
 	wg.Go(func() { svc.Run(ctx) })
 	wg.Go(func() { svc.RunJanitor(ctx) })
 
-	api := httpapi.New(cfg, pg, root, svc, info, log)
+	// 位置合わせ（VPS）。前回のプロセスが消し損ねた一時ファイルを先に片付ける。
+	if err := root.CleanTemp(); err != nil {
+		log.Warn("一時ファイルを片付けられません", "error", err.Error())
+	}
+	localizer := vps.New(cfg.Pipeline, runner, root, log)
+
+	api := httpapi.New(cfg, pg, root, svc, localizer, info, log)
 	srv := httpapi.NewHTTPServer(cfg.ListenAddr, api.Handler())
 	serveErr := make(chan error, 1)
 	go func() {

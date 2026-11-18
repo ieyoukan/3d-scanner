@@ -6,7 +6,16 @@
 //
 // アプリ自体には認証が無い（前段の Cloudflare Access が行う）。Access の Cookie は
 // 同じオリジンへの fetch に自動で付くので、ここで認証情報を扱うことはない。
-import type { ApiErrorDetail, CreateScanResult, GalleryPage, Scan, SceneInfo, ServerConfig, StepName } from './types';
+import type {
+  ApiErrorDetail,
+  CreateScanResult,
+  GalleryPage,
+  LocalizeResult,
+  Scan,
+  SceneInfo,
+  ServerConfig,
+  StepName,
+} from './types';
 
 /** サーバーが返したエラー。code で原因を区別できる。 */
 export class ApiError extends Error {
@@ -98,6 +107,19 @@ export async function renameScan(id: string, title: string): Promise<string> {
     }),
   );
   return ((await res.json()) as { title: string }).title;
+}
+
+/**
+ * 写真1枚を、スキャンの地図に位置合わせする（VPS）。地図のどこから、どちらを向いて撮ったかが返る。
+ * サーバーで COLMAP を動かすので、10〜数十秒かかる。
+ */
+export async function localizeFrame(scanId: string, image: Blob, signal?: AbortSignal): Promise<LocalizeResult> {
+  const form = new FormData();
+  form.append('image', image, image.type === 'image/png' ? 'query.png' : 'query.jpg');
+  const res = await ensureOk(
+    await fetch(`/api/scans/${encodeURIComponent(scanId)}/localize`, { method: 'POST', body: form, signal }),
+  );
+  return (await res.json()) as LocalizeResult;
 }
 
 export function fetchSceneInfo(url: string, signal?: AbortSignal): Promise<SceneInfo> {

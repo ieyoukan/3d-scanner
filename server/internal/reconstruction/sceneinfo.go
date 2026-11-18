@@ -53,12 +53,26 @@ type SceneInfo struct {
 	Radius float64 `json:"radius"`
 	// CameraPositions は各カメラの位置。初期視点を「撮影した側」に置くために使う。
 	CameraPositions [][3]float64 `json:"cameraPositions"`
+
+	// names は位置を推定できた写真のファイル名（CameraPositions と同じ順）。
+	// 続きの版で「今回の写真が何枚入ったか」を数えるのに使う。scene.json には書かない。
+	names []string
 }
 
-// cameraPose は images.txt から読んだカメラ1台ぶん。
-type cameraPose struct {
-	center [3]float64
-	down   [3]float64
+// ImagePose は images.txt から読んだ写真1枚ぶんのカメラの位置と向き（世界座標）。
+type ImagePose struct {
+	ID       int
+	CameraID int
+	// Name は写真のファイル名（images/ からの相対パス）。
+	Name string
+	// Center はカメラの位置。
+	Center [3]float64
+	// Down はカメラの「下」（画像の下方向）、Forward は「奥」（レンズの向く方向）。どちらも単位ベクトル。
+	Down    [3]float64
+	Forward [3]float64
+	// Observations は、この写真の特徴点のうち3D点に対応づいたものの数。
+	// ReadImagePoses を withObservations=true で呼んだときだけ数える（行が長く、数えるのに時間がかかるため）。
+	Observations int
 }
 
 // ReadSceneInfo は COLMAP のテキスト形式モデル（images.txt と points3D.txt）を読んで要約を作る。
@@ -67,7 +81,7 @@ type cameraPose struct {
 // 出力: SceneInfo。
 // 失敗条件: ファイルが無い・形式が違う・登録された画像が0枚。
 func ReadSceneInfo(txtDir string, totalImages int) (*SceneInfo, error) {
-	poses, err := readImagesTxt(filepath.Join(txtDir, "images.txt"))
+	poses, err := ReadImagePoses(filepath.Join(txtDir, "images.txt"), false)
 	if err != nil {
 		return nil, fmt.Errorf("images.txt を読めません: %w", err)
 	}
@@ -89,9 +103,10 @@ func ReadSceneInfo(txtDir string, totalImages int) (*SceneInfo, error) {
 
 	var downSum [3]float64
 	for _, p := range poses {
-		info.CameraPositions = append(info.CameraPositions, p.center)
+		info.CameraPositions = append(info.CameraPositions, p.Center)
+		info.names = append(info.names, p.Name)
 		for k := 0; k < 3; k++ {
-			downSum[k] += p.down[k]
+			downSum[k] += p.Down[k]
 		}
 	}
 	if up, ok := normalize([3]float64{-downSum[0], -downSum[1], -downSum[2]}); ok {
@@ -120,16 +135,17 @@ func WriteSceneInfo(info *SceneInfo, path string) error {
 	return os.WriteFile(path, append(b, '\n'), 0o640)
 }
 
-// readImagesTxt は images.txt を読む。
+// ReadImagePoses は images.txt を読み、写真ごとのカメラの位置と向きを返す。
 //
 // 形式（COLMAP ドキュメント "Output Format" より）: 1画像につき2行。
 //
 //	IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
 //	X Y POINT3D_ID  X Y POINT3D_ID ...   ← その画像で見つかった特徴点（非常に長い行。空のこともある）
 //
-// 2行目は使わないが、「空行でも1行と数える」ことに注意して読み飛ばす
+// 2行目は withObservations が true のときだけ解釈する（3D点に対応づいた特徴点を数える）。
+// どちらの場合も「空行でも1行と数える」ことに注意して読み進める
 // （空行を無視すると、次の画像の1行目を2行目と取り違える）。
-func readImagesTxt(path string) ([]cameraPose, error) {
+func ReadImagePoses(path string, withObservations bool) ([]ImagePose, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -137,7 +153,7 @@ func readImagesTxt(path string) ([]cameraPose, error) {
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
 
-	var poses []cameraPose
+	var poses []ImagePose
 	for {
 		line, err := readLongLine(r)
 		if errors.Is(err, io.EOF) {
@@ -160,17 +176,73 @@ func readImagesTxt(path string) ([]cameraPose, error) {
 		if err != nil {
 			return nil, err
 		}
-		poses = append(poses, poseFromQuaternion(nums[0], nums[1], nums[2], nums[3], [3]float64{nums[4], nums[5], nums[6]}))
+		pose := poseFromQuaternion(nums[0], nums[1], nums[2], nums[3], [3]float64{nums[4], nums[5], nums[6]})
+		pose.ID, _ = strconv.Atoi(fields[0])
+		pose.CameraID, _ = strconv.Atoi(fields[8])
+		// 名前に空白が含まれていても読めるよう、9番目以降をつなげる。
+		pose.Name = strings.Join(fields[9:], " ")
 
-		// 特徴点の行を1行読み捨てる（空でも必ず1行ある）。
-		if _, err := readLongLine(r); err != nil && !errors.Is(err, io.EOF) {
+		// 特徴点の行（空でも必ず1行ある）。
+		points, err := readLongLine(r)
+		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, err
 		}
+		if withObservations {
+			pose.Observations = countObservations(points)
+		}
+		poses = append(poses, pose)
 	}
 }
 
-// poseFromQuaternion は四元数と並進からカメラの位置と下方向を求める。
-func poseFromQuaternion(qw, qx, qy, qz float64, t [3]float64) cameraPose {
+// countObservations は特徴点の行（"X Y POINT3D_ID" の繰り返し）のうち、
+// 3D点に対応づいた（POINT3D_ID が -1 でない）ものを数える。
+func countObservations(line string) int {
+	fields := strings.Fields(line)
+	n := 0
+	for i := 2; i < len(fields); i += 3 {
+		if fields[i] != "-1" {
+			n++
+		}
+	}
+	return n
+}
+
+// Camera は cameras.txt の1行（カメラの内部パラメータ）。
+type Camera struct {
+	ID     int
+	Model  string
+	Width  int
+	Height int
+}
+
+// ReadCameras は cameras.txt を読む。形式: CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]
+func ReadCameras(path string) ([]Camera, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cams []Camera
+	for _, line := range strings.Split(string(b), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		if len(fields) < 4 {
+			return nil, fmt.Errorf("カメラの行の項目が足りません: %q", truncate(line, 80))
+		}
+		id, err1 := strconv.Atoi(fields[0])
+		w, err2 := strconv.Atoi(fields[2])
+		h, err3 := strconv.Atoi(fields[3])
+		if err := errors.Join(err1, err2, err3); err != nil {
+			return nil, fmt.Errorf("カメラの行を読めません: %q", truncate(line, 80))
+		}
+		cams = append(cams, Camera{ID: id, Model: fields[1], Width: w, Height: h})
+	}
+	return cams, nil
+}
+
+// poseFromQuaternion は四元数と並進からカメラの位置と向きを求める。
+func poseFromQuaternion(qw, qx, qy, qz float64, t [3]float64) ImagePose {
 	// 四元数は長さ1のはずだが、テキストに丸めて書かれているので正規化し直す。
 	n := math.Sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
 	if n == 0 {
@@ -189,8 +261,8 @@ func poseFromQuaternion(qw, qx, qy, qz float64, t [3]float64) cameraPose {
 	for k := 0; k < 3; k++ {
 		c[k] = -(R[0][k]*t[0] + R[1][k]*t[1] + R[2][k]*t[2])
 	}
-	// カメラの Y 軸（画像の下方向）を世界座標で表すと R の2行目。
-	return cameraPose{center: c, down: R[1]}
+	// カメラの Y 軸（画像の下方向）を世界座標で表すと R の2行目、Z 軸（奥）は3行目。
+	return ImagePose{Center: c, Down: R[1], Forward: R[2]}
 }
 
 // readPoints3DTxt は points3D.txt から点の座標と再投影誤差の平均を読む。

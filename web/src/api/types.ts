@@ -72,11 +72,27 @@ export interface Scan {
   title: string;
   /** ギャラリー用の縮小画像。無ければ省略。 */
   thumbnailUrl?: string;
+  /** 元の版（「続きを撮る」で作った場合）。新規、または元の版が削除済みなら省略。 */
+  parentId?: string;
+  /** 元の版から引き継いだ写真の枚数（frameCount に含まれる）。 */
+  baseFrameCount: number;
+  /** 「続きを撮る」と位置合わせ（VPS）に使えるか。 */
+  resumable: boolean;
+  /** この版を元にした続きの版（新しい順）。 */
+  continuations: Continuation[];
   /** 自分より前に並んでいる件数。queued のときだけ入る。 */
   queuePosition?: number;
   error: ApiErrorDetail | null;
   steps: Step[];
   assets: Asset[];
+}
+
+/** 続きの版1件の概要。 */
+export interface Continuation {
+  id: string;
+  status: ScanStatus;
+  createdAt: string;
+  frameCount: number;
 }
 
 export interface Limits {
@@ -119,6 +135,10 @@ export interface GalleryItem {
   frameCount: number;
   assetKinds: AssetKind[];
   thumbnailUrl?: string;
+  /** 元の版（「続きを撮る」で作った場合）。 */
+  parentId?: string;
+  /** 元の版から引き継いだ写真の枚数。 */
+  baseFrameCount: number;
 }
 
 export interface GalleryPage {
@@ -130,7 +150,9 @@ export interface GalleryPage {
 export interface CreateScanResult {
   id: string;
   status: ScanStatus;
+  /** 処理に使う写真の枚数（続きの版では引き継いだ写真を含む）。 */
   frameCount: number;
+  baseFrameCount: number;
   duplicatesSkipped: number;
   expiresAt: string;
 }
@@ -148,6 +170,22 @@ export interface SceneInfo {
   /** 中心からの広がりの目安。 */
   radius: number;
   cameraPositions: [number, number, number][];
+}
+
+/** 位置合わせ（VPS）の結果（POST /api/scans/:id/localize）。座標は地図（scene.json と同じ）の座標系。 */
+export interface LocalizeResult {
+  localized: boolean;
+  /** カメラの位置。位置が分からなければ省略。 */
+  position?: [number, number, number];
+  /** レンズの向き（単位ベクトル）。 */
+  forward?: [number, number, number];
+  /** 地図の3D点と一致した特徴点の数（多いほど確か）。 */
+  matches: number;
+  comparedImages: number;
+  mapImages: number;
+  durationMs: number;
+  /** そのまま表示できる説明。 */
+  message: string;
 }
 
 /** 終了状態（これ以上変化しない）かどうか。 */
