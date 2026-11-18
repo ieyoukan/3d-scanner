@@ -67,6 +67,8 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
 
   const { frames, add, remove, clear } = useFrames(limits.maxImages);
   const [phase, setPhase] = useState<Phase>('capture');
+  // 送信中は撮影を止める（自動撮影が、送信中の一覧に写真を足さないように）。
+  const [sending, setSending] = useState(false);
   const info = useSceneInfo(scan);
   const { state, fixes, check: locate, forget, reset } = useLocalize(scan.id);
 
@@ -147,6 +149,7 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
             limits={limits}
             onAdd={add}
             onReview={() => setPhase('review')}
+            paused={sending}
             hint={resumeHint(frames.length, limits.maxImages, state)}
             overlay={
               <div className="flex items-start justify-between gap-3">
@@ -184,6 +187,7 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
               retentionHours={config.retentionHours}
               keepCompleted={config.keepCompleted}
               pipeline={config.pipeline}
+              onSendingChange={setSending}
               resume={{ scanId: scan.id, baseFrameCount: base }}
               onCreated={(result) => {
                 clearAll();

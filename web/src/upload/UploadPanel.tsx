@@ -29,9 +29,11 @@ interface Props {
    * サーバーは元の写真と地図を引き継いだ新しい版を作る。
    */
   resume?: { scanId: string; baseFrameCount: number };
+  /** 送信を始めた・終えたときに呼ばれる（送信中は撮影を止めるため）。 */
+  onSendingChange?: (sending: boolean) => void;
 }
 
-export function UploadPanel({ frames, check, limits, retentionHours, keepCompleted, pipeline, onCreated, resume }: Props) {
+export function UploadPanel({ frames, check, limits, retentionHours, keepCompleted, pipeline, onCreated, resume, onSendingChange }: Props) {
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const handle = useRef<UploadHandle | null>(null);
@@ -39,6 +41,10 @@ export function UploadPanel({ frames, check, limits, retentionHours, keepComplet
 
   // 画面を離れたら送信を止める（結果を受け取る人が居なくなるため）。
   useEffect(() => () => handle.current?.abort(), []);
+
+  useEffect(() => {
+    onSendingChange?.(sending);
+  }, [sending, onSendingChange]);
 
   const start = async () => {
     setError(null);

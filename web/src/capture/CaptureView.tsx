@@ -78,9 +78,14 @@ interface Props {
   overlay?: ReactNode;
   /** 映像の下に出す一言。省略すると枚数に応じた既定の案内。 */
   hint?: string;
+  /**
+   * true のあいだは撮影しない（写真の送信中など）。自動撮影も止め、シャッターと「追加」も押せなくする。
+   * 送信中に撮った写真は送られず、送信が終わると一覧ごと消えてしまうため。
+   */
+  paused?: boolean;
 }
 
-export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: Props) {
+export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, paused = false }: Props) {
   const camera = useCamera();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -121,10 +126,12 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
   const busyRef = useRef(false);
   const fullRef = useRef(full);
   fullRef.current = full;
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   /** 1枚撮って一覧に足す。静止画が使えれば静止画、だめなら映像の1コマ。撮れたら true。 */
   const shoot = useCallback(async (): Promise<boolean> => {
-    if (busyRef.current || fullRef.current) return false;
+    if (busyRef.current || fullRef.current || pausedRef.current) return false;
     busyRef.current = true;
     setBusy(true);
     setNotice(null);
@@ -162,9 +169,9 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
 
   // 自動撮影: 一定間隔で映像を見て、撮るべき瞬間なら撮る。
   const ready = camera.state.kind === 'ready';
-  const { sample } = camera;
+  const { sample, videoRef } = camera;
   useEffect(() => {
-    if (!auto || !ready) {
+    if (!auto || !ready || paused) {
       setAdvice(null);
       return;
     }
@@ -172,7 +179,14 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
     let tooFarTimer: number | undefined;
     const timer = window.setInterval(() => {
       // 撮影中（静止画は時間がかかる）はプレビューが止まることがあるので、判断しない。
-      if (busyRef.current || fullRef.current || document.hidden) return;
+      if (busyRef.current || fullRef.current || pausedRef.current || document.hidden) return;
+      // 撮影画面が隠れている（狭い画面で「確認」を開いている）ときは撮らない。
+      // 確認から戻るたびにカメラを起動し直さずに済むよう、この部品は消さずに隠しているので、ループは動き続ける。
+      // 戻ってきたら判断をやり直す（隠れる前の「止まっていた」記録で撮らないように）。
+      if (!isShown(videoRef.current)) {
+        state = initialAutoState;
+        return;
+      }
       const gray = sample(sampleWidth, sampleHeight);
       if (!gray) return;
       const sig = signatureOf(gray, sampleWidth, sampleHeight);
@@ -194,7 +208,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
       window.clearInterval(timer);
       window.clearTimeout(tooFarTimer);
     };
-  }, [auto, ready, sample]);
+  }, [auto, ready, paused, sample, videoRef]);
 
   /** 端末から選んだ写真を取り込む。 */
   const pickFiles = useCallback(
@@ -243,7 +257,11 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
           <>
             <FrameCorners />
             <p className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
-              {auto ? autoHint(advice, tooFar) : (hint ?? captureHint(frames.length, limits))}
+              {paused
+                ? '写真を送信しています。送信が終わるまで撮影を止めています。'
+                : auto
+                  ? autoHint(advice, tooFar)
+                  : (hint ?? captureHint(frames.length, limits))}
             </p>
           </>
         )}
@@ -320,7 +338,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
             type="button"
             className={buttonClass('secondary', 'px-3')}
             onClick={() => fileInput.current?.click()}
-            disabled={busy || full}
+            disabled={busy || full || paused}
           >
             <ImagesIcon />
             <span className="text-sm">追加</span>
@@ -330,7 +348,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
         <button
           type="button"
           onClick={() => void shoot()}
-          disabled={!ready || busy || full}
+          disabled={!ready || busy || full || paused}
           aria-label="撮影する"
           className="group grid size-[72px] place-items-center rounded-full border-[3px] border-paper disabled:border-line"
         >
@@ -351,6 +369,11 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: 
       </div>
     </div>
   );
+}
+
+/** 要素が画面に出ているか（自分か祖先が display: none なら false）。 */
+function isShown(el: HTMLElement | null): boolean {
+  return el !== null && el.getClientRects().length > 0;
 }
 
 /** 撮り方の切り替え（押すたびに入・切）。 */
