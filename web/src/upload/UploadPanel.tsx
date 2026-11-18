@@ -24,9 +24,14 @@ interface Props {
   pipeline: PipelineInfo;
   /** サーバーが受け付けたら呼ばれる。 */
   onCreated: (result: CreateScanResult) => void;
+  /**
+   * 「続きを撮る」のときに指定する。写真はこのスキャンの続きとして送られ、
+   * サーバーは元の写真と地図を引き継いだ新しい版を作る。
+   */
+  resume?: { scanId: string; baseFrameCount: number };
 }
 
-export function UploadPanel({ frames, check, limits, retentionHours, keepCompleted, pipeline, onCreated }: Props) {
+export function UploadPanel({ frames, check, limits, retentionHours, keepCompleted, pipeline, onCreated, resume }: Props) {
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const handle = useRef<UploadHandle | null>(null);
@@ -38,7 +43,7 @@ export function UploadPanel({ frames, check, limits, retentionHours, keepComplet
   const start = async () => {
     setError(null);
     setProgress({ sentBytes: 0, totalBytes: check.totalBytes });
-    const upload = uploadScan(frames, setProgress);
+    const upload = uploadScan(frames, setProgress, resume?.scanId);
     handle.current = upload;
     try {
       onCreated(await upload.done);
@@ -55,12 +60,23 @@ export function UploadPanel({ frames, check, limits, retentionHours, keepComplet
 
   return (
     <section className="space-y-3">
-      <p className="tabular text-sm text-mute">
-        <span className="text-base font-semibold text-paper">{frames.length}枚</span>
-        <span>（{limits.minImages}〜{limits.maxImages}枚）</span>
-        <span className="mx-1.5">・</span>
-        合計 {formatBytes(check.totalBytes)} / {formatBytes(limits.maxUploadBytes)}
-      </p>
+      {resume ? (
+        <p className="tabular text-sm text-mute">
+          今回 <span className="text-base font-semibold text-paper">{frames.length}枚</span>
+          <span>（あと{limits.maxImages}枚まで）</span>
+          <span className="mx-1.5">・</span>
+          前回の{resume.baseFrameCount}枚と合わせて{resume.baseFrameCount + frames.length}枚
+          <span className="mx-1.5">・</span>
+          {formatBytes(check.totalBytes)}
+        </p>
+      ) : (
+        <p className="tabular text-sm text-mute">
+          <span className="text-base font-semibold text-paper">{frames.length}枚</span>
+          <span>（{limits.minImages}〜{limits.maxImages}枚）</span>
+          <span className="mx-1.5">・</span>
+          合計 {formatBytes(check.totalBytes)} / {formatBytes(limits.maxUploadBytes)}
+        </p>
+      )}
 
       {check.issues.length > 0 && (
         <ul className="space-y-1.5">
@@ -108,13 +124,15 @@ export function UploadPanel({ frames, check, limits, retentionHours, keepComplet
         </div>
       ) : (
         <Button variant="primary" className="w-full" disabled={!check.canStart} onClick={() => void start()}>
-          3Dモデルを生成
+          {resume ? '写真を追加して作り直す' : '3Dモデルを生成'}
         </Button>
       )}
 
       <p className="flex items-start gap-2 text-xs leading-relaxed text-mute">
         <InfoIcon width={16} height={16} className="mt-0.5 shrink-0" />
         <span>
+          {resume &&
+            '前回の写真と位置合わせの結果はそのまま使い、今回の写真を同じ座標に合わせて足します。作り直した3Dデータは新しい版として保存され、前の版も残ります。'}
           {describePipeline(pipeline)}
           {keepCompleted
             ? `完成した3Dデータはギャラリーに保存されます。失敗したものは${formatHours(retentionHours)}後に自動で削除されます。`

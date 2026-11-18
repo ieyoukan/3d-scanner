@@ -47,7 +47,15 @@ function clientInfo(): Record<string, unknown> {
   };
 }
 
-export function uploadScan(frames: readonly Frame[], onProgress: (p: UploadProgress) => void): UploadHandle {
+/**
+ * 写真を送る。resumeFrom を指定すると、そのスキャンの「続き」として送る
+ * （POST /api/scans/:id/resume。サーバーは元の版の写真と地図を引き継いだ新しい版を作る）。
+ */
+export function uploadScan(
+  frames: readonly Frame[],
+  onProgress: (p: UploadProgress) => void,
+  resumeFrom?: string,
+): UploadHandle {
   const form = new FormData();
   frames.forEach((frame, i) => {
     const ext = frame.blob.type === 'image/png' ? 'png' : 'jpg';
@@ -74,7 +82,7 @@ export function uploadScan(frames: readonly Frame[], onProgress: (p: UploadProgr
     };
     xhr.onerror = () => reject(new Error('通信が途切れました。電波の良い場所でもう一度お試しください。'));
     xhr.onabort = () => reject(new DOMException('アップロードを中止しました。', 'AbortError'));
-    xhr.open('POST', '/api/scans');
+    xhr.open('POST', resumeFrom ? `/api/scans/${encodeURIComponent(resumeFrom)}/resume` : '/api/scans');
     // Content-Type は自分で設定しない。FormData を渡すと、ブラウザが区切り文字（boundary）
     // つきの正しいヘッダを自動で付ける。
     xhr.send(form);

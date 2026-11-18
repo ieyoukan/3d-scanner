@@ -49,11 +49,11 @@ func TestPoseFromQuaternion(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := poseFromQuaternion(c.qw, c.qx, c.qy, c.qz, c.t)
-			if !nearVec(got.center, c.wantCenter) {
-				t.Errorf("カメラ位置 = %v, want %v", got.center, c.wantCenter)
+			if !nearVec(got.Center, c.wantCenter) {
+				t.Errorf("カメラ位置 = %v, want %v", got.Center, c.wantCenter)
 			}
-			if !nearVec(got.down, c.wantDown) {
-				t.Errorf("下方向 = %v, want %v", got.down, c.wantDown)
+			if !nearVec(got.Down, c.wantDown) {
+				t.Errorf("下方向 = %v, want %v", got.Down, c.wantDown)
 			}
 		})
 	}
@@ -159,5 +159,54 @@ func TestWriteSceneInfoIsValidJSON(t *testing.T) {
 	}
 	if back.RegisteredImages != 3 || back.Up != info.Up || len(back.CameraPositions) != 1 {
 		t.Errorf("読み戻した値が違う: %+v", back)
+	}
+}
+
+// TestReadImagePosesWithObservations: 名前・カメラ ID・向き・3D点に対応づいた特徴点の数を読む。
+func TestReadImagePosesWithObservations(t *testing.T) {
+	dir := writeModel(t, "# Image list\n"+
+		"# 2 lines per image\n"+
+		"1 1 0 0 0 0 0 0 1 frame_0001.jpg\n"+
+		"10.5 20.5 7 11 22 -1 30 40 8\n"+
+		"2 1 0 0 0 1 0 0 2 vps query.jpg\n"+
+		"\n", "")
+	poses, err := ReadImagePoses(filepath.Join(dir, "images.txt"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(poses) != 2 {
+		t.Fatalf("枚数 = %d", len(poses))
+	}
+	p := poses[0]
+	if p.ID != 1 || p.CameraID != 1 || p.Name != "frame_0001.jpg" || p.Observations != 2 {
+		t.Fatalf("1枚目 = %+v", p)
+	}
+	// 回転なしのカメラは +Z を向いている。
+	if !nearVec(p.Forward, [3]float64{0, 0, 1}) {
+		t.Fatalf("Forward = %v", p.Forward)
+	}
+	if q := poses[1]; q.Name != "vps query.jpg" || q.CameraID != 2 || q.Observations != 0 || !nearVec(q.Center, [3]float64{-1, 0, 0}) {
+		t.Fatalf("2枚目 = %+v", q)
+	}
+	// 数えない指定なら 0 のまま。
+	poses, _ = ReadImagePoses(filepath.Join(dir, "images.txt"), false)
+	if poses[0].Observations != 0 {
+		t.Fatalf("Observations = %d, want 0", poses[0].Observations)
+	}
+}
+
+func TestReadCameras(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cameras.txt")
+	os.WriteFile(path, []byte("# Camera list\n1 SIMPLE_RADIAL 1920 1440 1500 960 720 0.01\n2 PINHOLE 640 480 500 500 320 240\n"), 0o640)
+	cams, err := ReadCameras(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cams) != 2 || cams[0] != (Camera{ID: 1, Model: "SIMPLE_RADIAL", Width: 1920, Height: 1440}) || cams[1].ID != 2 {
+		t.Fatalf("cams = %+v", cams)
+	}
+	os.WriteFile(path, []byte("1 SIMPLE_RADIAL x 1440\n"), 0o640)
+	if _, err := ReadCameras(path); err == nil {
+		t.Fatal("壊れた行を受け付けた")
 	}
 }

@@ -134,6 +134,12 @@ type Scan struct {
 	Saved bool
 	// Title は利用者が付けた名前（空なら画面は撮影日時を出す）。
 	Title string
+	// ParentID は「続きを撮る」で作ったスキャンの元になった版の ID。
+	// 新規のスキャンと、元の版が削除されたものは空。
+	ParentID string
+	// BaseFrameCount は元の版から引き継いだ写真の枚数（FrameCount に含まれる）。
+	// FrameCount - BaseFrameCount が、今回追加した写真の枚数。
+	BaseFrameCount int
 }
 
 // MaxTitleLength はスキャンの名前の最大文字数（DB の CHECK 制約と同じ値）。

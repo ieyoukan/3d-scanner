@@ -171,3 +171,119 @@ func TestFreeBytes(t *testing.T) {
 		t.Fatalf("FreeBytes = %d, %v", free, err)
 	}
 }
+
+// writeMap は SfM が成功したスキャンと同じ形の地図（DB と sparse/0）と写真を置く。
+func writeMap(t *testing.T, ws *Scan, images ...string) {
+	t.Helper()
+	for _, name := range images {
+		if err := os.WriteFile(filepath.Join(ws.ImagesDir(), name), []byte("jpeg:"+name), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(ws.ModelDir(), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		ws.DatabasePath():                               "sqlite",
+		filepath.Join(ws.ModelDir(), "images.bin"):      "images",
+		filepath.Join(ws.ModelDir(), "cameras.bin"):     "cameras",
+		filepath.Join(ws.ModelDir(), "points3D.bin"):    "points",
+		ws.ThumbnailPath():                              "thumb",
+		filepath.Join(ws.OutputDir(), "mesh.glb"):       "glTF",
+		filepath.Join(ws.SparseDir(), "1", "other.bin"): "smaller model",
+	} {
+		os.MkdirAll(filepath.Dir(path), 0o750)
+		if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestInheritFrom: 「続きを撮る」で元の版の写真と地図を引き継ぐ。
+func TestInheritFrom(t *testing.T) {
+	root, parent, _ := newTestScan(t)
+	writeMap(t, parent, "frame_0001.jpg", "frame_0002.png", "frame_0010.jpg")
+	if !parent.HasMap() || parent.HasBase() {
+		t.Fatalf("元の版: HasMap=%v HasBase=%v", parent.HasMap(), parent.HasBase())
+	}
+
+	childID, _ := scan.NewID()
+	child, _ := root.Scan(childID)
+	if err := child.Create(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := child.InheritFrom(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 番号の最大は 10 なので、追加する写真は 11 番から（欠番があっても重ならない）。
+	if got.Frames != 3 || got.NextNumber != 11 {
+		t.Fatalf("InheritFrom = %+v", got)
+	}
+	if !child.HasBase() || child.HasMap() {
+		t.Fatalf("続きの版: HasBase=%v HasMap=%v（自分の地図はまだ無い）", child.HasBase(), child.HasMap())
+	}
+	names, err := child.BaseFrames()
+	if err != nil || len(names) != 3 || !names["frame_0002.png"] {
+		t.Fatalf("BaseFrames = %v, %v", names, err)
+	}
+
+	// ハードリンクなので、元の版を丸ごと消しても引き継いだファイルは読める。
+	if err := parent.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		filepath.Join(child.ImagesDir(), "frame_0010.jpg"): "jpeg:frame_0010.jpg",
+		child.BaseDatabasePath():                           "sqlite",
+		filepath.Join(child.BaseModelDir(), "images.bin"):  "images",
+		child.ThumbnailPath():                              "thumb",
+	} {
+		if b, err := os.ReadFile(path); err != nil || string(b) != want {
+			t.Errorf("%s = %q, %v", path, b, err)
+		}
+	}
+	// 引き継ぐのは sparse/0 だけ。成果物や他のモデルは持ってこない。
+	for _, p := range []string{filepath.Join(child.OutputDir(), "mesh.glb"), filepath.Join(child.BaseModelDir(), "other.bin")} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("%s は引き継がないはず", p)
+		}
+	}
+
+	// 完成して保存すると、引き継いだ地図（base/）は要らなくなるので消す。写真は残す。
+	if err := child.PruneIntermediate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(child.BaseDir()); !os.IsNotExist(err) {
+		t.Fatalf("base/ が残っている: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(child.ImagesDir(), "frame_0001.jpg")); err != nil {
+		t.Fatalf("写真が消えた: %v", err)
+	}
+}
+
+// TestInheritFromRequiresMap: 地図の無いスキャン（SfM が失敗した等）からは続きを撮れない。
+func TestInheritFromRequiresMap(t *testing.T) {
+	root, parent, _ := newTestScan(t)
+	childID, _ := scan.NewID()
+	child, _ := root.Scan(childID)
+	child.Create()
+	if _, err := child.InheritFrom(parent); err == nil {
+		t.Fatal("地図が無いのに引き継げた")
+	}
+}
+
+// TestTempDir: 一時作業の置き場は作れて、起動時の掃除で空になる。
+func TestTempDir(t *testing.T) {
+	root, _, _ := newTestScan(t)
+	dir, err := root.NewTemp("vps-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dir, "database.db"), []byte("x"), 0o640)
+	if err := root.CleanTemp(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("一時ディレクトリが残っている: %v", err)
+	}
+}

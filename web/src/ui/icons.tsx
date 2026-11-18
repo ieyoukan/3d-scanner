@@ -126,6 +126,24 @@ export const CubeIcon = (p: Props) => (
   </Icon>
 );
 
+/** 位置合わせ（VPS）。照準の印。 */
+export const LocateIcon = (p: Props) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="6" />
+    <circle cx="12" cy="12" r="1.5" />
+    <path d="M12 2.5V6M12 18v3.5M2.5 12H6M18 12h3.5" />
+  </Icon>
+);
+
+/** 続きを撮る。カメラに「＋」。 */
+export const AddPhotoIcon = (p: Props) => (
+  <Icon {...p}>
+    <path d="M13 6H8.5L7 8H4v11h16v-6" />
+    <circle cx="11" cy="13.5" r="3" />
+    <path d="M19 3v6M16 6h6" />
+  </Icon>
+);
+
 /** 処理中を示す回転する弧。 */
 export const SpinnerIcon = (p: Props) => (
   <Icon {...p} className={`spinner ${p.className ?? ''}`}>

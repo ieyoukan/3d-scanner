@@ -68,9 +68,11 @@ func (p *Postgres) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 func (p *Postgres) Create(ctx context.Context, s scan.Scan, frames []scan.Frame) error {
 	return p.inTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO scans (id, status, created_at, updated_at, expires_at, frame_count, capture_meta)
-			VALUES ($1, $2, $3, $3, $4, $5, $6::jsonb)`,
-			s.ID, string(scan.StatusQueued), s.CreatedAt, s.ExpiresAt, s.FrameCount, jsonOrEmpty(s.CaptureMeta))
+			INSERT INTO scans (id, status, created_at, updated_at, expires_at, frame_count, capture_meta,
+			                   title, parent_id, base_frame_count)
+			VALUES ($1, $2, $3, $3, $4, $5, $6::jsonb, $7, $8, $9)`,
+			s.ID, string(scan.StatusQueued), s.CreatedAt, s.ExpiresAt, s.FrameCount, jsonOrEmpty(s.CaptureMeta),
+			s.Title, nullUUID(s.ParentID), s.BaseFrameCount)
 		if err != nil {
 			return fmt.Errorf("scans への登録に失敗: %w", err)
 		}
@@ -97,20 +99,24 @@ func (p *Postgres) Create(ctx context.Context, s scan.Scan, frames []scan.Frame)
 
 // scanColumns は scans を読むときの列の並び。scanRow と必ず同じ順番にする。
 const scanColumns = `id::text, status, created_at, updated_at, expires_at, started_at, finished_at,
-	frame_count, attempts, error_code, error_message, capture_meta, saved, title`
+	frame_count, attempts, error_code, error_message, capture_meta, saved, title,
+	COALESCE(parent_id::text, ''), base_frame_count`
 
 // rowScanner は *sql.Row と *sql.Rows の共通部分（Scan だけ）を表す。
 type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanRow(r rowScanner) (scan.Scan, error) {
+// extra は scanColumns の後ろに続けて選んだ列の読み先（一覧の成果物の種類など）。
+func scanRow(r rowScanner, extra ...any) (scan.Scan, error) {
 	var s scan.Scan
 	var status string
 	var started, finished sql.NullTime
 	var meta []byte
-	err := r.Scan(&s.ID, &status, &s.CreatedAt, &s.UpdatedAt, &s.ExpiresAt, &started, &finished,
-		&s.FrameCount, &s.Attempts, &s.ErrorCode, &s.ErrorMessage, &meta, &s.Saved, &s.Title)
+	dest := []any{&s.ID, &status, &s.CreatedAt, &s.UpdatedAt, &s.ExpiresAt, &started, &finished,
+		&s.FrameCount, &s.Attempts, &s.ErrorCode, &s.ErrorMessage, &meta, &s.Saved, &s.Title,
+		&s.ParentID, &s.BaseFrameCount}
+	err := r.Scan(append(dest, extra...)...)
 	if err != nil {
 		return scan.Scan{}, err
 	}
@@ -240,9 +246,12 @@ func (p *Postgres) PutAsset(ctx context.Context, scanID string, a scan.Asset) er
 func (p *Postgres) List(ctx context.Context, q ListQuery) ([]scan.Summary, error) {
 	// 成果物の種類は string_agg で1つの文字列（"mesh_glb,scene_json"）にまとめて読む。
 	// 一覧の各行で scan_assets を別に問い合わせると、件数ぶん往復が増える（N+1 問題）。
+	// 続きの版が完成した古い版は出さない（同じ対象のカードが版の数だけ並ばないように）。
+	// 古い版は、続きの版の画面から辿れる。
 	query := `SELECT ` + scanColumns + `,
 		COALESCE((SELECT string_agg(kind, ',' ORDER BY kind) FROM scan_assets a WHERE a.scan_id = s.id), '')
-		FROM scans s WHERE status <> 'expired'`
+		FROM scans s WHERE status <> 'expired'
+		AND NOT EXISTS (SELECT 1 FROM scans c WHERE c.parent_id = s.id AND c.status IN ('succeeded', 'partial'))`
 	args := []any{}
 	if q.After != nil {
 		// (created_at, id) の組で比べる（行値の比較）。同じ時刻の行があっても順番が一意に決まる。
@@ -258,24 +267,36 @@ func (p *Postgres) List(ctx context.Context, q ListQuery) ([]scan.Summary, error
 	defer rows.Close()
 	var out []scan.Summary
 	for rows.Next() {
-		var sum scan.Summary
-		var status, kinds string
-		var started, finished sql.NullTime
-		var meta []byte
-		sc := &sum.Scan
-		if err := rows.Scan(&sc.ID, &status, &sc.CreatedAt, &sc.UpdatedAt, &sc.ExpiresAt, &started, &finished,
-			&sc.FrameCount, &sc.Attempts, &sc.ErrorCode, &sc.ErrorMessage, &meta, &sc.Saved, &sc.Title, &kinds); err != nil {
+		var kinds string
+		sc, err := scanRow(rows, &kinds)
+		if err != nil {
 			return nil, err
 		}
-		sc.Status = scan.Status(status)
-		sc.StartedAt, sc.FinishedAt = timePtr(started), timePtr(finished)
-		sc.CaptureMeta = json.RawMessage(meta)
+		sum := scan.Summary{Scan: sc}
 		for _, k := range strings.Split(kinds, ",") {
 			if k != "" {
 				sum.AssetKinds = append(sum.AssetKinds, scan.AssetKind(k))
 			}
 		}
 		out = append(out, sum)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) Children(ctx context.Context, id string) ([]scan.Scan, error) {
+	rows, err := p.db.QueryContext(ctx, `SELECT `+scanColumns+` FROM scans
+		WHERE parent_id = $1 AND status <> 'expired' ORDER BY created_at DESC, id DESC`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []scan.Scan
+	for rows.Next() {
+		sc, err := scanRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sc)
 	}
 	return out, rows.Err()
 }
@@ -483,6 +504,11 @@ func timePtr(t sql.NullTime) *time.Time {
 	}
 	v := t.Time
 	return &v
+}
+
+// nullUUID は空文字を NULL にする（parent_id は「元の版が無い」ことを NULL で表す）。
+func nullUUID(id string) sql.NullString {
+	return sql.NullString{String: id, Valid: id != ""}
 }
 
 // jsonOrEmpty は空の JSON を "{}" に揃える（JSONB 列は NOT NULL なので NULL を入れない）。

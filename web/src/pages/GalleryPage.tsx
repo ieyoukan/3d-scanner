@@ -140,6 +140,12 @@ function Card({ item }: { item: GalleryItem }) {
             {badge.label}
           </span>
         )}
+        {item.baseFrameCount > 0 && (
+          // 「続きを撮る」で足した枚数。同じ対象を撮り足した新しい版だと分かるように。
+          <span className="tabular absolute top-2 right-2 rounded-md bg-ink/85 px-1.5 py-0.5 text-xs text-paper">
+            追加 +{item.frameCount - item.baseFrameCount}枚
+          </span>
+        )}
       </div>
       <div className="space-y-0.5 px-2.5 py-2">
         <p className="truncate text-sm font-semibold">{displayTitle(item)}</p>

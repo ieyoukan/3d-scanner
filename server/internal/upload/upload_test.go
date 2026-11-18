@@ -291,3 +291,37 @@ func TestReceiveRejectsOversizedMetadata(t *testing.T) {
 	_, err := Receive(multipartReader(t, images(t, 3), map[string]string{"metadata": huge}), t.TempDir(), testLimits())
 	wantCode(t, err, "metadata_too_large", http.StatusRequestEntityTooLarge)
 }
+
+// TestReceiveWithContinuesNumbering: 「続きを撮る」では引き継いだ写真の続きの番号で保存し、1枚から受け付ける。
+func TestReceiveWithContinuesNumbering(t *testing.T) {
+	dir := t.TempDir()
+	files := []filePart{
+		{"images", "a.jpg", jpegBytes(t, 64, 48, 1)},
+		{"images", "b.png", pngBytes(t, 64, 48)},
+	}
+	res, err := ReceiveWith(multipartReader(t, files, nil), dir, testLimits(), Options{FirstNumber: 12, MinImages: 1, MaxImages: 2})
+	if err != nil {
+		t.Fatalf("ReceiveWith: %v", err)
+	}
+	if len(res.Frames) != 2 || res.Frames[0].FileName != "frame_0012.jpg" || res.Frames[0].Index != 11 ||
+		res.Frames[1].FileName != "frame_0013.png" {
+		t.Fatalf("frames = %+v", res.Frames)
+	}
+
+	// 上限（今回は2枚）を超えたら断る。「◯枚目」は今回送った順番で数える。
+	files = append(files, filePart{"images", "c.jpg", jpegBytes(t, 64, 48, 3)})
+	_, err = ReceiveWith(multipartReader(t, files, nil), t.TempDir(), testLimits(), Options{FirstNumber: 12, MinImages: 1, MaxImages: 2})
+	wantCode(t, err, "too_many_images", http.StatusRequestEntityTooLarge)
+
+	// 0枚は断る。
+	_, err = ReceiveWith(multipartReader(t, nil, nil), t.TempDir(), testLimits(), Options{FirstNumber: 12, MinImages: 1, MaxImages: 2})
+	wantCode(t, err, "too_few_images", http.StatusBadRequest)
+
+	// 壊れた写真の「◯枚目」は送った順番（2枚目）で伝える。番号（13）ではない。
+	bad := []filePart{{"images", "a.jpg", jpegBytes(t, 64, 48, 1)}, {"images", "b.jpg", []byte("\xff\xd8\xff not really a jpeg")}}
+	_, err = ReceiveWith(multipartReader(t, bad, nil), t.TempDir(), testLimits(), Options{FirstNumber: 12, MinImages: 1})
+	var ue *Error
+	if !errors.As(err, &ue) || !strings.Contains(ue.Message, "2枚目") {
+		t.Fatalf("err = %v（2枚目と伝えるはず）", err)
+	}
+}

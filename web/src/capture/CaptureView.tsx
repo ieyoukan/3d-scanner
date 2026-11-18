@@ -7,7 +7,7 @@
 //
 // どの状況でも「写真を選ぶ」は押せる。カメラは便利な入力手段の1つであって必須ではない、
 // という作りにしておくと、権限の拒否や HTTP 接続でも行き止まりにならない。
-import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'react';
 import type { Limits } from '../api/types';
 import { useCamera } from '../camera/useCamera';
 import { Button, buttonClass } from '../ui/Button';
@@ -22,9 +22,13 @@ interface Props {
   onAdd: (frames: Frame[]) => number;
   /** 確認画面へ進む。 */
   onReview: () => void;
+  /** 映像の上端に重ねる表示（「続きを撮る」の位置合わせの状況など）。 */
+  overlay?: ReactNode;
+  /** 映像の下に出す一言。省略すると枚数に応じた既定の案内。 */
+  hint?: string;
 }
 
-export function CaptureView({ frames, limits, onAdd, onReview }: Props) {
+export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint }: Props) {
   const camera = useCamera();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -121,10 +125,12 @@ export function CaptureView({ frames, limits, onAdd, onReview }: Props) {
           <>
             <FrameCorners />
             <p className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
-              {captureHint(frames.length, limits)}
+              {hint ?? captureHint(frames.length, limits)}
             </p>
           </>
         )}
+        {/* 重ねる表示は、カメラが使えないときも出す（写真を選んで送る場合も位置合わせはできる）。 */}
+        {overlay && <div className="pointer-events-none absolute inset-x-0 top-0 z-10 p-3">{overlay}</div>}
         {flash && <div className="pointer-events-none absolute inset-0 bg-white/70" />}
 
         {camera.state.kind === 'idle' && (

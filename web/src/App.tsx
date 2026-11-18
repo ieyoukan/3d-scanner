@@ -3,17 +3,19 @@
 //   2. URL に応じて表示する画面を選ぶ（ルーティング）
 // アクセス制限はこのアプリでは行わない（前段の Cloudflare Access などに任せる）。
 //
-// 画面は4つ:
-//   /                 撮影・確認・送信
-//   /gallery          これまでに作った3Dデータの一覧
-//   /scans/:id        処理の進行状況
-//   /scans/:id/view   3Dビューア
+// 画面は5つ:
+//   /                   撮影・確認・送信
+//   /gallery            これまでに作った3Dデータの一覧
+//   /scans/:id          処理の進行状況
+//   /scans/:id/view     3Dビューア
+//   /scans/:id/resume   続きを撮る（位置合わせ＝VPS をしながら撮り足し、作り直す）
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { BrowserRouter, Link, Route, Routes } from 'react-router-dom';
 import { fetchConfig } from './api/client';
 import type { ServerConfig } from './api/types';
 import { CapturePage } from './pages/CapturePage';
 import { GalleryPage } from './pages/GalleryPage';
+import { ResumePage } from './pages/ResumePage';
 import { ScanPage } from './pages/ScanPage';
 import { Button, buttonClass } from './ui/Button';
 import { SpinnerIcon } from './ui/icons';
@@ -59,6 +61,7 @@ export function App() {
           <Route path="/gallery" element={<GalleryPage />} />
           <Route path="/scans/:id" element={<ScanPage />} />
           <Route path="/scans/:id/view" element={<ViewPage />} />
+          <Route path="/scans/:id/resume" element={<ResumePage config={config} />} />
           <Route
             path="*"
             element={

@@ -14,6 +14,8 @@
 //	GET    /api/scans/{id}/logs?step=sfm  ステップの処理ログ（テキスト）
 //	GET    /api/scans/{id}/assets/{kind}  成果物のダウンロード（末尾に /scene.sog 等のファイル名を付けてもよい）
 //	GET    /api/scans/{id}/thumbnail      ギャラリー用の縮小画像（1枚目の写真から作る）
+//	POST   /api/scans/{id}/localize       写真1枚の位置合わせ（VPS）。地図のどこから撮ったかを返す
+//	POST   /api/scans/{id}/resume         続きを撮る: 写真を足した新しい版を登録（202 Accepted）
 //	PATCH  /api/scans/{id}                名前の変更（{"title": "..."}）
 //	DELETE /api/scans/{id}                キャンセル／削除
 //	それ以外                               ビルド済み Web（SPA）を返す
@@ -46,13 +48,15 @@ type PipelineInfo struct {
 
 // Server は HTTP ハンドラ群と、その依存先をまとめたもの。
 type Server struct {
-	cfg      config.Config
-	store    store.Store
-	root     *workspace.Root
-	jobs     *jobs.Service
-	pipeline PipelineInfo
-	log      *slog.Logger
-	now      func() time.Time
+	cfg   config.Config
+	store store.Store
+	root  *workspace.Root
+	jobs  *jobs.Service
+	// localizer は位置合わせ（VPS）を行う。
+	localizer Localizer
+	pipeline  PipelineInfo
+	log       *slog.Logger
+	now       func() time.Time
 
 	// uploadSlots は同時に受け付けるアップロードの数を制限する（セマフォ）。
 	// 容量2のチャネルに「席札」を入れられた人だけが進める。席が無ければ 429 で断る。
@@ -61,12 +65,12 @@ type Server struct {
 }
 
 // New は Server を作る。
-func New(cfg config.Config, st store.Store, root *workspace.Root, js *jobs.Service, info PipelineInfo, log *slog.Logger) *Server {
+func New(cfg config.Config, st store.Store, root *workspace.Root, js *jobs.Service, loc Localizer, info PipelineInfo, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Server{
-		cfg: cfg, store: st, root: root, jobs: js, pipeline: info, log: log,
+		cfg: cfg, store: st, root: root, jobs: js, localizer: loc, pipeline: info, log: log,
 		now:         time.Now,
 		uploadSlots: make(chan struct{}, 2),
 	}
@@ -96,6 +100,8 @@ func (s *Server) Handler() http.Handler {
 	// 名前と一致するときだけ受け付け、ファイルの場所を決めるのには使わない。
 	mux.Handle("GET /api/scans/{id}/assets/{kind}/{name}", s.protect(s.handleGetAsset))
 	mux.Handle("GET /api/scans/{id}/thumbnail", s.protect(s.handleGetThumbnail))
+	mux.Handle("POST /api/scans/{id}/localize", s.protect(s.handleLocalize))
+	mux.Handle("POST /api/scans/{id}/resume", s.protect(s.handleResumeScan))
 	mux.Handle("PATCH /api/scans/{id}", s.protect(s.handleUpdateScan))
 	mux.Handle("DELETE /api/scans/{id}", s.protect(s.handleDeleteScan))
 

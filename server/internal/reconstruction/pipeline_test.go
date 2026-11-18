@@ -104,6 +104,10 @@ func (f *fakeRunner) produce(key string, args []string) error {
 	switch key {
 	case "colmap mapper":
 		dir := filepath.Join(argValue(args, "--output_path"), "0")
+		if argValue(args, "--input_path") != "" {
+			// 既存のモデルから続けるときは、出力先に直接書く（本物の COLMAP と同じ）。
+			dir = argValue(args, "--output_path")
+		}
 		for _, name := range []string{"cameras.bin", "images.bin", "points3D.bin"} {
 			if err := write(filepath.Join(dir, name), "bin"); err != nil {
 				return err
@@ -752,5 +756,94 @@ func TestUserMessage(t *testing.T) {
 	// クラッシュ（SIGABRT）をメモリ不足と説明しない。
 	if got := userMessage(&cmdrun.ExitError{Command: "colmap", ExitCode: -1, Signal: "SIGABRT"}); strings.Contains(got, "メモリ") {
 		t.Errorf("SIGABRT をメモリ不足と説明している: %q", got)
+	}
+}
+
+// newResumeJob は「続きを撮る」の作業ディレクトリを作る。写真5枚のうち、1〜3枚目が元の版から
+// 引き継いだもの（base/frames.txt に記録）、4〜5枚目が今回の写真。
+func newResumeJob(t *testing.T) Job {
+	t.Helper()
+	job := newJob(t)
+	ws := job.WS
+	if err := os.MkdirAll(ws.BaseModelDir(), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		ws.BaseDatabasePath():                          "元の版の DB",
+		filepath.Join(ws.BaseModelDir(), "images.bin"): "bin",
+		ws.BaseFramesPath():                            "frame_0001.jpg\nframe_0002.jpg\nframe_0003.jpg\n",
+	}
+	for path, content := range files {
+		if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return job
+}
+
+func TestResumeStartsFromInheritedMap(t *testing.T) {
+	run := newFakeRunner()
+	rep := newFakeReporter()
+	job := newResumeJob(t)
+	p := New(testPipelineConfig(), run, Capabilities{}, nil)
+	if err := p.Run(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.finished[scan.StepSfM] != scan.StepSucceeded {
+		t.Fatalf("SfM = %s: %s", rep.finished[scan.StepSfM], rep.messages[scan.StepSfM])
+	}
+	if msg := rep.messages[scan.StepSfM]; !strings.Contains(msg, "今回の2枚中2枚") {
+		t.Fatalf("SfM の補足 = %q", msg)
+	}
+
+	// mapper は元の版のモデルから続け、元の写真のカメラ位置を固定し、sparse/0 に直接書く。
+	args := run.args["colmap mapper"]
+	if argValue(args, "--input_path") != job.WS.BaseModelDir() || argValue(args, "--output_path") != job.WS.ModelDir() ||
+		argValue(args, "--Mapper.fix_existing_frames") != "1" {
+		t.Fatalf("mapper の引数 = %v", args)
+	}
+	// 作業用の DB は元の版の複製（同じファイルを共有していない）。
+	work, err1 := os.Stat(job.WS.DatabasePath())
+	base, err2 := os.Stat(job.WS.BaseDatabasePath())
+	if err1 != nil || err2 != nil || os.SameFile(work, base) {
+		t.Fatalf("作業用の DB が複製になっていない: %v %v", err1, err2)
+	}
+	if b, _ := os.ReadFile(job.WS.DatabasePath()); string(b) != "元の版の DB" {
+		t.Fatalf("作業用の DB の中身 = %q", b)
+	}
+	if out := rep.outcome(); out.Status != scan.StatusSucceeded {
+		t.Fatalf("全体 = %+v", out)
+	}
+}
+
+func TestResumeFailsWhenNoNewPhotoFits(t *testing.T) {
+	run := newFakeRunner()
+	run.registered = 3 // 元の3枚だけが地図に入り、今回の2枚は入らなかった
+	rep := newFakeReporter()
+	p := New(testPipelineConfig(), run, Capabilities{}, nil)
+	if err := p.Run(context.Background(), newResumeJob(t), rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.finished[scan.StepSfM] != scan.StepFailed || rep.messages[scan.StepSfM] != noNewImagesMessage {
+		t.Fatalf("SfM = %s: %q", rep.finished[scan.StepSfM], rep.messages[scan.StepSfM])
+	}
+	if rep.finished[scan.StepSplat] != scan.StepSkipped {
+		t.Fatalf("3DGS = %s（SfM の失敗で実行しないはず）", rep.finished[scan.StepSplat])
+	}
+	if out := rep.outcome(); out.Status != scan.StatusFailed {
+		t.Fatalf("全体 = %+v", out)
+	}
+}
+
+func TestNewScanDoesNotUseResumeOptions(t *testing.T) {
+	run := newFakeRunner()
+	p := New(testPipelineConfig(), run, Capabilities{}, nil)
+	job := newJob(t)
+	if err := p.Run(context.Background(), job, newFakeReporter()); err != nil {
+		t.Fatal(err)
+	}
+	args := run.args["colmap mapper"]
+	if argValue(args, "--input_path") != "" || argValue(args, "--output_path") != job.WS.SparseDir() {
+		t.Fatalf("mapper の引数 = %v", args)
 	}
 }

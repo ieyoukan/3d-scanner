@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -23,6 +24,7 @@ import (
 	"github.com/ieyoukan/3d-scanner/server/internal/reconstruction"
 	"github.com/ieyoukan/3d-scanner/server/internal/scan"
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
+	"github.com/ieyoukan/3d-scanner/server/internal/vps"
 	"github.com/ieyoukan/3d-scanner/server/internal/workspace"
 )
 
@@ -40,6 +42,10 @@ func (fakePipeline) Run(ctx context.Context, job reconstruction.Job, rep reconst
 	}
 	rep.StepStarted(ctx, scan.StepSfM)
 	os.WriteFile(job.WS.LogPath(scan.StepSfM), []byte("$ colmap feature_extractor\n特徴点を抽出しました\n"), 0o640)
+	// SfM の結果（地図）。これがあると「続きを撮る」と位置合わせの対象になる。
+	os.MkdirAll(job.WS.ModelDir(), 0o750)
+	os.WriteFile(job.WS.DatabasePath(), []byte("sqlite"), 0o640)
+	os.WriteFile(filepath.Join(job.WS.ModelDir(), "images.bin"), []byte("bin"), 0o640)
 	write(scan.AssetSparsePLY, "sparse.ply", "ply\nsparse")
 	rep.StepFinished(ctx, scan.StepSfM, scan.StepSucceeded, "3枚中3枚")
 	rep.StepFinished(ctx, scan.StepMVS, scan.StepSkipped, "GPU なし")
@@ -90,7 +96,7 @@ func newTestEnv(t *testing.T, mutate func(*config.Config)) *testEnv {
 	}
 	st := store.NewMemory()
 	js := jobs.New(st, root, fakePipeline{}, cfg.Jobs, nil)
-	srv := New(cfg, st, root, js, PipelineInfo{MeshEnabled: true, MeshMode: "sparse", SplatEnabled: true, SplatDevice: "cpu"}, nil)
+	srv := New(cfg, st, root, js, &fakeLocalizer{}, PipelineInfo{MeshEnabled: true, MeshMode: "sparse", SplatEnabled: true, SplatDevice: "cpu"}, nil)
 	return &testEnv{t: t, cfg: cfg, store: st, root: root, jobs: js, server: srv, http: srv.Handler()}
 }
 
@@ -672,4 +678,174 @@ func TestRenameScan(t *testing.T) {
 	if rec := rename(`{"title":"` + strings.Repeat("あ", 80) + `"}`); rec.Code != 200 {
 		t.Fatalf("80文字の名前が拒否された: %d", rec.Code)
 	}
+}
+
+// fakeLocalizer は位置合わせの偽物。決めた結果かエラーを返す。
+type fakeLocalizer struct {
+	result vps.Result
+	err    error
+	// got は渡された写真（呼ばれた時点でファイルがあったか）。
+	got       vps.Query
+	fileExist bool
+}
+
+func (f *fakeLocalizer) Localize(_ context.Context, m *workspace.Scan, q vps.Query) (vps.Result, error) {
+	f.got = q
+	_, err := os.Stat(q.Path)
+	f.fileExist = err == nil
+	return f.result, f.err
+}
+
+// resumeBody は n 枚の写真を入れた「続きを撮る」のボディ（seed をずらして元の写真と別の中身にする）。
+func resumeBody(t *testing.T, n int) (io.Reader, func(*http.Request)) {
+	t.Helper()
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for i := 0; i < n; i++ {
+		fw, _ := w.CreateFormFile("images", fmt.Sprintf("IMG_%d.jpg", i))
+		fw.Write(photo(t, uint8(100+i)))
+	}
+	w.Close()
+	return &body, header("Content-Type", w.FormDataContentType())
+}
+
+func TestResumeScan(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.startWorker()
+	parentID := e.createScan(3)
+	parent := e.waitScan(parentID)
+	if !parent.Resumable || len(parent.Continuations) != 0 || parent.ParentID != "" {
+		t.Fatalf("元の版 = %+v", parent)
+	}
+
+	// 上限は元の写真と合わせて 6 枚。元が 3 枚なので、4 枚は多すぎる。
+	body, ct := resumeBody(t, 4)
+	wantError(t, e.do("POST", "/api/scans/"+parentID+"/resume", body, ct), http.StatusRequestEntityTooLarge, "too_many_images")
+
+	// 1 枚から受け付ける。
+	body, ct = resumeBody(t, 2)
+	rec := e.do("POST", "/api/scans/"+parentID+"/resume", body, ct)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("resume = %d %s", rec.Code, rec.Body.String())
+	}
+	created := decode[createResponse](t, rec)
+	if created.FrameCount != 5 || created.BaseFrameCount != 3 {
+		t.Fatalf("受付 = %+v", created)
+	}
+
+	// 続きの版の作業ディレクトリ: 引き継いだ写真3枚＋今回の2枚（続きの番号）と、元の版の地図。
+	child, _ := e.root.Scan(created.ID)
+	var names []string
+	entries, _ := os.ReadDir(child.ImagesDir())
+	for _, en := range entries {
+		names = append(names, en.Name())
+	}
+	if strings.Join(names, ",") != "frame_0001.jpg,frame_0002.jpg,frame_0003.jpg,frame_0004.jpg,frame_0005.jpg" {
+		t.Fatalf("写真 = %v", names)
+	}
+
+	got := e.waitScan(created.ID)
+	if got.ParentID != parentID || got.BaseFrameCount != 3 || got.FrameCount != 5 || !got.Resumable {
+		t.Fatalf("続きの版 = %+v", got)
+	}
+	if after := decode[scanResponse](t, e.do("GET", "/api/scans/"+parentID, nil)); len(after.Continuations) != 1 ||
+		after.Continuations[0].ID != created.ID {
+		t.Fatalf("元の版の continuations = %+v", after.Continuations)
+	}
+	// 続きの版が完成したので、一覧には新しい版だけが出る。
+	page := decode[galleryResponse](t, e.do("GET", "/api/scans", nil))
+	if len(page.Items) != 1 || page.Items[0].ID != created.ID || page.Items[0].ParentID != parentID || page.Items[0].BaseFrameCount != 3 {
+		t.Fatalf("一覧 = %+v", page.Items)
+	}
+
+	// 続きの版のさらに続きも撮れる（番号は 6 から）。
+	body, ct = resumeBody(t, 1)
+	rec = e.do("POST", "/api/scans/"+created.ID+"/resume", body, ct)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("2回目の resume = %d %s", rec.Code, rec.Body.String())
+	}
+	third, _ := e.root.Scan(decode[createResponse](t, rec).ID)
+	if _, err := os.Stat(filepath.Join(third.ImagesDir(), "frame_0006.jpg")); err != nil {
+		t.Fatalf("続きの番号で保存されていない: %v", err)
+	}
+}
+
+func TestResumeRequiresMap(t *testing.T) {
+	e := newTestEnv(t, nil)
+	id := e.createScan(3) // ワーカーを動かさないので queued のまま（地図が無い）
+	body, ct := resumeBody(t, 1)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/resume", body, ct), http.StatusConflict, "not_resumable")
+	body, ct = resumeBody(t, 1)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", body, ct), http.StatusConflict, "not_resumable")
+	body, ct = resumeBody(t, 1)
+	wantError(t, e.do("POST", "/api/scans/00000000-0000-4000-8000-000000000000/resume", body, ct), http.StatusNotFound, "not_found")
+	if got := decode[scanResponse](t, e.do("GET", "/api/scans/"+id, nil)); got.Resumable {
+		t.Fatal("処理前のスキャンが resumable になっている")
+	}
+	// 別のサイトからは受け付けない。
+	body, ct = resumeBody(t, 1)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/resume", body, ct, header("Origin", "https://evil.example")), http.StatusForbidden, "cross_origin")
+}
+
+// localizeBody は写真 n 枚を項目 "image" に入れたボディ。
+func localizeBody(t *testing.T, n int) (io.Reader, func(*http.Request)) {
+	t.Helper()
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for i := 0; i < n; i++ {
+		fw, _ := w.CreateFormFile("image", "query.jpg")
+		fw.Write(photo(t, uint8(200+i)))
+	}
+	w.Close()
+	return &body, header("Content-Type", w.FormDataContentType())
+}
+
+func TestLocalize(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.startWorker()
+	id := e.createScan(3)
+	e.waitScan(id)
+	loc := e.server.localizer.(*fakeLocalizer)
+
+	loc.result = vps.Result{Localized: true, Position: [3]float64{1, 2, 3}, Forward: [3]float64{0, 0, 1}, Matches: 321, ComparedImages: 3, MapImages: 3}
+	body, ct := localizeBody(t, 1)
+	rec := e.do("POST", "/api/scans/"+id+"/localize", body, ct)
+	if rec.Code != 200 {
+		t.Fatalf("localize = %d %s", rec.Code, rec.Body.String())
+	}
+	got := decode[localizeResponse](t, rec)
+	if !got.Localized || got.Position == nil || *got.Position != [3]float64{1, 2, 3} || got.Matches != 321 || got.Message == "" {
+		t.Fatalf("結果 = %+v", got)
+	}
+	if !loc.fileExist || loc.got.Width != 64 || loc.got.Height != 48 {
+		t.Fatalf("位置合わせに渡した写真 = %+v（存在: %v）", loc.got, loc.fileExist)
+	}
+	// 受け取った写真は一時ディレクトリごと消える（地図にも作業ディレクトリにも残らない）。
+	if _, err := os.Stat(loc.got.Path); !os.IsNotExist(err) {
+		t.Fatalf("写真が残っている: %v", err)
+	}
+
+	loc.result = vps.Result{Localized: false, ComparedImages: 3, MapImages: 3}
+	body, ct = localizeBody(t, 1)
+	if got := decode[localizeResponse](t, e.do("POST", "/api/scans/"+id+"/localize", body, ct)); got.Localized || got.Position != nil || got.Message == "" {
+		t.Fatalf("見つからないときの結果 = %+v", got)
+	}
+
+	body, ct = localizeBody(t, 2)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", body, ct), http.StatusRequestEntityTooLarge, "too_many_images")
+	body, ct = localizeBody(t, 0)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", body, ct), http.StatusBadRequest, "too_few_images")
+
+	loc.err = vps.ErrBusy
+	body, ct = localizeBody(t, 1)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", body, ct), http.StatusTooManyRequests, "busy")
+	loc.err = vps.ErrTimeout
+	body, ct = localizeBody(t, 1)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", body, ct), http.StatusGatewayTimeout, "localize_timeout")
+	loc.err = errors.New("colmap が終了コード 1 で失敗しました")
+	body, ct = localizeBody(t, 1)
+	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", body, ct), http.StatusInternalServerError, "localize_failed")
+
+	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", strings.NewReader("{}"), header("Content-Type", "application/json")),
+		http.StatusUnsupportedMediaType, "unsupported_media_type")
 }

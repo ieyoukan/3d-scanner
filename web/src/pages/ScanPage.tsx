@@ -6,7 +6,7 @@ import { isTerminal, type Scan } from '../api/types';
 import { ReconstructionProgress } from '../progress/ReconstructionProgress';
 import { useNow, useScan } from '../progress/useScan';
 import { Button, buttonClass } from '../ui/Button';
-import { AlertIcon, BackIcon, CheckIcon, CubeIcon, GridIcon, SpinnerIcon } from '../ui/icons';
+import { AddPhotoIcon, AlertIcon, BackIcon, CheckIcon, CubeIcon, GridIcon, SpinnerIcon } from '../ui/icons';
 
 export function ScanPage() {
   const { id = '' } = useParams();
@@ -46,6 +46,7 @@ export function ScanPage() {
                 <span>通信が不安定です。表示は少し前の状態かもしれません。自動で再接続します。</span>
               </p>
             )}
+            {load.scan.baseFrameCount > 0 && <ContinuationNote scan={load.scan} />}
             <ReconstructionProgress scan={load.scan} now={now} />
           </>
         )}
@@ -111,9 +112,20 @@ function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
         </Link>
       )}
 
+      {!active && scan.resumable && (
+        <Link to={`/scans/${scan.id}/resume`} className={buttonClass('secondary', 'w-full')}>
+          <AddPhotoIcon />
+          続きを撮る
+        </Link>
+      )}
+
       {!active && !viewable && (
-        <Link to="/" className={buttonClass(pointsOnly ? 'secondary' : 'primary', 'w-full')}>
-          もう一度撮る
+        // 続きの版が失敗したときは、前の版から撮り足し直すのが近道。
+        <Link
+          to={scan.parentId ? `/scans/${scan.parentId}/resume` : '/'}
+          className={buttonClass(pointsOnly ? 'secondary' : 'primary', 'w-full')}
+        >
+          {scan.parentId ? '前の版から撮り直す' : 'もう一度撮る'}
         </Link>
       )}
 
@@ -138,6 +150,25 @@ function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
         </div>
       )}
     </footer>
+  );
+}
+
+/** 続きの版であることの説明。前の版は書き換えないことも伝える。 */
+function ContinuationNote({ scan }: { scan: Scan }) {
+  const added = scan.frameCount - scan.baseFrameCount;
+  return (
+    <p className="mb-4 rounded-lg border border-line bg-panel p-3 text-sm text-mute">
+      前の版の{scan.baseFrameCount}枚に、今回の{added}枚を足した版です。
+      {'今回の写真を前の版と同じ座標に合わせてから、3Dデータを作り直します。前の版はそのまま残ります。'}
+      {scan.parentId && (
+        <>
+          {' '}
+          <Link to={`/scans/${scan.parentId}/view`} className="text-paper underline underline-offset-4">
+            前の版を見る
+          </Link>
+        </>
+      )}
+    </p>
   );
 }
 

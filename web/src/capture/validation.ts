@@ -24,7 +24,16 @@ export interface Check {
   issues: Issue[];
 }
 
-export function checkFrames(frames: readonly FrameSummary[], blurryCount: number, limits: Limits): Check {
+/**
+ * 送信前の確認。recommended は「これ以上あると安定する」目安の枚数で、0 なら目安の助言を出さない
+ * （「続きを撮る」は数枚の追加でも意味があるので出さない）。
+ */
+export function checkFrames(
+  frames: readonly FrameSummary[],
+  blurryCount: number,
+  limits: Limits,
+  recommended = recommendedImages,
+): Check {
   const issues: Issue[] = [];
   const totalBytes = frames.reduce((sum, f) => sum + f.bytes, 0);
   const count = frames.length;
@@ -50,10 +59,10 @@ export function checkFrames(frames: readonly FrameSummary[], blurryCount: number
     });
   }
 
-  if (count >= limits.minImages && count < recommendedImages) {
+  if (count >= limits.minImages && count < recommended) {
     issues.push({
       level: 'warn',
-      text: `${recommendedImages}枚以上あると安定します。対象のまわりを少しずつ動いて撮り足すのがおすすめです。`,
+      text: `${recommended}枚以上あると安定します。対象のまわりを少しずつ動いて撮り足すのがおすすめです。`,
     });
   }
   if (blurryCount > 0) {

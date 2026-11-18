@@ -12,7 +12,16 @@ import { formatBytes } from '../capture/validation';
 import { displayTitle } from '../gallery/gallery';
 import { useScan } from '../progress/useScan';
 import { Button, buttonClass } from '../ui/Button';
-import { AlertIcon, BackIcon, CloseIcon, DownloadIcon, PencilIcon, ResetViewIcon, SpinnerIcon } from '../ui/icons';
+import {
+  AddPhotoIcon,
+  AlertIcon,
+  BackIcon,
+  CloseIcon,
+  DownloadIcon,
+  PencilIcon,
+  ResetViewIcon,
+  SpinnerIcon,
+} from '../ui/icons';
 import { MeshViewer } from '../viewer/MeshViewer';
 import { PointCloudViewer } from '../viewer/PointCloudViewer';
 import { computeViewFrame } from '../viewer/sceneFrame';
@@ -126,6 +135,7 @@ function Viewer({ scan }: { scan: Scan }) {
 
       <footer className="pad-safe-b space-y-2 border-t border-line bg-panel px-4 pt-2.5">
         <TitleRow scan={scan} />
+        <Versions scan={scan} />
         {active?.note && <p className="text-xs text-amber">{active.note}</p>}
         {missing.length > 0 && (
           <ul className="space-y-1">
@@ -153,6 +163,13 @@ function Viewer({ scan }: { scan: Scan }) {
             <DownloadIcon />
             保存
           </Button>
+          {scan.resumable && (
+            // 位置合わせ（VPS）をしながら撮り足し、この3Dデータを作り直す。
+            <Link to={`/scans/${scan.id}/resume`} className={buttonClass('secondary', 'col-span-2')}>
+              <AddPhotoIcon />
+              続きを撮る（位置を合わせて撮り足す）
+            </Link>
+          )}
         </div>
       </footer>
 
@@ -223,6 +240,45 @@ function TitleRow({ scan }: { scan: Scan }) {
       </div>
       {error && <p className="text-xs text-bad">{error}</p>}
     </div>
+  );
+}
+
+/**
+ * 版のつながり。「続きを撮る」で作った版なら前の版へ、新しい版があればそちらへの道を出す。
+ * 前の版はギャラリーの一覧から外れる（新しい版が完成すると隠れる）ので、ここから辿れるようにする。
+ */
+function Versions({ scan }: { scan: Scan }) {
+  const newer = scan.continuations.find((c) => c.status === 'succeeded' || c.status === 'partial');
+  const running = scan.continuations.find((c) => c.status === 'queued' || c.status === 'running');
+  const added = scan.frameCount - scan.baseFrameCount;
+  if (!newer && !running && scan.baseFrameCount === 0) return null;
+  const link = 'underline underline-offset-4';
+  return (
+    <p className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-mute">
+      {scan.baseFrameCount > 0 && (
+        <span>
+          前の版の{scan.baseFrameCount}枚に{added}枚を足した版
+          {scan.parentId && (
+            <>
+              {' · '}
+              <Link to={`/scans/${scan.parentId}/view`} className={`${link} text-paper`}>
+                前の版
+              </Link>
+            </>
+          )}
+        </span>
+      )}
+      {newer && (
+        <Link to={`/scans/${newer.id}/view`} className={`${link} text-amber`}>
+          新しい版があります
+        </Link>
+      )}
+      {!newer && running && (
+        <Link to={`/scans/${running.id}`} className={`${link} text-paper`}>
+          続きの版を処理中
+        </Link>
+      )}
+    </p>
   );
 }
 
