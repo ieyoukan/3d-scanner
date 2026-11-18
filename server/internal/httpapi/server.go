@@ -16,6 +16,7 @@
 //	GET    /api/scans/{id}/thumbnail      ギャラリー用の縮小画像（1枚目の写真から作る）
 //	POST   /api/scans/{id}/localize       写真1枚の位置合わせ（VPS）。地図のどこから撮ったかを返す
 //	POST   /api/scans/{id}/resume         続きを撮る: 写真を足した新しい版を登録（202 Accepted）
+//	POST   /api/scans/{id}/splat          3DGS を（作り直しを含めて）あとで作る待ち行列に入れる（202 Accepted）
 //	PATCH  /api/scans/{id}                名前の変更（{"title": "..."}）
 //	DELETE /api/scans/{id}                キャンセル／削除
 //	それ以外                               ビルド済み Web（SPA）を返す
@@ -41,7 +42,9 @@ type PipelineInfo struct {
 	SplatEnabled    bool   `json:"splatEnabled"`
 	SplatIterations int    `json:"splatIterations"`
 	// SplatDevice は "cpu" か "gpu"。
-	SplatDevice   string `json:"splatDevice"`
+	SplatDevice string `json:"splatDevice"`
+	// SplatDeferred が true なら、3DGS はメッシュの後で（手が空いたときに）作る。
+	SplatDeferred bool   `json:"splatDeferred"`
 	ColmapVersion string `json:"colmapVersion"`
 	ColmapGPU     bool   `json:"colmapGpu"`
 }
@@ -102,6 +105,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/scans/{id}/thumbnail", s.protect(s.handleGetThumbnail))
 	mux.Handle("POST /api/scans/{id}/localize", s.protect(s.handleLocalize))
 	mux.Handle("POST /api/scans/{id}/resume", s.protect(s.handleResumeScan))
+	mux.Handle("POST /api/scans/{id}/splat", s.protect(s.handleMakeSplat))
 	mux.Handle("PATCH /api/scans/{id}", s.protect(s.handleUpdateScan))
 	mux.Handle("DELETE /api/scans/{id}", s.protect(s.handleDeleteScan))
 

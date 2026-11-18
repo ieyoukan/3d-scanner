@@ -29,7 +29,10 @@ import (
 
 // Pipeline は復元処理の実体。本番では *reconstruction.Pipeline、テストでは偽物を渡す。
 type Pipeline interface {
+	// Run は位置推定からメッシュまで（あとで作る設定でなければ 3DGS も）を実行する。
 	Run(ctx context.Context, job reconstruction.Job, rep reconstruction.Reporter) error
+	// RunSplat は 3DGS（学習と圧縮）だけを実行する。あとで作る 3DGS の待ち行列から呼ぶ。
+	RunSplat(ctx context.Context, job reconstruction.Job, rep reconstruction.Reporter) error
 }
 
 // Service はジョブの実行管理。
@@ -50,6 +53,13 @@ type Service struct {
 	// wake は「新しいジョブが来た」ことをワーカーに知らせる合図。
 	// 容量1のチャネルにして、合図が溜まらないようにする（何度鳴らしても「起きろ」は1回で足りる）。
 	wake chan struct{}
+
+	// splatMu は splat を守る。3DGS のワーカー、ワーカー（順番を譲らせる）、削除の3者が触る。
+	splatMu sync.Mutex
+	// splat は実行中の 3DGS の学習（無ければ nil）。詳しくは splat.go。
+	splat *runningSplat
+	// splatWake は 3DGS のワーカーを起こす合図。
+	splatWake chan struct{}
 }
 
 // New は Service を作る。
@@ -59,9 +69,10 @@ func New(st store.Store, root *workspace.Root, pipe Pipeline, cfg config.Jobs, l
 	}
 	return &Service{
 		store: st, root: root, pipe: pipe, cfg: cfg, log: log,
-		now:     time.Now,
-		running: map[string]context.CancelFunc{},
-		wake:    make(chan struct{}, 1),
+		now:       time.Now,
+		running:   map[string]context.CancelFunc{},
+		wake:      make(chan struct{}, 1),
+		splatWake: make(chan struct{}, 1),
 	}
 }
 
@@ -95,7 +106,7 @@ func (s *Service) Recover(ctx context.Context) error {
 	if len(requeued) > 0 {
 		s.Notify()
 	}
-	return nil
+	return s.recoverSplats(ctx, s.log)
 }
 
 // Run はワーカーのループ。ctx が終わるまで戻らない（goroutine として起動する）。
@@ -110,6 +121,8 @@ func (s *Service) Run(ctx context.Context) {
 			s.log.Error("ジョブの取得に失敗", "error", err)
 		}
 		if worked {
+			// 待ち行列が空になっていれば、3DGS のワーカーが学習を始められる。
+			s.NotifySplat()
 			continue // 待ち行列にまだあるかもしれないので、待たずに次を見る
 		}
 		// 合図が来るか、一定時間が経つまで待つ。定期的にも見るのは、合図を取りこぼしても
@@ -130,6 +143,8 @@ func (s *Service) processNext(ctx context.Context) (worked bool, err error) {
 	if err != nil || sc == nil {
 		return false, err
 	}
+	// 3DGS を学習中なら、止めて順番を譲らせる（CPU を取り合わないように）。
+	s.yieldSplat()
 	s.runJob(ctx, *sc)
 	return true, nil
 }
@@ -172,7 +187,7 @@ func (s *Service) runJob(ctx context.Context, sc scan.Scan) {
 	log.Info("ジョブを開始", "frames", sc.FrameCount)
 	start := s.now()
 	rep := &reporter{store: s.store, ws: ws, scanID: sc.ID, now: s.now, log: log, started: map[scan.StepName]time.Time{}}
-	runErr := s.pipe.Run(jobCtx, reconstruction.Job{ID: sc.ID, WS: ws}, rep)
+	runErr := s.pipe.Run(jobCtx, reconstruction.Job{ID: sc.ID, WS: ws, DeferSplat: s.cfg.DeferSplat}, rep)
 
 	switch {
 	case ctx.Err() != nil:
@@ -209,11 +224,29 @@ func (s *Service) runJob(ctx context.Context, sc scan.Scan) {
 	}
 	if out.Saved {
 		// 長く残すので、表示に要らない中間ファイルを消して容量を空ける。失敗しても結果には影響しない。
+		// 3DGS の学習に要るもの（images/ と sparse/0/）は消さない。
 		if err := ws.PruneIntermediate(); err != nil {
 			log.Warn("中間ファイルを消せません", "error", err)
 		}
 	}
-	log.Info("ジョブが終了", "status", out.Status, "saved", out.Saved, "duration", s.now().Sub(start).Round(time.Second))
+	// 3DGS をあとで作る場合（パイプラインが splat を実行せずに戻った）は、待ち行列に入れる。
+	splatDeferred := out.Status.Keepable() && stepStatus(detail.Steps, scan.StepSplat) == scan.StepPending
+	if splatDeferred {
+		if err := s.EnqueueSplat(ctx, sc.ID); err != nil {
+			log.Error("3DGS を待ち行列に入れられません", "error", err)
+		}
+	}
+	log.Info("ジョブが終了", "status", out.Status, "saved", out.Saved, "splatDeferred", splatDeferred,
+		"duration", s.now().Sub(start).Round(time.Second))
+}
+
+func stepStatus(steps []scan.Step, name scan.StepName) scan.StepStatus {
+	for _, st := range steps {
+		if st.Name == name {
+			return st.Status
+		}
+	}
+	return ""
 }
 
 // finish は終了状態を記録する。running でなかった場合は false。
@@ -264,6 +297,8 @@ func (s *Service) Remove(ctx context.Context, id string) (Removal, error) {
 	if err != nil {
 		return "", store.ErrNotFound
 	}
+	// 3DGS を学習中なら先に止める（OpenSplat が書いている最中にファイルを消さない）。
+	s.stopSplat(id)
 	// 先に DB の状態を cancelled にする。こうしておけば、止めている最中にワーカーが完了しても
 	// Finish は running の行にしか効かないので、結果が成功で上書きされることはない。
 	prev, changed, err := s.store.Cancel(ctx, id, s.now())

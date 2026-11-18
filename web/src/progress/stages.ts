@@ -140,11 +140,16 @@ export function headline(scan: Scan): Headline {
       };
     }
     case 'succeeded':
+      if (scan.splatJob) {
+        return { title: '完成しました', detail: `メッシュを3Dビューアで確認できます。${splatJobText(scan)}`, tone: 'good' };
+      }
       return { title: '完成しました', detail: '3Dビューアで確認できます。', tone: 'good' };
     case 'partial':
       return {
         title: '一部が完成しました',
-        detail: scan.error?.message ?? '失敗した処理があります。成功した出力は閲覧できます。',
+        detail:
+          (scan.error?.message ?? '失敗した処理があります。成功した出力は閲覧できます。') +
+          (scan.splatJob ? splatJobText(scan) : ''),
         tone: 'warn',
       };
     case 'failed':
@@ -154,6 +159,20 @@ export function headline(scan: Scan): Headline {
     case 'expired':
       return { title: '保存期限が過ぎました', detail: '写真と結果は削除されました。', tone: 'neutral' };
   }
+}
+
+/**
+ * あとで作る 3DGS の状況を一言にする。無ければ空文字。
+ * 3DGS は手が空いたときに学習し、新しいスキャンが来たらそちらを先に処理する（サーバーの設定による）。
+ */
+export function splatJobText(scan: Pick<Scan, 'splatJob'>): string {
+  const job = scan.splatJob;
+  if (!job) return '';
+  if (job.status === 'running') return '3DGS を学習しています。この画面を閉じても続きます。';
+  const ahead = job.queuePosition ?? 0;
+  return ahead > 0
+    ? `3DGS はあとで作ります（前に${ahead}件）。`
+    : '3DGS はあとで作ります。新しいスキャンがあれば、そちらを先に処理します。';
 }
 
 /** ミリ秒を「3分12秒」のような表記にする。 */

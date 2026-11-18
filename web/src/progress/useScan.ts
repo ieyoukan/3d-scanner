@@ -11,6 +11,13 @@ import { ApiError, fetchScan } from '../api/client';
 import { isTerminal, type Scan } from '../api/types';
 
 const pollIntervalMs = 2000;
+/** 完成した後、3DGS だけを待っている間の間隔。学習は数十分かかるので、頻繁に聞かない。 */
+const splatPollIntervalMs = 5000;
+
+/** もう問い合わせなくてよいか（終了していて、あとで作る 3DGS も残っていない）。 */
+export function settled(scan: Scan): boolean {
+  return isTerminal(scan.status) && !scan.splatJob;
+}
 
 export type ScanLoad =
   | { kind: 'loading' }
@@ -36,7 +43,7 @@ export function useScan(id: string) {
         const scan = await fetchScan(id, controller.signal);
         last.current = scan;
         setLoad({ kind: 'ready', scan, stale: false });
-        if (isTerminal(scan.status)) return; // 終了。もう問い合わせない
+        if (settled(scan)) return; // 終了。もう問い合わせない
       } catch (err) {
         if (controller.signal.aborted) return;
         if (err instanceof ApiError && err.status === 404) {
@@ -51,7 +58,8 @@ export function useScan(id: string) {
         }
       }
       // タブが裏にある間は問い合わせない（電池と通信量の節約）。表に戻ったら onVisible が再開する。
-      if (!document.hidden) timer = window.setTimeout(() => void tick(), pollIntervalMs);
+      const interval = last.current && isTerminal(last.current.status) ? splatPollIntervalMs : pollIntervalMs;
+      if (!document.hidden) timer = window.setTimeout(() => void tick(), interval);
     };
 
     const onVisible = () => {

@@ -24,6 +24,11 @@ func (f pipelineFunc) Run(ctx context.Context, job reconstruction.Job, rep recon
 	return f(ctx, job, rep)
 }
 
+// RunSplat は呼ばれない想定（これらのテストは 3DGS をその場で作る設定で動かす）。
+func (f pipelineFunc) RunSplat(context.Context, reconstruction.Job, reconstruction.Reporter) error {
+	return errors.New("pipelineFunc は RunSplat に対応していません")
+}
+
 // env はテスト1件ぶんの部品一式。
 type env struct {
 	t     *testing.T

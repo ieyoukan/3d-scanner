@@ -9,6 +9,7 @@
 //   ブラウザは <img> を表示するとき、画像を画素に展開してメモリに持つ。
 //   1920×1440 の写真は展開すると約 11MB。80 枚並べるとスマホのメモリを使い切り、
 //   タブが落ちることがある。一覧には 320px に縮めたサムネイルだけを使う。
+import { focalLength35mmOf } from './exif';
 import { laplacianVariance, toGray } from './sharpness';
 
 export type FrameSource = 'camera' | 'file';
@@ -23,6 +24,12 @@ export interface Frame {
   capturedAt: string;
   source: FrameSource;
   sharpness: number;
+  /**
+   * 写真の EXIF にあった 35mm 換算の焦点距離（mm）。無ければ null。
+   * 縮小し直すと EXIF は消えるので、その前に読んでおいてメタデータで送る（SfM の初期値になる）。
+   * 映像から切り出したコマには EXIF が無いので、いつも null。
+   */
+  focalLength35mm: number | null;
 }
 
 /** サムネイルの長辺（画素）。 */
@@ -55,6 +62,7 @@ export async function frameFromCapture(blob: Blob): Promise<Frame> {
       capturedAt: new Date().toISOString(),
       source: 'camera',
       sharpness,
+      focalLength35mm: null,
     };
   } finally {
     // ImageBitmap は展開済みの画素を持つ。使い終わったらすぐ解放する。
@@ -73,11 +81,33 @@ export async function frameFromCapture(blob: Blob): Promise<Frame> {
  *     1枚を数百KB〜2MB 程度に抑える必要がある。
  */
 export async function frameFromFile(file: File): Promise<Frame> {
+  return frameFromImage(file, {
+    name: `「${file.name}」`,
+    source: 'file',
+    // ファイルの更新時刻を撮影時刻の代わりにする（厳密ではないが、並び順の手掛かりになる）。
+    capturedAt: new Date(file.lastModified || Date.now()).toISOString(),
+  });
+}
+
+/**
+ * カメラの静止画（ImageCapture.takePhoto の結果）から Frame を作る。
+ * 映像のコマより画質が良く、端末によっては EXIF（焦点距離）も付く。大きいので写真ファイルと同じく縮小する。
+ */
+export async function frameFromPhoto(blob: Blob): Promise<Frame> {
+  return frameFromImage(blob, { name: '撮った写真', source: 'camera', capturedAt: new Date().toISOString() });
+}
+
+async function frameFromImage(
+  file: Blob,
+  meta: { name: string; source: FrameSource; capturedAt: string },
+): Promise<Frame> {
+  // 縮小し直すと EXIF が消えるので、先に読んでおく。
+  const focalLength35mm = await focalLength35mmOf(file);
   let bitmap: ImageBitmap;
   try {
     bitmap = await decode(file);
   } catch {
-    throw new FrameError(`「${file.name}」を画像として読み込めませんでした。`);
+    throw new FrameError(`${meta.name}を画像として読み込めませんでした。`);
   }
   try {
     const supported = file.type === 'image/jpeg' || file.type === 'image/png';
@@ -99,10 +129,10 @@ export async function frameFromFile(file: File): Promise<Frame> {
       thumbUrl,
       width,
       height,
-      // ファイルの更新時刻を撮影時刻の代わりにする（厳密ではないが、並び順の手掛かりになる）。
-      capturedAt: new Date(file.lastModified || Date.now()).toISOString(),
-      source: 'file',
+      capturedAt: meta.capturedAt,
+      source: meta.source,
       sharpness,
+      focalLength35mm,
     };
   } finally {
     bitmap.close();

@@ -122,6 +122,11 @@ export async function localizeFrame(scanId: string, image: Blob, signal?: AbortS
   return (await res.json()) as LocalizeResult;
 }
 
+/** 3DGS を（作り直しを含めて）あとで作る待ち行列に入れる。 */
+export async function requestSplat(id: string): Promise<void> {
+  await ensureOk(await fetch(`/api/scans/${encodeURIComponent(id)}/splat`, { method: 'POST' }));
+}
+
 export function fetchSceneInfo(url: string, signal?: AbortSignal): Promise<SceneInfo> {
   return getJSON<SceneInfo>(url, signal);
 }

@@ -35,7 +35,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Limits.MaxUploadBytes >= 100*1024*1024 {
 		t.Errorf("MaxUploadBytes = %d（100MB 未満のはず）", cfg.Limits.MaxUploadBytes)
 	}
-	if cfg.Jobs.Retention != 24*time.Hour || cfg.Jobs.MaxAttempts != 2 || !cfg.Jobs.KeepCompleted {
+	if cfg.Jobs.Retention != 24*time.Hour || cfg.Jobs.MaxAttempts != 2 || !cfg.Jobs.KeepCompleted ||
+		!cfg.Jobs.DeferSplat || !cfg.Jobs.SplatYield {
 		t.Errorf("Jobs = %+v", cfg.Jobs)
 	}
 	p := cfg.Pipeline

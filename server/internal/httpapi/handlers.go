@@ -16,6 +16,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/ieyoukan/3d-scanner/server/internal/reconstruction"
 	"github.com/ieyoukan/3d-scanner/server/internal/scan"
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
 	"github.com/ieyoukan/3d-scanner/server/internal/thumbnail"
@@ -296,6 +297,14 @@ func (s *Server) createScan(w http.ResponseWriter, r *http.Request, parent *scan
 		return
 	}
 
+	// 撮影側が写真の EXIF から読んだ焦点距離があれば、位置推定の手掛かりとして残す（reconstruction.CameraHint）。
+	if focal, ok := upload.FocalHint(res.Frames); ok {
+		hint := reconstruction.CameraHint{FocalLength35mm: focal, Width: res.Frames[0].Width, Height: res.Frames[0].Height}
+		if err := reconstruction.WriteCameraHint(ws, hint); err != nil {
+			s.log.Warn("焦点距離の手掛かりを保存できません", "scan", id, "error", err)
+		}
+	}
+
 	// ギャラリー用の縮小画像を、1枚目の写真から作っておく。失敗しても受付は続ける（一覧で画像が出ないだけ）。
 	// 続きの版は元の版の縮小画像を引き継いでいる（一覧で同じ見た目にする）ので、無いときだけ作る。
 	if _, err := os.Stat(ws.ThumbnailPath()); err != nil && len(res.Frames) > 0 {
@@ -360,11 +369,23 @@ type scanResponse struct {
 	Resumable bool `json:"resumable"`
 	// Continuations はこの版を元にした続きの版（新しい順）。
 	Continuations []continuationResponse `json:"continuations"`
+	// SplatJob は、あとで作る 3DGS が待ち行列にあればその状況（無ければ省略）。
+	SplatJob *splatJobResponse `json:"splatJob,omitempty"`
 	// QueuePosition は自分より前に並んでいる件数（queued のときだけ入る）。
 	QueuePosition *int            `json:"queuePosition,omitempty"`
 	Error         *errorDetail    `json:"error"`
 	Steps         []stepResponse  `json:"steps"`
 	Assets        []assetResponse `json:"assets"`
+}
+
+// splatJobResponse は、あとで作る 3DGS の状況。
+type splatJobResponse struct {
+	// Status は "queued"（順番待ち）か "running"（学習中）。
+	Status scan.SplatJobStatus `json:"status"`
+	// QueuePosition は自分より前に並んでいる 3DGS の件数（順番待ちのときだけ入る）。
+	QueuePosition *int `json:"queuePosition,omitempty"`
+	// Attempts は着手した回数（新しいスキャンに順番を譲った回は数えない）。
+	Attempts int `json:"attempts"`
 }
 
 // continuationResponse は続きの版1件の概要。
@@ -428,6 +449,14 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		ParentID: sc.ParentID, BaseFrameCount: sc.BaseFrameCount, Resumable: s.resumable(sc),
 		Continuations: []continuationResponse{},
 		Steps:         []stepResponse{}, Assets: []assetResponse{},
+	}
+	if d.Splat != nil {
+		resp.SplatJob = &splatJobResponse{Status: d.Splat.Status, Attempts: d.Splat.Attempts}
+		if d.Splat.Status == scan.SplatQueued {
+			if pos, err := s.store.SplatQueuePosition(r.Context(), sc.ID); err == nil {
+				resp.SplatJob.QueuePosition = &pos
+			}
+		}
 	}
 	if children, err := s.store.Children(r.Context(), sc.ID); err == nil {
 		for _, c := range children {
@@ -577,9 +606,10 @@ func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", info.ContentType)
-	// 成果物は一度出来たら変わらないので、利用者のブラウザ内に限って短時間キャッシュさせる
-	// （private: 途中の共有キャッシュには保存させない）。タブを切り替えるたびの再取得を減らす。
-	w.Header().Set("Cache-Control", "private, max-age=600")
+	// 3DGS は作り直すと同じ URL のまま中身が変わるので、使うたびにブラウザに確かめさせる（no-cache）。
+	// 変わっていなければ ServeContent が更新時刻を見て 304 を返すので、ファイル本体は送り直さない。
+	// private: 途中の共有キャッシュには保存させない。
+	w.Header().Set("Cache-Control", "private, no-cache")
 	if dl, _ := strconv.ParseBool(r.URL.Query().Get("download")); dl {
 		// attachment を付けると、ブラウザは表示せずファイルとして保存する。
 		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": info.DownloadName}))
@@ -626,6 +656,8 @@ type galleryItem struct {
 	// ParentID は元の版（「続きを撮る」で作った場合）。BaseFrameCount は引き継いだ写真の枚数。
 	ParentID       string `json:"parentId,omitempty"`
 	BaseFrameCount int    `json:"baseFrameCount"`
+	// SplatPending は 3DGS をあとで作る予定（順番待ちか学習中）かどうか。
+	SplatPending bool `json:"splatPending"`
 }
 
 type galleryResponse struct {
@@ -684,6 +716,7 @@ func (s *Server) handleListScans(w http.ResponseWriter, r *http.Request) {
 			ID: sc.ID, Status: sc.Status, Title: sc.Title, CreatedAt: sc.CreatedAt, FinishedAt: sc.FinishedAt,
 			ExpiresAt: sc.ExpiresAt, Saved: sc.Saved, FrameCount: sc.FrameCount, AssetKinds: kinds,
 			ThumbnailURL: s.thumbnailURL(sc), ParentID: sc.ParentID, BaseFrameCount: sc.BaseFrameCount,
+			SplatPending: row.SplatPending,
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -899,6 +932,45 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("位置合わせ", "scan", d.Scan.ID, "localized", out.Localized, "matches", out.Matches,
 		"compared", out.ComparedImages, "duration", elapsed.Round(time.Millisecond))
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---------------------------------------------------------------------------
+// 3DGS の作り直し
+// ---------------------------------------------------------------------------
+
+// handleMakeSplat は、完成したスキャンの 3DGS を待ち行列に入れる（POST /api/scans/{id}/splat）。
+//
+// 使いどころ: GPU を使えるようになった後や、反復回数（SPLAT_ITERATIONS）を増やした後に、
+// 保存済みのスキャンの 3DGS を作り直す。前の 3DGS は、新しいものが出来るまで見られるまま残る。
+// 学習は位置推定の結果（images/ と sparse/0/）から行うので、地図が残っているスキャンだけが対象。
+func (s *Server) handleMakeSplat(w http.ResponseWriter, r *http.Request) {
+	d, ok := s.lookup(w, r)
+	if !ok {
+		return
+	}
+	if !s.cfg.Pipeline.EnableSplat {
+		writeError(w, http.StatusConflict, "splat_disabled", "このサーバーでは 3DGS の生成が無効になっています。")
+		return
+	}
+	if !s.resumable(d.Scan) {
+		writeError(w, http.StatusConflict, "not_ready", "3DGS を作れるのは、完成していて位置推定の結果が残っているスキャンだけです。")
+		return
+	}
+	err := s.jobs.EnqueueSplat(r.Context(), d.Scan.ID)
+	switch {
+	case errors.Is(err, store.ErrConflict):
+		writeError(w, http.StatusConflict, "splat_busy", "3DGS はすでに作成待ちか作成中です。")
+		return
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "スキャンが見つかりません。")
+		return
+	case err != nil:
+		s.log.Error("3DGS を待ち行列に入れられません", "scan", d.Scan.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal", "3DGS の作成を受け付けられませんでした。")
+		return
+	}
+	s.log.Info("3DGS の作成を受け付けました", "scan", d.Scan.ID)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": string(scan.SplatQueued)})
 }
 
 // ---------------------------------------------------------------------------

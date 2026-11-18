@@ -101,6 +101,7 @@ func run(log *slog.Logger) error {
 	// ワーカーと掃除係を goroutine として起動する。WaitGroup で「全員が終わるまで待つ」ことができる。
 	var wg sync.WaitGroup
 	wg.Go(func() { svc.Run(ctx) })
+	wg.Go(func() { svc.RunSplats(ctx) })
 	wg.Go(func() { svc.RunJanitor(ctx) })
 
 	// 位置合わせ（VPS）。前回のプロセスが消し損ねた一時ファイルを先に片付ける。
@@ -180,6 +181,7 @@ func pipelineInfo(cfg config.Config, caps reconstruction.Capabilities, p *recons
 		SplatDevice:     "gpu",
 		ColmapVersion:   caps.ColmapVersion,
 		ColmapGPU:       caps.ColmapGPU,
+		SplatDeferred:   cfg.Pipeline.EnableSplat && cfg.Jobs.DeferSplat,
 	}
 	if p.DenseMesh() {
 		info.MeshMode = "dense"

@@ -52,9 +52,30 @@ func (fakePipeline) Run(ctx context.Context, job reconstruction.Job, rep reconst
 	rep.StepStarted(ctx, scan.StepMesh)
 	write(scan.AssetMeshGLB, "mesh.glb", "glTF-0123456789")
 	rep.StepFinished(ctx, scan.StepMesh, scan.StepSucceeded, "")
+	if job.DeferSplat {
+		return nil // 本物と同じく、メッシュが出来たら 3DGS は後回しにする
+	}
 	rep.StepStarted(ctx, scan.StepSplat)
 	rep.StepFinished(ctx, scan.StepSplat, scan.StepFailed, "メモリ不足の可能性があります。")
 	rep.StepFinished(ctx, scan.StepSOG, scan.StepSkipped, "")
+	return nil
+}
+
+// RunSplat は 3DGS の学習と圧縮が成功したことにする。
+func (fakePipeline) RunSplat(ctx context.Context, job reconstruction.Job, rep reconstruction.Reporter) error {
+	for _, a := range []struct {
+		kind scan.AssetKind
+		name string
+		data string
+	}{{scan.AssetGaussianPLY, "splat.ply", "ply\nsplat"}, {scan.AssetGaussianSOG, "scene.sog", "PK-sog"}} {
+		path := filepath.Join(job.WS.OutputDir(), a.name)
+		os.WriteFile(path, []byte(a.data), 0o640)
+		rep.AssetReady(ctx, a.kind, path, int64(len(a.data)))
+	}
+	rep.StepStarted(ctx, scan.StepSplat)
+	rep.StepFinished(ctx, scan.StepSplat, scan.StepSucceeded, "")
+	rep.StepStarted(ctx, scan.StepSOG)
+	rep.StepFinished(ctx, scan.StepSOG, scan.StepSucceeded, "")
 	return nil
 }
 
@@ -848,4 +869,103 @@ func TestLocalize(t *testing.T) {
 
 	wantError(t, e.do("POST", "/api/scans/"+id+"/localize", strings.NewReader("{}"), header("Content-Type", "application/json")),
 		http.StatusUnsupportedMediaType, "unsupported_media_type")
+}
+
+func TestDeferredSplatAndRegenerate(t *testing.T) {
+	e := newTestEnv(t, func(c *config.Config) {
+		c.Pipeline.EnableSplat = true
+		c.Jobs.DeferSplat = true
+	})
+	e.startWorker() // 3DGS のワーカーは動かさない（待ち行列に残ったままを確かめる）
+	id := e.createScan(3)
+	got := e.waitScan(id)
+	// 完成の記録の直後に待ち行列に入るので、少し待つ。
+	for deadline := time.Now().Add(5 * time.Second); got.SplatJob == nil && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+		got = decode[scanResponse](t, e.do("GET", "/api/scans/"+id, nil))
+	}
+	if got.Status != scan.StatusSucceeded {
+		t.Fatalf("status = %s（メッシュが出来た時点で完成のはず）", got.Status)
+	}
+	if got.SplatJob == nil || got.SplatJob.Status != scan.SplatQueued || got.SplatJob.QueuePosition == nil || *got.SplatJob.QueuePosition != 0 {
+		t.Fatalf("splatJob = %+v（順番待ちのはず）", got.SplatJob)
+	}
+	page := decode[galleryResponse](t, e.do("GET", "/api/scans", nil))
+	if len(page.Items) != 1 || !page.Items[0].SplatPending {
+		t.Fatalf("一覧 = %+v", page.Items)
+	}
+	// 既に待ち行列にあるので、作り直しは受け付けない。
+	wantError(t, e.do("POST", "/api/scans/"+id+"/splat", nil), http.StatusConflict, "splat_busy")
+
+	// 3DGS のワーカーを動かすと、待ち行列から学習して片付く。
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { e.jobs.RunSplats(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	e.jobs.NotifySplat()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s := decode[scanResponse](t, e.do("GET", "/api/scans/"+id, nil))
+		if s.SplatJob == nil && len(s.Assets) >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("3DGS が出来ない: %+v", s)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 作り直し（GPU を使えるようになった後など）。
+	rec := e.do("POST", "/api/scans/"+id+"/splat", nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("作り直し = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 成果物は作り直すと中身が変わるので、使うたびに確かめさせる（no-cache）。
+	asset := e.do("GET", "/api/scans/"+id+"/assets/mesh_glb", nil)
+	if cc := asset.Header().Get("Cache-Control"); cc != "private, no-cache" {
+		t.Fatalf("Cache-Control = %q", cc)
+	}
+}
+
+func TestMakeSplatRejections(t *testing.T) {
+	e := newTestEnv(t, func(c *config.Config) { c.Pipeline.EnableSplat = true })
+	id := e.createScan(3) // 処理前（地図が無い）
+	wantError(t, e.do("POST", "/api/scans/"+id+"/splat", nil), http.StatusConflict, "not_ready")
+	wantError(t, e.do("POST", "/api/scans/00000000-0000-4000-8000-000000000000/splat", nil), http.StatusNotFound, "not_found")
+	wantError(t, e.do("POST", "/api/scans/"+id+"/splat", nil, header("Origin", "https://evil.example")), http.StatusForbidden, "cross_origin")
+
+	off := newTestEnv(t, nil) // ENABLE_SPLAT=false
+	off.startWorker()
+	id = off.createScan(3)
+	off.waitScan(id)
+	wantError(t, off.do("POST", "/api/scans/"+id+"/splat", nil), http.StatusConflict, "splat_disabled")
+}
+
+// TestFocalHintIsSaved: 撮影側が送った焦点距離（EXIF から読んだ値）を、位置推定の手掛かりとして保存する。
+func TestFocalHintIsSaved(t *testing.T) {
+	e := newTestEnv(t, nil)
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for i := 0; i < 3; i++ {
+		fw, _ := w.CreateFormFile("images", "IMG.jpg")
+		fw.Write(photo(t, uint8(i+1)))
+	}
+	w.WriteField("metadata", `{"frames":[{"focalLength35mm":26},{"focalLength35mm":26},{"focalLength35mm":26}]}`)
+	w.Close()
+	rec := e.do("POST", "/api/scans", &body, header("Content-Type", w.FormDataContentType()))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("アップロード = %d %s", rec.Code, rec.Body.String())
+	}
+	ws, _ := e.root.Scan(decode[createResponse](t, rec).ID)
+	hint, ok := reconstruction.ReadCameraHint(ws)
+	if !ok || hint != (reconstruction.CameraHint{FocalLength35mm: 26, Width: 64, Height: 48}) {
+		t.Fatalf("手掛かり = %+v, %v", hint, ok)
+	}
+	// 送られていなければ作らない。
+	id := e.createScan(3)
+	ws, _ = e.root.Scan(id)
+	if _, ok := reconstruction.ReadCameraHint(ws); ok {
+		t.Fatal("焦点距離が無いのに手掛かりを作った")
+	}
 }

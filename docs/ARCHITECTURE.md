@@ -20,6 +20,8 @@
 - PostgreSQL でジョブの状態を管理し、写真と成果物は PVC に保存。保存期限で自動削除。
 - アクセス制限はアプリに持たせず、前段の Cloudflare Access に任せる（同一オリジン確認だけ行う）。
 - ギャラリー（完成したものを保存）と、続きを撮る（VPS による位置合わせと、撮り足した写真での作り直し）。
+- 3DGS の後回し（メッシュで完成にし、3DGS は別の待ち行列で学習。新しいスキャンに順番を譲る）。
+- 撮影の補助: 自動撮影、静止画での撮影、写真の焦点距離（EXIF）を位置推定の初期値に使う。
 - Dockerfile、docker compose、Helm chart、GitHub Actions。
 
 ### MVP で実装していないもの
@@ -132,6 +134,7 @@ API とワーカーを同じ Pod・同じプロセスにしているのは、作
 
 後から足した列: `scans.saved`・`title`（`0002_gallery.sql`、ギャラリー）、`scans.parent_id`・`base_frame_count`
 （`0003_resume.sql`、続きの版が前の版を指す。前の版を消すと NULL になり、続きの版は残る）。
+後から足したテーブル: `splat_jobs`（`0004_splat_jobs.sql`、あとで作る 3DGS の待ち行列。待っている間と学習中だけ行がある）。
 
 `scan_frames.captured_at` と `camera`（JSONB）、`scans.capture_meta`（JSONB）は MVP では
 記録するだけだが、VPS や ARCore を足すときに列を増やさず項目を追加できるようにしてある。
@@ -160,6 +163,7 @@ API とワーカーを同じ Pod・同じプロセスにしているのは、作
 | `GET /api/scans/{id}/assets/{kind}` | 成果物。末尾に `/scene.sog` のようなファイル名を付けてもよい |
 | `GET /api/scans/{id}/thumbnail` | ギャラリー用の縮小画像（受付時に1枚目の写真から作る JPEG、長辺 480） |
 | `POST /api/scans/{id}/localize` | 位置合わせ（VPS）。項目 `image` に写真 1 枚。地図の座標系での位置・向き・一致した 3D 点の数を返す（同期。制限 80 秒） |
+| `POST /api/scans/{id}/splat` | 3DGS を（作り直しを含めて）待ち行列に入れる。`202`。既に入っていれば `409` |
 | `POST /api/scans/{id}/resume` | 続きを撮る。`POST /api/scans` と同じ形（1 枚から）。前の版を引き継いだ新しい版を登録して `202` |
 | `PATCH /api/scans/{id}` | 名前の変更（`{"title": "..."}`、80 文字まで） |
 | `DELETE /api/scans/{id}` | 処理中ならキャンセル、終了済みなら削除 |
@@ -226,6 +230,30 @@ COLMAP が書き換える `database.db` だけは、ワーカーが処理の始�
   gltfpack は PLY を読めないので、Go で OBJ + MTL に書き直す（`reconstruction/obj.go`）。
 - メッシュの作り方は `MESH_MODE`（`auto` / `dense` / `sparse`）で決まる。`auto` は
   `colmap version` の表示（`with CUDA` / `without GPU support`）で判定する。
+
+### 3DGS の後回し
+
+`SPLAT_DEFERRED=true`（既定）のとき、ワーカーは `sfm` → `mvs` → `mesh` までで止まり、メッシュが出来ていれば
+スキャンを完成（`succeeded` / `partial`、保存）にして、3DGS を `splat_jobs` に入れる。`splat` / `sog` のステップは
+`pending` のまま「あとで作ります」と表示する。メッシュが出来なかったときは、見られるものを作るためその場で 3DGS も学習する。
+
+3DGS のワーカー（`jobs/splat.go`）は別の goroutine で、待ち行列から1件ずつ学習する。
+
+- `SPLAT_YIELD=true`（CPU 向けの既定）: 位置推定・メッシュの待ち（queued / running）がある間は始めない。
+  学習中にワーカーが新しいスキャンを取り出したら、学習を止めて待ち行列の元の位置に戻す（着手回数に数えない）。
+  OpenSplat は途中から再開できないので、後で最初からやり直す。
+- `SPLAT_YIELD=false`（GPU 向け）: 新しいスキャンと並行して学習する。
+- 学習結果は別名（`splat.new.ply` / `scene.new.sog`）に書き、検証を通ってから置き換える。作り直しに失敗しても前の 3DGS は残る。
+  成果物は作り直すと同じ URL のまま中身が変わるので、`Cache-Control: private, no-cache`（変わっていなければ 304）にした。
+- 再起動で中断された学習は、起動時に待ち行列へ戻す。3 回中断されたら 3DGS を失敗にし、スキャンを `partial` にする。
+- 削除・期限切れのときは、学習を止めて終わるのを待ってからファイルを消す。
+
+### 焦点距離の手掛かり
+
+撮影側は送る前に写真の EXIF から 35mm 換算の焦点距離（`FocalLengthIn35mmFilm`）を読み、メタデータで送る
+（ブラウザで縮小し直すと EXIF は消える）。サーバーは写真がすべて同じ寸法で、半分以上に値があり、それらが ±5% に
+収まるときだけ `camera_hint.json` に残し、`feature_extractor --ImageReader.camera_params f,cx,cy,0` で
+SIMPLE_RADIAL の初期値として渡す（`f = f35 × 対角線[px] ÷ 43.27`）。COLMAP はこれを事前値（Prior）として扱う。
 
 続きの版（`base/` がある）の `sfm` は、前の版の結果から始める:
 
@@ -314,4 +342,5 @@ Helm chart の要点（詳細は `charts/3d-scanner/values.yaml` のコメント
 | アップロード | 分割アップロードの検討 | 1 リクエスト＋ブラウザ側での縮小 | 長辺 2048px に縮めれば 80 枚でも 100MB に収まる。分割は必要になってから |
 | 公開 URL | `scanner.youkan.uk` は候補 | Application の values で指定 | DNS とトンネルの経路は Ingress Controller が作る。実際の公開はマージ後 |
 | 保存期間 | すべて 24 時間で削除（長期保存は範囲外） | 完成したものはギャラリーに保存して残す（`KEEP_COMPLETED`、既定 true） | 利用者の要望。撮った 3D データを手元に残したい。失敗・中止したものは従来どおり期限で消す |
+| 3DGS の作成時期 | メッシュと続けて作る | 既定はあとで作る（`SPLAT_DEFERRED`）。新しいスキャンに順番を譲る（`SPLAT_YIELD`） | GPU が無く CPU で数十分かかるため。メッシュを先に見られるようにし、GPU を入れたら作り直せるようにした |
 | VPS | 次のフェーズ | 写真 1 枚の位置合わせと、続きを撮る（前の版を引き継いだ新しい版） | 利用者の要望。保存した 3D データに後から撮り足したい。前の版を書き換えないので、追加がうまくいかなくても元に戻す必要がない |

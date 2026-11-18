@@ -150,6 +150,8 @@ const MaxTitleLength = 80
 type Summary struct {
 	Scan       Scan
 	AssetKinds []AssetKind
+	// SplatPending は 3DGS をあとで作る予定（順番待ちか学習中）かどうか。
+	SplatPending bool
 }
 
 // Frame はアップロードされた写真1枚。DB の scan_frames テーブル1行に対応する。
@@ -192,6 +194,26 @@ type Detail struct {
 	Scan   Scan
 	Steps  []Step
 	Assets []Asset
+	// Splat は、あとで作る 3DGS の待ち行列に入っていればその状況（無ければ nil）。
+	Splat *SplatJob
+}
+
+// SplatJobStatus は、あとで作る 3DGS の学習の状態。
+type SplatJobStatus string
+
+const (
+	// SplatQueued: 順番を待っている（新しいスキャンの処理が先）。
+	SplatQueued SplatJobStatus = "queued"
+	// SplatRunning: 学習している。
+	SplatRunning SplatJobStatus = "running"
+)
+
+// SplatJob は、あとで作る 3DGS の待ち行列の1件。DB の splat_jobs テーブル1行に対応する。
+type SplatJob struct {
+	Status    SplatJobStatus
+	QueuedAt  time.Time
+	StartedAt *time.Time
+	Attempts  int
 }
 
 // Viewable は「3Dビューアで見られる成果物」かどうか。

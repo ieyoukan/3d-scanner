@@ -17,6 +17,10 @@ import (
 // ErrNotFound は指定した ID のスキャンが無いことを表す。
 var ErrNotFound = errors.New("スキャンが見つかりません")
 
+// ErrConflict は、いまの状態ではその操作ができないことを表す
+// （例: 3DGS が既に待ち行列にある、スキャンがまだ完成していない）。
+var ErrConflict = errors.New("いまの状態ではその操作はできません")
+
 // Store はスキャンの保存と状態遷移を提供する。
 //
 // 時刻（now）を引数で受け取るメソッドが多いのは、テストで時間を自由に進められるようにするため。
@@ -93,6 +97,30 @@ type Store interface {
 	// PurgeExpired は expired になってから十分経った行を消し、消した件数を返す。
 	PurgeExpired(ctx context.Context, expiredBefore time.Time) (int, error)
 
+	// ---- あとで作る 3DGS の待ち行列 ----
+
+	// EnqueueSplat は、完成したスキャン（succeeded / partial）の 3DGS を待ち行列に入れ、
+	// splat / sog のステップを「待ち」に戻す。無ければ ErrNotFound、完成していない・既に入っていれば ErrConflict。
+	EnqueueSplat(ctx context.Context, id string, now time.Time) error
+
+	// ClaimNextSplat は待ち行列の先頭（最も古いもの）を running にして、そのスキャンを返す。無ければ (nil, nil)。
+	ClaimNextSplat(ctx context.Context, now time.Time) (*scan.Scan, error)
+
+	// FinishSplat は実行中の 3DGS を待ち行列から外し、スキャン全体の状態を out に更新する。
+	// 戻り値 false は「実行中の行が無かった（削除された等）ので何もしなかった」。
+	FinishSplat(ctx context.Context, id string, out scan.Outcome, now time.Time) (bool, error)
+
+	// RequeueSplat は実行中の 3DGS を、待ち行列の元の位置に戻す（新しいスキャンに順番を譲るとき）。
+	// 譲った回は着手回数に数えない。
+	RequeueSplat(ctx context.Context, id string, now time.Time) error
+
+	// SplatQueuePosition は、指定したスキャンより前に並んでいる 3DGS の件数を返す。
+	SplatQueuePosition(ctx context.Context, id string) (int, error)
+
+	// RecoverSplats は起動時に呼ぶ。running のまま残った 3DGS を、着手回数が上限未満なら待ち行列に戻し、
+	// 上限に達していれば失敗として記録する（3DGS のステップを failed、スキャンを partial にする）。
+	RecoverSplats(ctx context.Context, maxAttempts int, now time.Time) (requeued, failed []string, err error)
+
 	// Close は接続を閉じる。
 	Close() error
 }
@@ -119,4 +147,10 @@ const (
 	interruptedMessage = "サーバーの再起動で処理が中断され、やり直しの上限に達しました。もう一度お試しください。"
 	interruptedStep    = "サーバーの再起動で中断されました。"
 	notRunStep         = "中断されたため実行していません。"
+
+	// 3DGS の待ち行列に入れたときと、新しいスキャンに順番を譲ったときの説明。
+	splatQueuedStep    = "あとで作ります。メッシュを先に仕上げ、手が空いたときに順番に学習します。"
+	splatYieldedStep   = "新しいスキャンを先に処理するため中断しました。あとで最初からやり直します。"
+	splatFailedCode    = "splat_failed"
+	splatFailedMessage = "3DGS の学習がサーバーの再起動で中断を繰り返したため、作れませんでした。メッシュは閲覧できます。"
 )

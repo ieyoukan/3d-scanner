@@ -1,14 +1,14 @@
 // 「/scans/:id」の画面。処理の進行状況を表示し、終わったらビューアへ案内する。
 import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { deleteScan } from '../api/client';
-import { isTerminal, type Scan } from '../api/types';
+import { deleteScan, requestSplat } from '../api/client';
+import { isTerminal, type Scan, type ServerConfig } from '../api/types';
 import { ReconstructionProgress } from '../progress/ReconstructionProgress';
 import { useNow, useScan } from '../progress/useScan';
 import { Button, buttonClass } from '../ui/Button';
 import { AddPhotoIcon, AlertIcon, BackIcon, CheckIcon, CubeIcon, GridIcon, SpinnerIcon } from '../ui/icons';
 
-export function ScanPage() {
+export function ScanPage({ config }: { config: ServerConfig }) {
   const { id = '' } = useParams();
   const { load, refresh } = useScan(id);
   const active = load.kind === 'ready' && !isTerminal(load.scan.status);
@@ -52,13 +52,15 @@ export function ScanPage() {
         )}
       </main>
 
-      {load.kind === 'ready' && <Actions scan={load.scan} onChanged={refresh} />}
+      {load.kind === 'ready' && (
+        <Actions scan={load.scan} splatEnabled={config.pipeline.splatEnabled} onChanged={refresh} />
+      )}
     </div>
   );
 }
 
 /** 画面下部の操作。状態によって出すボタンが変わる。 */
-function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
+function Actions({ scan, splatEnabled, onChanged }: { scan: Scan; splatEnabled: boolean; onChanged: () => void }) {
   const navigate = useNavigate();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,6 +72,28 @@ function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
   const pointsOnly = !viewable && has('sparse_ply');
   const active = !isTerminal(scan.status);
   const gone = scan.status === 'cancelled' || scan.status === 'expired';
+
+  const hasSplat = has('gaussian_sog') || has('gaussian_ply');
+  // 3DGS は、位置推定の結果（地図）が残っている完成したスキャンなら、いつでも作り直せる
+  // （GPU を使えるようになった後や、反復回数を増やした後に）。
+  const canMakeSplat = splatEnabled && !active && scan.resumable && !scan.splatJob;
+
+  const makeSplat = async () => {
+    const question = hasSplat
+      ? '3DGS を作り直します。出来上がるまでは前の 3DGS を表示します。CPU では数十分かかり、新しいスキャンがあればそちらを先に処理します。'
+      : '3DGS を作ります。CPU では数十分かかり、新しいスキャンがあればそちらを先に処理します。';
+    if (!window.confirm(question)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await requestSplat(scan.id);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '受け付けられませんでした。');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const remove = async (question: string) => {
     // 取り消せない操作なので、必ず確認を挟む。
@@ -127,6 +151,14 @@ function Actions({ scan, onChanged }: { scan: Scan; onChanged: () => void }) {
         >
           {scan.parentId ? '前の版から撮り直す' : 'もう一度撮る'}
         </Link>
+      )}
+
+      {canMakeSplat && (
+        <div className="text-right">
+          <button type="button" disabled={busy} onClick={() => void makeSplat()} className="min-h-11 px-2 text-sm text-mute underline underline-offset-4">
+            {hasSplat ? '3DGS を作り直す' : '3DGS を作る'}
+          </button>
+        </div>
       )}
 
       {!active && !gone && (

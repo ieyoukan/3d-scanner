@@ -2,6 +2,7 @@ package upload
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"image"
 	"image/color"
@@ -17,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/ieyoukan/3d-scanner/server/internal/config"
+	"github.com/ieyoukan/3d-scanner/server/internal/scan"
 )
 
 // testLimits はテスト用の小さな上限。
@@ -323,5 +325,33 @@ func TestReceiveWithContinuesNumbering(t *testing.T) {
 	var ue *Error
 	if !errors.As(err, &ue) || !strings.Contains(ue.Message, "2枚目") {
 		t.Fatalf("err = %v（2枚目と伝えるはず）", err)
+	}
+}
+
+func TestFocalHint(t *testing.T) {
+	frame := func(w, h int, camera string) scan.Frame {
+		return scan.Frame{Width: w, Height: h, Camera: json.RawMessage(camera)}
+	}
+	cases := []struct {
+		name   string
+		frames []scan.Frame
+		want   float64
+		ok     bool
+	}{
+		{"全部にある", []scan.Frame{frame(64, 48, `{"focalLength35mm":26}`), frame(64, 48, `{"focalLength35mm":26}`)}, 26, true},
+		{"半分にある", []scan.Frame{frame(64, 48, `{"focalLength35mm":24}`), frame(64, 48, `{}`)}, 24, true},
+		{"半分未満", []scan.Frame{frame(64, 48, `{"focalLength35mm":24}`), frame(64, 48, `{}`), frame(64, 48, ``)}, 0, false},
+		{"寸法が違う", []scan.Frame{frame(64, 48, `{"focalLength35mm":26}`), frame(48, 64, `{"focalLength35mm":26}`)}, 0, false},
+		{"ズームが混ざる", []scan.Frame{frame(64, 48, `{"focalLength35mm":26}`), frame(64, 48, `{"focalLength35mm":52}`)}, 0, false},
+		{"壊れた JSON は無いものとして扱う", []scan.Frame{frame(64, 48, `{"focalLength35mm":"x"}`), frame(64, 48, `{"focalLength35mm":28}`)}, 28, true},
+		{"写真が無い", nil, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := FocalHint(c.frames)
+			if ok != c.ok || got != c.want {
+				t.Fatalf("FocalHint = %v, %v; want %v, %v", got, ok, c.want, c.ok)
+			}
+		})
 	}
 }
