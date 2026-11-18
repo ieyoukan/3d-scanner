@@ -28,6 +28,8 @@ export function CapturePage({ config }: Props) {
   const navigate = useNavigate();
   const { frames, add, remove, clear } = useFrames(limits.maxImages);
   const [phase, setPhase] = useState<Phase>('capture');
+  // 送信中は撮影を止める（自動撮影が、送信中の一覧に写真を足さないように）。
+  const [sending, setSending] = useState(false);
   const [showGuide, setShowGuide] = useState(false);
 
   // frames から計算できる値は state にせず、その場で求める（同じ情報を2か所に持つと食い違う）。
@@ -78,7 +80,7 @@ export function CapturePage({ config }: Props) {
       */}
       <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] lg:gap-4 lg:px-4 lg:pb-4">
         <div className={`min-h-0 overflow-hidden lg:block lg:rounded-xl lg:border lg:border-line ${phase === 'capture' ? '' : 'hidden'}`}>
-          <CaptureView frames={frames} limits={limits} onAdd={add} onReview={() => setPhase('review')} />
+          <CaptureView frames={frames} limits={limits} onAdd={add} onReview={() => setPhase('review')} paused={sending} />
         </div>
 
         <div className={`min-h-0 flex-col lg:flex ${phase === 'review' ? 'flex' : 'hidden'}`}>
@@ -100,6 +102,7 @@ export function CapturePage({ config }: Props) {
               retentionHours={config.retentionHours}
               keepCompleted={config.keepCompleted}
               pipeline={config.pipeline}
+              onSendingChange={setSending}
               onCreated={(result) => {
                 // 送信済みの写真はもう不要。メモリを空けてから移動する。
                 clear();
