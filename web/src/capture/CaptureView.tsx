@@ -58,13 +58,34 @@ function autoHint(advice: AutoAdvice | null, tooFar: boolean): string {
   switch (advice) {
     case 'flat':
       return '模様のある所を写してください。無地だと位置を合わせられません。';
-    case 'move':
-      return '少し横へ移動してください。止まると自動で撮ります。';
+    case 'stop':
     case 'capture':
-      return '撮りました。そのまま少しずつ移動してください。';
+      return '止めてください。止まると撮ります。';
     default:
-      return 'ゆっくり移動して、止まると自動で撮ります。';
+      return 'バーがいっぱいになるまで、横へ少し移動してください。';
   }
+}
+
+/**
+ * 自動撮影の進み具合。左から「移動 → 止める → 撮る」の順に進むことが目で分かるようにする。
+ *   移動  前の写真から景色がどれだけ変わったか（白いバーが伸びる）
+ *   止める  十分変わった（バーが黄色になる）。止まれば撮る
+ */
+function AutoMeter({ advice, progress }: { advice: AutoAdvice | null; progress: number }) {
+  if (advice === null || advice === 'flat') return null;
+  const ready = advice !== 'move';
+  return (
+    <div className="mx-auto mb-2 flex max-w-xs items-center gap-2 text-xs">
+      <span className={ready ? 'text-mute' : 'text-paper'}>移動</span>
+      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/25">
+        <div
+          className={`h-full rounded-full transition-[width] duration-150 ${ready ? 'bg-amber' : 'bg-paper'}`}
+          style={{ width: `${Math.round((ready ? 1 : progress) * 100)}%` }}
+        />
+      </div>
+      <span className={ready ? 'font-semibold text-amber' : 'text-mute'}>止める</span>
+    </div>
+  );
 }
 
 interface Props {
@@ -100,6 +121,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const stillBroken = useRef(false);
   const stillAvailable = camera.state.kind === 'ready' && camera.state.still && !stillBroken.current;
   const [advice, setAdvice] = useState<AutoAdvice | null>(null);
+  const [progress, setProgress] = useState(0);
   const [tooFar, setTooFar] = useState(false);
 
   // 以前にカメラを許可済みなら、ボタンを押させずにすぐ開始する。
@@ -194,6 +216,8 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
       const d = decide(state, sig, now);
       state = d.state;
       setAdvice(d.advice);
+      // 細かく変えると描き直しが増えるので、5% 刻みにする。
+      setProgress(Math.round(d.progress * 20) / 20);
       if (d.advice !== 'capture') return;
       // 撮った時点で記録する（撮影に時間がかかっても、同じ景色をもう一度撮らない）。
       state = markCaptured(state, sig, now);
@@ -256,13 +280,14 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
         {ready && (
           <>
             <FrameCorners />
-            <p className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
+              {auto && !paused && <AutoMeter advice={advice} progress={progress} />}
               {paused
                 ? '写真を送信しています。送信が終わるまで撮影を止めています。'
                 : auto
                   ? autoHint(advice, tooFar)
                   : (hint ?? captureHint(frames.length, limits))}
-            </p>
+            </div>
           </>
         )}
         {/* 重ねる表示は、カメラが使えないときも出す（写真を選んで送る場合も位置合わせはできる）。 */}

@@ -12,7 +12,12 @@
 // 無関係な2枚では約 1.13（標準正規分布2つの差の絶対値の平均 2/√π）になるので、それで割って
 // 「0 = 同じ、1 = まったく別の景色」の目安にそろえる。
 //
-// 注意: しきい値（defaultAutoConfig）は合成画像で振る舞いを確かめただけで、実機での調整はまだ。
+// 手持ちでは完全には止まれないので、「止まっている」の基準は2段にする:
+//   ふつうは steady（200ms で画面幅の約1.2%以下の動き）が steadyMs 続いたら撮る。
+//   景色が十分変わってから looseAfterMs 経っても撮れていなければ、looseSteady（約2%）まで許して撮る。
+//   これで「手が震えていつまでも撮れない」を防ぐ。2% / 200ms は露光 1/60 秒で幅の約0.17%のぶれで、位置合わせには支障がない。
+//
+// 注意: しきい値は実写真をずらして測った値から決めた（実機の手ぶれ・自動露出での調整はまだ）。
 
 export const signatureWidth = 32;
 export const signatureHeight = 24;
@@ -74,18 +79,25 @@ export interface AutoConfig {
   tooFar: number;
   /** 撮影の最小間隔（ミリ秒）。 */
   minIntervalMs: number;
+  /** 景色が十分変わってから、これだけ待っても撮れなければ、基準を looseSteady まで緩める（ミリ秒）。 */
+  looseAfterMs: number;
+  /** 緩めたときの「止まっている」の基準。 */
+  looseSteady: number;
 }
 
-// minChange と tooFar の目安: 1周しながら撮ったサンプル11枚（COLMAP が全部の位置を推定できた写真）で、
-// 隣り合う写真どうしの違いは 0.16〜0.85 だった。少し細かめに撮るよう minChange はその最小より下にし、
-// tooFar は「ほぼ別の景色」のときだけ知らせる値にした（この測り方は景色の全体の見た目を比べるだけなので、
-// 違いが大きくても特徴点は対応づくことが多い）。steady は実機の手ぶれで調整が要る。
+// 目安（サンプル写真11枚で測った値）:
+//   写真を画面幅の 0.5% / 1% / 2% / 4% ずらしたときの違いは、およそ 0.06 / 0.11 / 0.19 / 0.30。
+//   1周しながら撮った隣り合う写真どうしの違いは 0.16〜0.85（COLMAP が全部の位置を推定できた）。
+// minChange はその最小付近（幅の約2%の移動）にし、tooFar は「ほぼ別の景色」のときだけ知らせる値にした
+// （この測り方は景色の全体の見た目を比べるだけなので、違いが大きくても特徴点は対応づくことが多い）。
 export const defaultAutoConfig: AutoConfig = {
-  steady: 0.08,
-  steadyMs: 250,
-  minChange: 0.15,
+  steady: 0.13,
+  steadyMs: 150,
+  minChange: 0.17,
   tooFar: 0.9,
-  minIntervalMs: 700,
+  minIntervalMs: 600,
+  looseAfterMs: 1000,
+  looseSteady: 0.22,
 };
 
 export interface AutoState {
@@ -96,41 +108,57 @@ export interface AutoState {
   /** 前に撮った写真。 */
   last: Signature | null;
   lastAt: number;
+  /** 景色が十分変わって「止まれば撮る」状態になった時刻（なっていなければ null）。 */
+  readySince: number | null;
 }
 
-export const initialAutoState: AutoState = { prev: null, steadySince: null, last: null, lastAt: -Infinity };
+export const initialAutoState: AutoState = {
+  prev: null,
+  steadySince: null,
+  last: null,
+  lastAt: -Infinity,
+  readySince: null,
+};
 
 /**
  * 次にどうするか。
  *   capture  いま撮る
- *   hold     動いている（止まるのを待つ）
- *   move     止まっているが、前の写真と同じ景色（横に動いてほしい）
+ *   move     前の写真からまだ景色が変わっていない（横に動いてほしい）
+ *   stop     景色は十分変わった（止まれば撮る）
  *   flat     模様が無い（位置合わせの手掛かりが無い）
  */
-export type AutoAdvice = 'capture' | 'hold' | 'move' | 'flat';
+export type AutoAdvice = 'capture' | 'move' | 'stop' | 'flat';
 
 export interface AutoDecision {
   state: AutoState;
   advice: AutoAdvice;
   /** capture のとき、前の写真から離れすぎていたか（間を埋める写真を撮るよう促す）。 */
   tooFar: boolean;
+  /** 次の1枚までの進み具合（0〜1）。前の写真からの景色の変わり具合を minChange で割った値。 */
+  progress: number;
 }
 
 /** 映像の1コマを見て、次にどうするかを決める。 */
 export function decide(state: AutoState, sig: Signature, now: number, cfg: AutoConfig = defaultAutoConfig): AutoDecision {
   const motion = state.prev ? difference(state.prev, sig) : Infinity;
   const steadySince = motion < cfg.steady ? (state.steadySince ?? now) : null;
-  const next: AutoState = { ...state, prev: sig, steadySince };
-
-  if (sig.flat) return { state: next, advice: 'flat', tooFar: false };
-  if (steadySince === null || now - steadySince < cfg.steadyMs) return { state: next, advice: 'hold', tooFar: false };
-  if (now - state.lastAt < cfg.minIntervalMs) return { state: next, advice: 'hold', tooFar: false };
   const change = state.last ? difference(state.last, sig) : Infinity;
-  if (change < cfg.minChange) return { state: next, advice: 'move', tooFar: false };
-  return { state: next, advice: 'capture', tooFar: state.last !== null && change > cfg.tooFar };
+  const progress = Math.min(1, change / cfg.minChange);
+  const enough = change >= cfg.minChange && now - state.lastAt >= cfg.minIntervalMs;
+  const readySince = enough && !sig.flat ? (state.readySince ?? now) : null;
+  const next: AutoState = { ...state, prev: sig, steadySince, readySince };
+  const result = (advice: AutoAdvice, tooFar = false): AutoDecision => ({ state: next, advice, tooFar, progress });
+
+  if (sig.flat) return result('flat');
+  if (readySince === null) return result('move');
+  const steady = steadySince !== null && now - steadySince >= cfg.steadyMs;
+  // 止まりきれない手でも撮れるよう、待ちが長引いたら基準を緩める。
+  const steadyEnough = steady || (now - readySince >= cfg.looseAfterMs && motion < cfg.looseSteady);
+  if (!steadyEnough) return result('stop');
+  return result('capture', state.last !== null && change > cfg.tooFar);
 }
 
 /** 撮ったことを記録する（次からは、この写真との違いで「景色が変わったか」を見る）。 */
 export function markCaptured(state: AutoState, sig: Signature, now: number): AutoState {
-  return { ...state, last: sig, lastAt: now };
+  return { ...state, last: sig, lastAt: now, readySince: null };
 }
