@@ -37,9 +37,12 @@ export function laplacianVariance(gray: ArrayLike<number>, width: number, height
   return sumSq / count - mean * mean;
 }
 
-/** RGBA の画素列（canvas の getImageData）をグレースケールに変換する。 */
-export function toGray(rgba: ArrayLike<number>): Float32Array {
-  const gray = new Float32Array(rgba.length / 4);
+/**
+ * RGBA の画素列（canvas の getImageData）をグレースケールに変換する。
+ * out を渡すとそこに書く（毎コマ測るときに、配列を作っては捨てるのを避けるため）。
+ */
+export function toGray(rgba: ArrayLike<number>, out?: Float32Array): Float32Array {
+  const gray = out && out.length === rgba.length / 4 ? out : new Float32Array(rgba.length / 4);
   for (let i = 0; i < gray.length; i++) {
     // 人の目は緑に最も敏感で青に鈍い。その感度に合わせた重み（ITU-R BT.601）。
     gray[i] = 0.299 * (rgba[i * 4] ?? 0) + 0.587 * (rgba[i * 4 + 1] ?? 0) + 0.114 * (rgba[i * 4 + 2] ?? 0);

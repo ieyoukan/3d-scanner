@@ -4,7 +4,7 @@
 //   上: 戻るボタンと、表示を切り替えるタブ（メッシュ / 3DGS / 点群）
 //   中: 3D の表示領域（画面のほとんどを使う）
 //   下: 読み込み状況、視点リセット、ダウンロード
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { fetchSceneInfo, renameScan } from '../api/client';
 import type { Scan, SceneInfo } from '../api/types';
@@ -22,12 +22,17 @@ import {
   ResetViewIcon,
   SpinnerIcon,
 } from '../ui/icons';
-import { MeshViewer } from '../viewer/MeshViewer';
-import { PointCloudViewer } from '../viewer/PointCloudViewer';
 import { computeViewFrame } from '../viewer/sceneFrame';
-import { SplatViewer } from '../viewer/SplatViewer';
 import { buildDownloads, buildTabs, defaultTab, type TabKey, type ViewerTab } from '../viewer/tabs';
 import type { ViewerHandle, ViewerState } from '../viewer/types';
+
+// ビューアはタブごとに分けて、開いたときに読み込む。メッシュと点群は three.js、3DGS は PlayCanvas を使う。
+// まとめると約 2.8MB（圧縮後 708KB）になり、最初に開くメッシュを見るだけでも PlayCanvas まで落としていた。
+const MeshViewer = lazy(() => import('../viewer/MeshViewer').then((m) => ({ default: m.MeshViewer })));
+const SplatViewer = lazy(() => import('../viewer/SplatViewer').then((m) => ({ default: m.SplatViewer })));
+const PointCloudViewer = lazy(() =>
+  import('../viewer/PointCloudViewer').then((m) => ({ default: m.PointCloudViewer })),
+);
 
 export function ViewPage() {
   const { id = '' } = useParams();
@@ -104,21 +109,19 @@ function Viewer({ scan }: { scan: Scan }) {
           // key を付けると、タブを切り替えたときに React が古いビューアを確実に破棄して作り直す。
           // WebGL の資源を持つ部品は、使い回すより作り直す方が安全。
           <div key={active.key} className="absolute inset-0">
-            {active.key === 'mesh' && <MeshViewer ref={viewer} url={active.url} frame={frame} onState={onState} />}
-            {active.key === 'splat' && <SplatViewer ref={viewer} url={active.url} frame={frame} onState={onState} />}
-            {active.key === 'points' && (
-              <PointCloudViewer ref={viewer} url={active.url} frame={frame} info={info ?? null} onState={onState} />
-            )}
+            {/* ビューアのプログラムを読み込んでいる間も「読み込んでいます」を出す。 */}
+            <Suspense fallback={<Loading />}>
+              {active.key === 'mesh' && <MeshViewer ref={viewer} url={active.url} frame={frame} onState={onState} />}
+              {active.key === 'splat' && <SplatViewer ref={viewer} url={active.url} frame={frame} onState={onState} />}
+              {active.key === 'points' && (
+                <PointCloudViewer ref={viewer} url={active.url} frame={frame} info={info ?? null} onState={onState} />
+              )}
+            </Suspense>
           </div>
         )}
 
         {/* 読み込み中・エラーは表示領域の中央に重ねる。pointer-events-none で下の3D操作を邪魔しない。 */}
-        {active?.url && state.kind === 'loading' && (
-          <p className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 text-sm text-mute">
-            <SpinnerIcon />
-            読み込んでいます…
-          </p>
-        )}
+        {active?.url && state.kind === 'loading' && <Loading />}
         {active?.url && state.kind === 'error' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center text-sm">
             <AlertIcon width={28} height={28} className="text-bad" />
@@ -307,5 +310,15 @@ function Tabs({ tabs, active, onSelect }: { tabs: ViewerTab[]; active: TabKey | 
         );
       })}
     </div>
+  );
+}
+
+/** 3D データやビューアを読み込んでいる間の表示。 */
+function Loading() {
+  return (
+    <p className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 text-sm text-mute">
+      <SpinnerIcon />
+      読み込んでいます…
+    </p>
   );
 }
