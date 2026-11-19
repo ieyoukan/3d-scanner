@@ -8,7 +8,7 @@
 // くっきりした方を残し（約半分になる）、以後は区間の長さを倍にする。何秒撮っても上限に収まり、
 // 1周の中にまんべんなく写真が残る。
 import { releaseFrame, type Frame } from './frames';
-import { BestPerWindow, FrameCollector, framesPerSecond, makeScorer } from './video';
+import { BestPerWindow, FrameCollector, framesPerSecond, makeScorer, oneAtATime } from './video';
 
 /**
  * 隣り合う2枚ずつ組にして、くっきり度（sharpness）の高い方を残す。並び順は保つ。
@@ -88,14 +88,21 @@ export function startLiveRecording(
     report();
   });
 
+  const gate = oneAtATime();
   const tick = (now: number) => {
     if (!running) return;
     elapsed = (now - t0) / 1000;
     // カメラが止まっている（裏に回った等）ときは、映像が無いので見ない。
     if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
-      const r = picker.offer(elapsed - stageStart, scorer());
-      if (r.keep) collector.keep(key(r.window), new Date().toISOString());
-      collector.flush(r.closed.map(key));
+      const at = elapsed;
+      gate.run(async () => {
+        const score = await scorer();
+        if (!running) return;
+        // 測っている間に間引き（段の切り替え）が起きても、いまの段の基準で区間を決める。
+        const r = picker.offer(at - stageStart, score);
+        if (r.keep) collector.keep(key(r.window), new Date().toISOString());
+        collector.flush(r.closed.map(key));
+      });
     }
     report();
     schedule();
@@ -112,6 +119,7 @@ export function startLiveRecording(
   return {
     async stop() {
       running = false;
+      await gate.idle();
       collector.flush(picker.finish().map(key));
       await collector.settled();
       // 止めた時点で候補が残っていて上限を超えたら、上限に収まるまで間引く。

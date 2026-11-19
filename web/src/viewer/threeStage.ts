@@ -130,6 +130,9 @@ export function createStage(canvas: HTMLCanvasElement, container: HTMLElement, f
       }
     });
     renderer.dispose();
+    // WebGL の文脈そのものも手放す。dispose だけだと文脈は GC まで残り、タブを何度も切り替えると
+    // ブラウザの上限（十数個）に達して古いものから失われる。
+    renderer.forceContextLoss();
   };
 
   return { scene, content, camera, reset, fitTo, dispose };
