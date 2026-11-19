@@ -155,11 +155,17 @@ function describePipeline(p: PipelineInfo): string {
   if (p.meshEnabled) {
     parts.push(p.meshMode === 'dense' ? 'メッシュ（密な復元）' : 'メッシュ（簡易版。このサーバーは GPU が無いため粗くなります）');
   }
-  if (p.splatEnabled && !p.splatDeferred) {
+  if (p.splatEnabled && !p.splatDeferred && !p.splatManual) {
     parts.push(p.splatDevice === 'cpu' ? '3D Gaussian Splatting（CPU で学習するため時間がかかります）' : '3D Gaussian Splatting');
   }
   if (parts.length === 0 && !p.splatEnabled) return 'カメラ位置と点群だけを求めます。';
-  const later = p.splatEnabled && p.splatDeferred ? '3D Gaussian Splatting は、そのあと手が空いたときに作ります。' : '';
+  const later = !p.splatEnabled
+    ? ''
+    : p.splatManual
+      ? '3D Gaussian Splatting は自動では作りません。必要なら、完成後に「3DGS を作る」で作れます。'
+      : p.splatDeferred
+        ? '3D Gaussian Splatting は、そのあと手が空いたときに作ります。'
+        : '';
   if (parts.length === 0) return later;
   return `${parts.join('と')}を作ります。${later}`;
 }

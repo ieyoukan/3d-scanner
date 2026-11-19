@@ -74,6 +74,9 @@ type Jobs struct {
 	// 後で最初からやり直す（CPU を取り合って両方が遅くなるのを避ける）。
 	// GPU で学習するなら false にすると、新しいスキャンの処理と並行して学習する。
 	SplatYield bool
+	// SplatAuto が false なら、3DGS は自動では作らない。利用者が「3DGS を作る」を押したときだけ、
+	// 待ち行列に入れて作る（POST /api/scans/{id}/splat）。
+	SplatAuto bool
 }
 
 // MeshMode はメッシュ分岐の作り方。
@@ -158,6 +161,7 @@ func Load(getenv func(string) string) (Config, error) {
 			JanitorInterval:     r.duration("JANITOR_INTERVAL", 10*time.Minute),
 			DeferSplat:          r.boolean("SPLAT_DEFERRED", true),
 			SplatYield:          r.boolean("SPLAT_YIELD", true),
+			SplatAuto:           r.boolean("SPLAT_AUTO", false),
 		},
 		Pipeline: readPipeline(r),
 	}

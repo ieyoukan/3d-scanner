@@ -46,6 +46,7 @@ data:
   SPLAT_FORCE_CPU: {{ .splatForceCPU | quote }}
   SPLAT_DEFERRED: {{ .splatDeferred | quote }}
   SPLAT_YIELD: {{ .splatYield | quote }}
+  SPLAT_AUTO: {{ .splatAuto | quote }}
   SFM_TIMEOUT: {{ .timeouts.sfm | quote }}
   MVS_TIMEOUT: {{ .timeouts.mvs | quote }}
   MESH_TIMEOUT: {{ .timeouts.mesh | quote }}

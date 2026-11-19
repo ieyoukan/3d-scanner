@@ -254,6 +254,28 @@ func (s *Scan) Remove() error {
 	return nil
 }
 
+// savedMarker は「ギャラリーに保存したスキャン」の目印のファイル名。
+//
+// 掃除（janitor）は DB に行が無い作業ディレクトリを孤児として消す。DB を作り直したり古いバックアップから
+// 戻したりすると、保存した 3D データのディレクトリまで孤児に見えて消えてしまう（検証環境で DB を作り直したとき、
+// 実際に全部消えた）。ディレクトリ自身に目印を残し、目印があるものは DB に無くても消さない。
+const savedMarker = "saved"
+
+// MarkSaved は、保存したスキャンの目印を置く（何度呼んでもよい）。
+func (s *Scan) MarkSaved() error {
+	p := filepath.Join(s.dir, savedMarker)
+	if _, err := os.Stat(p); err == nil {
+		return nil
+	}
+	return os.WriteFile(p, []byte("ギャラリーに保存したスキャン。DB に行が無くても掃除で消さない。\n"), 0o640)
+}
+
+// IsSaved は、保存したスキャンの目印があるかを返す。
+func (s *Scan) IsSaved() bool {
+	_, err := os.Stat(filepath.Join(s.dir, savedMarker))
+	return err == nil
+}
+
 // ModTime は作業ディレクトリの最終更新時刻を返す（孤児ディレクトリの古さの判定に使う）。
 func (s *Scan) ModTime() (time.Time, error) {
 	fi, err := os.Stat(s.dir)

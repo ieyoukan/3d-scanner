@@ -182,6 +182,7 @@ func pipelineInfo(cfg config.Config, caps reconstruction.Capabilities, p *recons
 		ColmapVersion:   caps.ColmapVersion,
 		ColmapGPU:       caps.ColmapGPU,
 		SplatDeferred:   cfg.Pipeline.EnableSplat && cfg.Jobs.DeferSplat,
+		SplatManual:     cfg.Pipeline.EnableSplat && !cfg.Jobs.SplatAuto,
 	}
 	if p.DenseMesh() {
 		info.MeshMode = "dense"

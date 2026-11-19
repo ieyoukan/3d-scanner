@@ -5,9 +5,9 @@
 //   中: 3D の表示領域（画面のほとんどを使う）
 //   下: 読み込み状況、視点リセット、ダウンロード
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useLocation, useParams } from 'react-router-dom';
-import { fetchSceneInfo, renameScan } from '../api/client';
-import type { Scan, SceneInfo } from '../api/types';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { fetchSceneInfo, renameScan, requestSplat } from '../api/client';
+import type { Scan, SceneInfo, ServerConfig } from '../api/types';
 import { formatBytes } from '../capture/validation';
 import { displayTitle } from '../gallery/gallery';
 import { useScan } from '../progress/useScan';
@@ -34,11 +34,11 @@ const PointCloudViewer = lazy(() =>
   import('../viewer/PointCloudViewer').then((m) => ({ default: m.PointCloudViewer })),
 );
 
-export function ViewPage() {
+export function ViewPage({ config }: { config: ServerConfig }) {
   const { id = '' } = useParams();
   const { load } = useScan(id);
 
-  if (load.kind === 'ready') return <Viewer scan={load.scan} />;
+  if (load.kind === 'ready') return <Viewer scan={load.scan} splatEnabled={config.pipeline.splatEnabled} />;
 
   return (
     <main className="flex min-h-dvh flex-col items-center justify-center gap-4 px-6 text-center text-sm text-mute">
@@ -54,7 +54,7 @@ export function ViewPage() {
   );
 }
 
-function Viewer({ scan }: { scan: Scan }) {
+function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
   const tabs = useMemo(() => buildTabs(scan), [scan]);
   const downloads = useMemo(() => buildDownloads(scan), [scan]);
   // 利用者が選んだタブ。null の間は「使えるものの先頭」を表示する。
@@ -147,6 +147,7 @@ function Viewer({ scan }: { scan: Scan }) {
                 <AlertIcon width={14} height={14} className="mt-0.5 shrink-0 text-amber" />
                 <span>
                   <span className="text-paper">{tab.label}なし:</span> {tab.reason}
+                  {tab.key === 'splat' && splatEnabled && <MakeSplatButton scan={scan} />}
                 </span>
               </li>
             ))}
@@ -320,5 +321,43 @@ function Loading() {
       <SpinnerIcon />
       読み込んでいます…
     </p>
+  );
+}
+
+/**
+ * 「3DGS を作る」。3DGS は自動では作らない設定があるので、無いときにここからも頼めるようにする。
+ * 頼んだら、学習の進み具合が見える処理状況の画面へ移る。
+ */
+function MakeSplatButton({ scan }: { scan: Scan }) {
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // 位置推定の結果（地図）が残っている完成したスキャンで、まだ頼んでいないときだけ。
+  if (!scan.resumable || scan.splatJob || (scan.status !== 'succeeded' && scan.status !== 'partial')) return null;
+  const make = async () => {
+    if (!window.confirm('3DGS を作ります。CPU では数十分かかり、新しいスキャンがあればそちらを先に処理します。')) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await requestSplat(scan.id);
+      navigate(`/scans/${scan.id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '受け付けられませんでした。');
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      {' '}
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void make()}
+        className="text-amber underline underline-offset-4 disabled:text-mute"
+      >
+        3DGS を作る
+      </button>
+      {error && <span className="block text-bad">{error}</span>}
+    </>
   );
 }

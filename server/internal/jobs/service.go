@@ -106,7 +106,37 @@ func (s *Service) Recover(ctx context.Context) error {
 	if len(requeued) > 0 {
 		s.Notify()
 	}
+	s.markSavedDirs(ctx)
 	return s.recoverSplats(ctx, s.log)
+}
+
+// markSavedDirs は起動時に、保存済みのスキャンのディレクトリに目印を置く
+// （目印の仕組みより前に保存したスキャンの分。何度実行してもよい）。失敗してもサーバーは起動する。
+func (s *Service) markSavedDirs(ctx context.Context) {
+	ids, err := s.root.List()
+	if err != nil {
+		s.log.Warn("保存の目印を確かめられません", "error", err)
+		return
+	}
+	marked := 0
+	for _, id := range ids {
+		d, err := s.store.Get(ctx, id)
+		if err != nil || !d.Scan.Saved {
+			continue
+		}
+		ws, err := s.root.Scan(id)
+		if err != nil || ws.IsSaved() {
+			continue
+		}
+		if err := ws.MarkSaved(); err != nil {
+			s.log.Warn("保存の目印を置けません", "scan", id, "error", err)
+			continue
+		}
+		marked++
+	}
+	if marked > 0 {
+		s.log.Info("保存済みのスキャンに目印を置きました", "count", marked)
+	}
 }
 
 // Run はワーカーのループ。ctx が終わるまで戻らない（goroutine として起動する）。
@@ -187,7 +217,7 @@ func (s *Service) runJob(ctx context.Context, sc scan.Scan) {
 	log.Info("ジョブを開始", "frames", sc.FrameCount)
 	start := s.now()
 	rep := &reporter{store: s.store, ws: ws, scanID: sc.ID, now: s.now, log: log, started: map[scan.StepName]time.Time{}}
-	runErr := s.pipe.Run(jobCtx, reconstruction.Job{ID: sc.ID, WS: ws, DeferSplat: s.cfg.DeferSplat}, rep)
+	runErr := s.pipe.Run(jobCtx, reconstruction.Job{ID: sc.ID, WS: ws, DeferSplat: s.cfg.DeferSplat, ManualSplat: !s.cfg.SplatAuto}, rep)
 
 	switch {
 	case ctx.Err() != nil:
@@ -217,6 +247,13 @@ func (s *Service) runJob(ctx context.Context, sc scan.Scan) {
 	out := scan.Summarize(detail.Steps, kinds)
 	// 見られる3Dデータが出来たものはギャラリーに保存する（保存期限で消さない）。
 	out.Saved = s.cfg.KeepCompleted && out.Status.Keepable()
+	if out.Saved {
+		// 掃除が DB に無いディレクトリを消すとき、保存したものは残すための目印。
+		// 完成を記録する前に置く（記録の直前にキャンセルされたら、ディレクトリごと消すので問題ない）。
+		if err := ws.MarkSaved(); err != nil {
+			log.Warn("保存の目印を置けません", "error", err)
+		}
+	}
 	if !s.finish(ctx, sc.ID, out) {
 		// (d) 記録の直前にキャンセルされていた。
 		s.removeFiles(ws, log)

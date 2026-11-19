@@ -902,6 +902,47 @@ func TestDeferSplatRunsInlineWhenMeshFails(t *testing.T) {
 	}
 }
 
+// TestManualSplat: 3DGS を自動で作らない設定では、メッシュの後に 3DGS を実行せず、
+// 「押したら作れる」というスキップとして記録する。メッシュが失敗しても自動では作らない。後から RunSplat で作れる。
+func TestManualSplat(t *testing.T) {
+	for _, meshFails := range []bool{false, true} {
+		run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
+		job.DeferSplat, job.ManualSplat = true, true
+		if meshFails {
+			run.fail["colmap delaunay_mesher"] = errors.New("失敗")
+		}
+		if err := New(testPipelineConfig(), run, Capabilities{}, nil).Run(context.Background(), job, rep); err != nil {
+			t.Fatal(err)
+		}
+		if _, called := run.args["opensplat"]; called {
+			t.Fatalf("メッシュ失敗=%v: 自動では作らないはずの 3DGS を実行した", meshFails)
+		}
+		for _, step := range []scan.StepName{scan.StepSplat, scan.StepSOG} {
+			if rep.finished[step] != scan.StepSkipped || rep.messages[step] != ManualSplatMessage {
+				t.Fatalf("メッシュ失敗=%v: %s = %s %q", meshFails, step, rep.finished[step], rep.messages[step])
+			}
+		}
+		if !meshFails {
+			if out := rep.outcome(); out.Status != scan.StatusSucceeded {
+				t.Fatalf("全体 = %+v（スキップした 3DGS で一部成功にしない）", out)
+			}
+		}
+	}
+
+	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
+	job.DeferSplat, job.ManualSplat = true, true
+	p := New(testPipelineConfig(), run, Capabilities{}, nil)
+	if err := p.Run(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RunSplat(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.finished[scan.StepSplat] != scan.StepSucceeded || rep.finished[scan.StepSOG] != scan.StepSucceeded {
+		t.Fatalf("押した後の 3DGS = %s / %s", rep.finished[scan.StepSplat], rep.finished[scan.StepSOG])
+	}
+}
+
 // TestFailedSplatKeepsPreviousFile: 作り直しに失敗しても、前の 3DGS のファイルは残る。
 func TestFailedSplatKeepsPreviousFile(t *testing.T) {
 	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)

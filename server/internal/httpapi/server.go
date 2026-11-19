@@ -44,7 +44,9 @@ type PipelineInfo struct {
 	// SplatDevice は "cpu" か "gpu"。
 	SplatDevice string `json:"splatDevice"`
 	// SplatDeferred が true なら、3DGS はメッシュの後で（手が空いたときに）作る。
-	SplatDeferred bool   `json:"splatDeferred"`
+	SplatDeferred bool `json:"splatDeferred"`
+	// SplatManual が true なら、3DGS は自動では作らず、利用者が「3DGS を作る」を押したときに作る。
+	SplatManual   bool   `json:"splatManual"`
 	ColmapVersion string `json:"colmapVersion"`
 	ColmapGPU     bool   `json:"colmapGpu"`
 }
