@@ -45,7 +45,14 @@ type Job struct {
 	// （splat / sog のステップは pending のまま残る。呼び出し側が待ち行列に入れ、後で RunSplat を呼ぶ）。
 	// メッシュが出来なかったときは、見られるものを1つでも作るため、そのまま 3DGS も実行する。
 	DeferSplat bool
+	// ManualSplat が true なら、3DGS 分岐は自動では実行しない（メッシュが出来なかったときも）。
+	// splat / sog のステップは「利用者が『3DGS を作る』を押したときに作る」というスキップとして記録する。
+	// 押されたら、待ち行列（RunSplat）で作る。CPU で数十分かかるので、要るものだけ作る運用のため。
+	ManualSplat bool
 }
+
+// ManualSplatMessage は、3DGS を自動では作らない設定のときに splat / sog のステップに残す説明。
+const ManualSplatMessage = "3DGS は自動では作りません。必要なときに「3DGS を作る」で作れます。"
 
 // Reporter はパイプラインの進行状況を受け取る側（本番ではワーカーが DB に書く）。
 type Reporter interface {
@@ -148,6 +155,12 @@ func (p *Pipeline) Run(ctx context.Context, job Job, rep Reporter) error {
 	meshOK := p.runMeshBranch(ctx, job, rep)
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if job.ManualSplat && p.cfg.EnableSplat {
+		for _, s := range []scan.StepName{scan.StepSplat, scan.StepSOG} {
+			rep.StepFinished(ctx, s, scan.StepSkipped, ManualSplatMessage)
+		}
+		return nil
 	}
 	if job.DeferSplat && meshOK && p.cfg.EnableSplat {
 		// 3DGS はあとで（RunSplat）。メッシュが出来ているので、スキャンはこの時点で見られる。

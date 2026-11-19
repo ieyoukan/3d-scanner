@@ -594,6 +594,51 @@ func TestSweepRemovesOnlyOldOrphans(t *testing.T) {
 	}
 }
 
+// TestSweepKeepsSavedOrphans: DB に行が無くても、保存したスキャンの目印があるディレクトリは消さない
+// （DB を作り直した・古いバックアップから戻した場合に、保存した 3D データを失わないため）。
+func TestSweepKeepsSavedOrphans(t *testing.T) {
+	e := newEnv(t, succeedAll(t))
+	id, _ := scan.NewID()
+	ws, _ := e.root.Scan(id)
+	if err := ws.Create(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.MarkSaved(); err != nil {
+		t.Fatal(err)
+	}
+	at := e.clock.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(ws.Dir(), at, at); err != nil {
+		t.Fatal(err)
+	}
+	res, err := e.svc.Sweep(context.Background())
+	if err != nil || res.Orphans != 0 || res.KeptOrphans != 1 {
+		t.Fatalf("Sweep = %+v, %v", res, err)
+	}
+	if !exists(ws.Dir()) {
+		t.Fatal("保存したスキャンのディレクトリを消した")
+	}
+}
+
+// TestRecoverMarksSavedScans: 目印の仕組みより前に保存したスキャンにも、起動時に目印を置く。
+func TestRecoverMarksSavedScans(t *testing.T) {
+	e := newEnv(t, succeedAll(t))
+	e.svc.cfg.KeepCompleted = true
+	stop := e.start()
+	id, ws := e.enqueue()
+	e.svc.Notify()
+	e.waitStatus(id, scan.StatusSucceeded)
+	stop()
+	if err := os.Remove(filepath.Join(ws.Dir(), "saved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !ws.IsSaved() {
+		t.Fatal("起動時に保存済みのスキャンへ目印を置いていない")
+	}
+}
+
 // TestGalleryKeepsCompletedScans: KeepCompleted のとき、完成したものはギャラリーに保存され、
 // 中間ファイル（dense/）だけが消え、保存期限を過ぎても消されない。失敗したものはこれまでどおり消える。
 func TestGalleryKeepsCompletedScans(t *testing.T) {
@@ -616,6 +661,9 @@ func TestGalleryKeepsCompletedScans(t *testing.T) {
 	d := e.waitStatus(keptID, scan.StatusSucceeded)
 	if !d.Scan.Saved {
 		t.Fatal("完成したのに保存されていない")
+	}
+	if !keptWS.IsSaved() {
+		t.Error("保存したスキャンに目印が無い（DB に行が無くなったとき掃除で消される）")
 	}
 	if exists(keptWS.DenseDir()) {
 		t.Error("中間ファイル（dense/）が残っている")

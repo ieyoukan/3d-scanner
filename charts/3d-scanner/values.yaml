@@ -160,6 +160,8 @@ config:
     # -- あとで作る 3DGS の学習中に新しいスキャンが来たら、学習を止めて順番を譲り、後でやり直す。
     # CPU で学習するときは true（CPU を取り合わない）。GPU で学習するなら false にすると並行して動く。
     splatYield: true
+    # false なら 3DGS は自動では作らない。処理状況やビューアの「3DGS を作る」を押したときだけ作る
+    splatAuto: false
     # -- 各ステップの制限時間。
     timeouts:
       sfm: 1h

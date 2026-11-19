@@ -126,6 +126,8 @@ export interface PipelineInfo {
   colmapGpu: boolean;
   /** true なら、3DGS はメッシュの後で（手が空いたときに）作る。 */
   splatDeferred: boolean;
+  /** true なら 3DGS は自動では作らず、「3DGS を作る」を押したときに作る。 */
+  splatManual?: boolean;
 }
 
 export interface ServerConfig {

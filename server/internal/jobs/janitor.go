@@ -19,6 +19,8 @@ type SweepResult struct {
 	Expired int // 期限切れにして、ファイルを消した件数
 	Purged  int // 期限切れのまま十分経ったので、行も消した件数
 	Orphans int // DB に行が無いので消したディレクトリの数
+	// KeptOrphans は、DB に行が無いが保存したスキャンの目印があるので、消さずに残したディレクトリの数。
+	KeptOrphans int
 }
 
 // RunJanitor は掃除を定期的に実行する。ctx が終わるまで戻らない。
@@ -29,6 +31,9 @@ func (s *Service) RunJanitor(ctx context.Context) {
 			s.log.Error("掃除に失敗", "error", err)
 		} else if res != (SweepResult{}) {
 			s.log.Info("掃除を実行", "expired", res.Expired, "purged", res.Purged, "orphans", res.Orphans)
+			if res.KeptOrphans > 0 {
+				s.log.Warn("DB に行が無い保存済みスキャンのディレクトリを、消さずに残しました", "count", res.KeptOrphans)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -113,6 +118,11 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 		modified, err := ws.ModTime()
 		if err != nil || now.Sub(modified) < orphanGrace {
+			continue
+		}
+		// 保存した 3D データは、DB に行が無くても消さない（DB を作り直した・戻した場合に備える）。
+		if ws.IsSaved() {
+			res.KeptOrphans++
 			continue
 		}
 		if err := ws.Remove(); err != nil {

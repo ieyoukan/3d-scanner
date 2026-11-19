@@ -60,7 +60,7 @@ export function App() {
           <Route path="/" element={<CapturePage config={config} />} />
           <Route path="/gallery" element={<GalleryPage />} />
           <Route path="/scans/:id" element={<ScanPage config={config} />} />
-          <Route path="/scans/:id/view" element={<ViewPage />} />
+          <Route path="/scans/:id/view" element={<ViewPage config={config} />} />
           <Route path="/scans/:id/resume" element={<ResumePage config={config} />} />
           <Route
             path="*"
