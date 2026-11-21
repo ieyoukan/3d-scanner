@@ -122,6 +122,10 @@ export function CapturePage({ config }: Props) {
 function CaptureGuide({ minImages, onClose }: { minImages: number; onClose: () => void }) {
   const tips: { title: string; why: string }[] = [
     {
+      title: 'AR なら、撮れた方向が色でわかる',
+      why: '対応する Android では「AR」で撮れます。対象の根元をタップすると半球が出て、撮れた方向が緑に、次に撮る方向が琥珀色になります。矢印の方へ回るだけです。',
+    },
+    {
       title: 'いちばん簡単なのは、動画で1周',
       why: '「動画」にして録画ボタンを押し、対象のまわりを歩きながら10〜30秒かけて1周したら止めるだけです。撮りながら1秒に3枚、ぶれの少ないコマを選んで写真にします。撮ってある動画を「動画を選ぶ」で使うこともできます。',
     },

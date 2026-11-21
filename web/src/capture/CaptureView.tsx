@@ -31,6 +31,9 @@ import { AlertIcon, CameraIcon, ForwardIcon, ImagesIcon, VideoIcon } from '../ui
 import { decide, initialAutoState, markCaptured, signatureOf, type AutoAdvice, type AutoState } from './autoCapture';
 import { frameFromCapture, frameFromFile, frameFromPhoto, FrameError, type Frame } from './frames';
 import { captureHint } from './validation';
+import { ArHud } from './ArHud';
+import type { ArController, ArState } from './arSession';
+import { arSupported } from './arSupport';
 import { startLiveRecording, type LiveProgress, type LiveRecording } from './liveVideo';
 import { framesFromVideo, type VideoProgress } from './video';
 
@@ -142,8 +145,35 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const [finishing, setFinishing] = useState(false);
   const isRecording = recording !== null;
 
-  // 送信中・動画を読んでいる間・動画で撮っている間は、ほかの方法で撮らない。
-  const blocked = paused || importing || isRecording || finishing;
+  // AR で撮る（arSession.ts）。対応端末（Android の Chrome）だけ選べる。
+  const [arPref, setArPref] = usePreference('capture.ar', false);
+  const [arOk, setArOk] = useState(false);
+  // AR 本体（three.js を含む）は、AR が使える端末でだけ先に読み込んでおく。
+  // ボタンを押してから読み込むと、ブラウザが「操作の直後」と認めず AR を始めさせないことがある。
+  const arModule = useRef<typeof import('./arSession') | null>(null);
+  useEffect(() => {
+    void arSupported().then((ok) => {
+      setArOk(ok);
+      if (ok)
+        void import('./arSession').then((m) => {
+          arModule.current = m;
+        });
+    });
+  }, []);
+  const arRoot = useRef<HTMLDivElement>(null);
+  const arCtl = useRef<ArController | null>(null);
+  const [arActive, setArActive] = useState(false);
+  const [arState, setArState] = useState<ArState | null>(null);
+
+  // 撮り方: AR / 動画 / 写真。
+  const mode: CaptureMode = arOk && arPref ? 'ar' : videoMode ? 'video' : 'photo';
+  const setMode = (m: CaptureMode) => {
+    setArPref(m === 'ar');
+    if (m !== 'ar') setVideoMode(m === 'video');
+  };
+
+  // 送信中・動画を読んでいる間・動画や AR で撮っている間は、ほかの方法で撮らない。
+  const blocked = paused || importing || isRecording || finishing || arActive;
 
   const [auto, setAuto] = usePreference('capture.auto', false);
   const [still, setStill] = usePreference('capture.still', true);
@@ -223,7 +253,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
   const ready = camera.state.kind === 'ready';
   const { sample, videoRef } = camera;
   useEffect(() => {
-    if (!auto || videoMode || !ready || blocked) {
+    if (!auto || mode !== 'photo' || !ready || blocked) {
       setAdvice(null);
       return;
     }
@@ -262,7 +292,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
       window.clearInterval(timer);
       window.clearTimeout(tooFarTimer);
     };
-  }, [auto, videoMode, ready, blocked, sample, videoRef]);
+  }, [auto, mode, ready, blocked, sample, videoRef]);
 
   // 動画の読み込みから、最新の値を読むための控え（値が変わるたびに読み込みをやり直さないように）。
   const onAddRef = useRef(onAdd);
@@ -323,6 +353,56 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
     if (file) setImportFile(file);
   }, []);
   const openVideo = () => videoInput.current?.click();
+
+  /**
+   * AR で撮り始める。ブラウザは操作の直後でないと AR を始めさせないので、ボタンの処理の中から直接呼ぶ。
+   * カメラは同時に1つの機能しか使えないので、ふだんのカメラを止めてから始め、終わったら戻す。
+   */
+  const startArFlow = () => {
+    const overlayEl = arRoot.current;
+    if (!overlayEl || arActive || paused || full) return;
+    setNotice(null);
+    camera.stop();
+    setArActive(true);
+    setArState(null);
+    const restartCamera = () => window.setTimeout(() => void camera.start(), 300);
+    const begin = (m: typeof import('./arSession')) => m.startAr({
+      overlay: overlayEl,
+      room: limits.maxImages - frames.length,
+      onState: setArState,
+      onEnded: () => {
+        arCtl.current = null;
+        setArActive(false);
+        setArState(null);
+        restartCamera();
+      },
+    });
+    // 読み込み済みなら、この操作の中ですぐ始める。
+    const started = arModule.current ? begin(arModule.current) : import('./arSession').then(begin);
+    started
+      .then((ctl) => {
+        arCtl.current = ctl;
+      })
+      .catch((err: unknown) => {
+        setArActive(false);
+        setNotice(err instanceof Error ? err.message : 'AR を始められませんでした。');
+        restartCamera();
+      });
+  };
+
+  /** AR の撮影を止め、写真を一覧に足して確認画面へ進む。 */
+  const stopAr = async () => {
+    const ctl = arCtl.current;
+    if (!ctl) return;
+    const loaded = await ctl.stop();
+    if (loaded.length === 0) return;
+    const rejected = onAddRef.current(loaded);
+    if (rejected > 0) setNotice(`上限を超えた${rejected}枚は追加しませんでした。`);
+    onReviewRef.current();
+  };
+
+  // 画面を離れたら AR も閉じる。
+  useEffect(() => () => arCtl.current?.cancel(), []);
 
   // 動画で撮っている間は画面を消さない（1周に30秒ほどかかり、その間は画面に触れないため）。
   const wakeLock = useRef<WakeLockSentinel | null>(null);
@@ -448,11 +528,13 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           <>
             <FrameCorners />
             <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 pb-3 pt-10 text-center text-sm">
-              {auto && !videoMode && !blocked && <AutoMeter advice={advice} progress={progress} />}
+              {auto && mode === 'photo' && !blocked && <AutoMeter advice={advice} progress={progress} />}
               {isRecording && <RecordingBadge progress={recording} />}
               {paused
                 ? '写真を送信しています。送信が終わるまで撮影を止めています。'
-                : videoMode
+                : mode === 'ar'
+                  ? 'AR で撮ると、撮れた方向が緑になります'
+                  : mode === 'video'
                   ? videoHint(isRecording, finishing)
                   : auto
                     ? autoHint(advice, tooFar)
@@ -471,10 +553,22 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
               いちばん簡単なのは、対象のまわりを歩きながら動画で1周撮ることです。写真を1枚ずつ撮ることもできます。
             </p>
             <div className="grid w-full max-w-xs grid-cols-2 gap-2">
+              {arOk && (
+                <Button
+                  variant="primary"
+                  className="col-span-2"
+                  onClick={() => {
+                    setMode('ar');
+                    startArFlow();
+                  }}
+                >
+                  AR で撮る
+                </Button>
+              )}
               <Button
-                variant="primary"
+                variant={arOk ? 'secondary' : 'primary'}
                 onClick={() => {
-                  setVideoMode(true);
+                  setMode('video');
                   void camera.start();
                 }}
               >
@@ -547,8 +641,8 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
       {/* 撮り方の選択。カメラが使えるときだけ出す。 */}
       {ready && (
         <div className="flex items-center justify-center gap-2 border-t border-line bg-panel px-4 pt-2.5">
-          <ModeSwitch video={videoMode} onChange={setVideoMode} disabled={isRecording || finishing} />
-          {videoMode ? (
+          <ModeSwitch mode={mode} ar={arOk} onChange={setMode} disabled={isRecording || finishing || arActive} />
+          {mode === 'video' ? (
             <button
               type="button"
               onClick={openVideo}
@@ -558,7 +652,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
               <VideoIcon width={16} height={16} />
               動画を選ぶ
             </button>
-          ) : (
+          ) : mode === 'ar' ? null : (
             <>
               <Toggle on={auto} onChange={setAuto} label="自動撮影" />
               {camera.state.kind === 'ready' && camera.state.still && (
@@ -591,7 +685,20 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           </button>
         </div>
 
-        {videoMode ? (
+        {mode === 'ar' ? (
+          // AR を始めるボタン（始めた後の録画ボタンは AR の画面の中に出る）。
+          <button
+            type="button"
+            onClick={startArFlow}
+            disabled={full || blocked}
+            aria-label="AR で撮る"
+            className="group grid size-[72px] place-items-center rounded-full border-[3px] border-amber disabled:border-line"
+          >
+            <span className="grid size-[56px] place-items-center rounded-full bg-amber text-lg font-bold text-ink group-active:scale-90 group-disabled:bg-line">
+              AR
+            </span>
+          </button>
+        ) : mode === 'video' ? (
           // 録画ボタン: 押すと撮り始め、もう一度押すと止める（赤い丸 → 赤い四角）。
           <button
             type="button"
@@ -630,6 +737,19 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           </button>
         </div>
       </div>
+
+      {/* AR の上に重ねる画面の根。AR の間はブラウザが全画面に広げる。ふだんは空で場所を取らない。 */}
+      <div ref={arRoot}>
+        {arActive && (
+          <ArHud
+            state={arState}
+            onRecord={() => arCtl.current?.record()}
+            onStop={() => void stopAr()}
+            onCancel={() => arCtl.current?.cancel()}
+            onReplace={() => arCtl.current?.replace()}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -661,19 +781,24 @@ function RecordingBadge({ progress }: { progress: LiveProgress | null }) {
   );
 }
 
-/** 撮り方の切り替え（動画 / 写真）。 */
+type CaptureMode = 'ar' | 'video' | 'photo';
+
+/** 撮り方の切り替え（AR / 動画 / 写真。AR は対応端末だけ）。 */
 function ModeSwitch({
-  video,
+  mode,
+  ar,
   onChange,
   disabled,
 }: {
-  video: boolean;
-  onChange: (video: boolean) => void;
+  mode: CaptureMode;
+  ar: boolean;
+  onChange: (mode: CaptureMode) => void;
   disabled: boolean;
 }) {
-  const options: [string, boolean][] = [
-    ['動画', true],
-    ['写真', false],
+  const options: [string, CaptureMode][] = [
+    ...(ar ? ([['AR', 'ar']] as [string, CaptureMode][]) : []),
+    ['動画', 'video'],
+    ['写真', 'photo'],
   ];
   return (
     <div role="radiogroup" aria-label="撮り方" className="flex rounded-full border border-line p-0.5 text-sm">
@@ -682,10 +807,10 @@ function ModeSwitch({
           key={label}
           type="button"
           role="radio"
-          aria-checked={video === value}
+          aria-checked={mode === value}
           disabled={disabled}
           onClick={() => onChange(value)}
-          className={`min-h-8 rounded-full px-3 ${video === value ? 'bg-amber font-semibold text-ink' : 'text-mute'}`}
+          className={`min-h-8 rounded-full px-3 ${mode === value ? 'bg-amber font-semibold text-ink' : 'text-mute'}`}
         >
           {label}
         </button>

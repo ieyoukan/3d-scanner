@@ -116,16 +116,17 @@ export class FrameCollector {
   private discarded = false;
 
   /**
-   * @param source  写し取る映像
+   * @param source  写し取る映像（keep を使うときだけ要る。AR では add で画像を直接渡す）
    * @param onFrame 写真が1枚できるたびに呼ばれる
    */
   constructor(
-    private readonly source: HTMLVideoElement,
+    private readonly source: HTMLVideoElement | null,
     private readonly onFrame?: (frame: Frame) => void,
   ) {}
 
   /** いま表示されているコマを、区間 key の候補として写し取る（前の候補は捨てる）。 */
   keep(key: number, capturedAt: string): void {
+    if (!this.source) throw new Error('写し取る映像がありません');
     this.drop(key);
     this.candidates.set(key, { capturedAt, bitmap: createImageBitmap(this.source) });
   }
@@ -136,25 +137,30 @@ export class FrameCollector {
       const c = this.candidates.get(key);
       if (!c) continue;
       this.candidates.delete(key);
-      this.encoding = this.encoding.then(async () => {
-        let bitmap: ImageBitmap | undefined;
-        try {
-          bitmap = await c.bitmap;
-          if (this.discarded) return;
-          const frame = await frameFromVideoFrame(bitmap, c.capturedAt);
-          if (this.discarded) {
-            releaseFrame(frame);
-            return;
-          }
-          this.frames.push(frame);
-          this.onFrame?.(frame);
-        } catch {
-          this.failures += 1;
-        } finally {
-          bitmap?.close();
-        }
-      });
+      this.add(c.bitmap, c.capturedAt);
     }
+  }
+
+  /** 選び終えた画像を、順番に写真にする（AR のように、候補を自分で持つ場合に使う）。 */
+  add(image: Promise<ImageBitmap>, capturedAt: string): void {
+    this.encoding = this.encoding.then(async () => {
+      let bitmap: ImageBitmap | undefined;
+      try {
+        bitmap = await image;
+        if (this.discarded) return;
+        const frame = await frameFromVideoFrame(bitmap, capturedAt);
+        if (this.discarded) {
+          releaseFrame(frame);
+          return;
+        }
+        this.frames.push(frame);
+        this.onFrame?.(frame);
+      } catch {
+        this.failures += 1;
+      } finally {
+        bitmap?.close();
+      }
+    });
   }
 
   /** 写真の一覧を入れ替える（間引いたとき）。外した写真の解放は呼び出し側が行う。 */
