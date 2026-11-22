@@ -54,11 +54,14 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
         )}
       </div>
 
-      {/* 中心を置く段階だけ、短い案内を出す */}
+      {/* 中心を置く段階だけ、短い案内を出す。照準が出るまでは、端末をゆっくり動かす絵 */}
       {phase === 'placing' && (
-        <p className="absolute inset-x-0 top-1/2 mt-16 text-center text-base font-semibold drop-shadow">
-          {state?.aiming ? '根元をタップ' : '床や机にかざす'}
-        </p>
+        <div className="absolute inset-x-0 top-1/2 mt-16 flex flex-col items-center gap-2 drop-shadow">
+          {!state?.aiming && <MovePhone />}
+          <p className="text-center text-base font-semibold">
+            {state?.aiming ? '対象に合わせてタップ' : 'ゆっくり動かす'}
+          </p>
+        </div>
       )}
 
       {state?.noCameraImage && (
@@ -109,6 +112,19 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
         )}
       </div>
     </div>
+  );
+}
+
+/** 端末を左右にゆっくり動かす絵（AR が周りを見つけるには、端末を少し動かす必要がある）。 */
+function MovePhone() {
+  return (
+    <svg viewBox="0 0 64 40" width="72" height="45" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+      <g className="ar-sway">
+        <rect x="24" y="6" width="16" height="28" rx="3" />
+        <path d="M30 29h4" />
+      </g>
+      <path d="M10 20h-6m0 0l3-3m-3 3l3 3M54 20h6m0 0l-3-3m3 3l-3 3" strokeOpacity="0.7" />
+    </svg>
   );
 }
 

@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { currentTile, directionOf, isFacing, nextTarget, progressOf, tileAt, tiles } from './coverage';
+import {
+  convergePoint,
+  coverageOf,
+  currentTile,
+  directionOf,
+  isFacing,
+  nextTarget,
+  progressOf,
+  tileAt,
+  tiles,
+} from './coverage';
 
 const O = [0, 0, 0] as const;
 
@@ -61,6 +71,46 @@ describe('nextTarget', () => {
     const all = tiles.map((t) => t.band !== 'top');
     expect(nextTarget(all, [0, 0, 2], O)).toEqual({ tile: 18, turn: 'up' });
     expect(nextTarget(tiles.map(() => true), [0, 0, 2], O)).toBeNull();
+  });
+});
+
+describe('convergePoint / coverageOf', () => {
+  // 中心 (0.3, 0.8, -1) のまわり、半径 1 m・高さ 1.4 m を回りながら中心を見るカメラ。
+  const C: [number, number, number] = [0.3, 0.8, -1];
+  const orbit = (fromDeg: number, toDeg: number, steps = 10) =>
+    Array.from({ length: steps }, (_, k) => {
+      const a = ((fromDeg + ((toDeg - fromDeg) * k) / (steps - 1)) * Math.PI) / 180;
+      const pos: [number, number, number] = [C[0] + Math.sin(a), 1.4, C[2] + Math.cos(a)];
+      return { pos, fwd: [C[0] - pos[0], C[1] - pos[1], C[2] - pos[2]] as [number, number, number] };
+    });
+
+  it('回りながら中心を見たカメラの視線から、中心を求める', () => {
+    const p = convergePoint(orbit(0, 90))!;
+    expect(p[0]).toBeCloseTo(C[0], 5);
+    expect(p[1]).toBeCloseTo(C[1], 5);
+    expect(p[2]).toBeCloseTo(C[2], 5);
+  });
+
+  it('ほとんど回っていない（視線がそろっている）うちは決めない', () => {
+    expect(convergePoint(orbit(0, 10))).toBeNull();
+    expect(convergePoint(orbit(0, 0, 1))).toBeNull();
+  });
+
+  it('よそ見した視線が少し混じっても、引っ張られない', () => {
+    const samples = orbit(0, 180, 20);
+    samples.push({ pos: [5, 1.4, 5], fwd: [1, 0, 0] }, { pos: [-2, 1.4, 3], fwd: [0, -1, 0.2] });
+    const p = convergePoint(samples)!;
+    expect(Math.hypot(p[0] - C[0], p[1] - C[1], p[2] - C[2])).toBeLessThan(0.01);
+  });
+
+  it('中心を動かしたら、撮れた方向を数え直せる', () => {
+    const samples = orbit(0, 90);
+    const covered = coverageOf(samples, C);
+    expect(covered.filter(Boolean).length).toBeGreaterThan(0);
+    // 撮った方向（方位 0〜90°）より外は撮れていない。
+    expect(covered[6]).toBe(false);
+    // 全然違う所を中心にすると、どこも撮れていない（中心を向いていない）。
+    expect(coverageOf(samples, [10, 0, 10]).some(Boolean)).toBe(false);
   });
 });
 

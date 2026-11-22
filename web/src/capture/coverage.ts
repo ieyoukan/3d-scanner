@@ -152,6 +152,93 @@ export function nextTarget(
   return null;
 }
 
+/** 撮影中のカメラの位置と視線（1コマ分）。 */
+export interface PoseSample {
+  pos: Vec3;
+  fwd: Vec3;
+}
+
+/** 撮ってきたカメラの位置と視線から、タイルごとの「撮れた」を数え直す（中心を動かしたとき用）。 */
+export function coverageOf(samples: readonly PoseSample[], center: Vec3): boolean[] {
+  const covered = tiles.map(() => false);
+  for (const s of samples) {
+    const i = currentTile(s.pos, s.fwd, center);
+    if (i !== null) covered[i] = true;
+  }
+  return covered;
+}
+
+/** 視線の集まる点を信じてよい、視線の広がりの下限（det(A/n)。2本の視線なら約 27° 開いたとき）。 */
+export const minSpread = 0.05;
+
+/**
+ * カメラの視線がいちばん集まる点（各視線の直線までの距離の二乗の和が最小の点）。
+ * 対象を画面の真ん中に入れて回ると、対象の中心になる（サーバーの focusPoint と同じ考え方）。
+ *
+ * 次のときは null（まだ決められない）:
+ *   - 視線の向きが揃いすぎている（回った角度が小さい。広がりが minSpread 未満）
+ *   - 求めた点が、8 割以上のカメラの前に無い（視線がほぼ平行で、後ろに解が出た等）
+ * よそ見した視線に引っ張られないよう、一度解いてから、解から遠く外れた視線を除いて解き直す。
+ */
+export function convergePoint(samples: readonly PoseSample[]): Vec3 | null {
+  const rays = samples.flatMap((s) => {
+    const l = Math.hypot(...s.fwd);
+    return l > 1e-6 ? [{ c: s.pos, d: [s.fwd[0] / l, s.fwd[1] / l, s.fwd[2] / l] as Vec3 }] : [];
+  });
+  let x = solveRays(rays);
+  if (!x) return null;
+  const dist = rays.map((r) => rayDistance(r, x!));
+  const median = [...dist].sort((a, b) => a - b)[Math.floor(dist.length / 2)]!;
+  const limit = Math.max(0.05, 3 * median);
+  const inliers = rays.filter((_, i) => dist[i]! <= limit);
+  if (inliers.length < rays.length) x = solveRays(inliers);
+  if (!x) return null;
+  const p = x;
+  const inFront = inliers.filter((r) => dot(r.d, [p[0] - r.c[0], p[1] - r.c[1], p[2] - r.c[2]]) > 0).length;
+  return inFront >= 0.8 * inliers.length ? p : null;
+}
+
+interface Ray {
+  c: Vec3;
+  d: Vec3;
+}
+
+const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+/** 点 x から直線（c を通り向き d、|d|=1）までの距離。 */
+function rayDistance(r: Ray, x: Vec3): number {
+  const v: Vec3 = [x[0] - r.c[0], x[1] - r.c[1], x[2] - r.c[2]];
+  const t = dot(v, r.d);
+  return Math.hypot(v[0] - t * r.d[0], v[1] - t * r.d[1], v[2] - t * r.d[2]);
+}
+
+/** Σ(I − ddᵀ) x = Σ(I − ddᵀ) c を解く。視線の広がりが足りなければ null。 */
+function solveRays(rays: readonly Ray[]): Vec3 | null {
+  const n = rays.length;
+  if (n < 2) return null;
+  const A = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  const b = [0, 0, 0];
+  for (const { c, d } of rays) {
+    for (let i = 0; i < 3; i++) {
+      for (let j = 0; j < 3; j++) {
+        const m = (i === j ? 1 : 0) - d[i]! * d[j]!;
+        A[i * 3 + j]! += m;
+        b[i]! += m * c[j]!;
+      }
+    }
+  }
+  const det = det3(A);
+  if (det / n ** 3 < minSpread) return null;
+  // クラメルの公式。
+  const col = (k: number) => A.map((v, idx) => (idx % 3 === k ? b[Math.floor(idx / 3)]! : v));
+  return [det3(col(0)) / det, det3(col(1)) / det, det3(col(2)) / det];
+}
+
+function det3(m: readonly number[]): number {
+  const [a, b, c, d, e, f, g, h, i] = m as [number, number, number, number, number, number, number, number, number];
+  return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+}
+
 /**
  * 方位角を delta 度変えるには、対象を向いたまま左右どちらへ回ればよいか。
  * 右へ少し動いたときに方位角が増えるか減るかを実際に計算して決める（座標系の向きの思い込みを避ける）。
