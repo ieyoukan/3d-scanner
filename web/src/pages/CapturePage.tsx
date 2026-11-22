@@ -123,7 +123,7 @@ function CaptureGuide({ minImages, onClose }: { minImages: number; onClose: () =
   const tips: { title: string; why: string }[] = [
     {
       title: 'AR なら、撮れた方向が色でわかる',
-      why: '対応する Android では「AR」で撮れます。対象の根元をタップすると半球が出て、撮れた方向が緑に、次に撮る方向が琥珀色になります。矢印の方へ回るだけです。',
+      why: '対応する Android では「AR」で撮れます。対象に合わせてタップすると半球が出て、撮れた方向が緑に、次に撮る方向が琥珀色になります。矢印の方へ回るだけです。',
     },
     {
       title: 'いちばん簡単なのは、動画で1周',

@@ -89,8 +89,24 @@
   animation: spin-slow 1s linear infinite;
 }
 
+/* AR で「端末をゆっくり左右に動かす」を示す揺れ。 */
+@keyframes ar-sway {
+  0%,
+  100% {
+    transform: translateX(-10px);
+  }
+  50% {
+    transform: translateX(10px);
+  }
+}
+
+.ar-sway {
+  animation: ar-sway 1.6s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .spinner {
+  .spinner,
+  .ar-sway {
     animation: none;
   }
 }
