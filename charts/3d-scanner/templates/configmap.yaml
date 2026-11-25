@@ -30,6 +30,7 @@ data:
   {{- with .Values.config.limits }}
   MIN_IMAGES: {{ .minImages | quote }}
   MAX_IMAGES: {{ .maxImages | quote }}
+  MAX_SCENE_IMAGES: {{ .maxSceneImages | quote }}
   MAX_IMAGE_MB: {{ .maxImageMB | quote }}
   MAX_UPLOAD_MB: {{ .maxUploadMB | quote }}
   MAX_QUEUED_SCANS: {{ .maxQueuedScans | quote }}

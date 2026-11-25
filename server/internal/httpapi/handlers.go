@@ -91,6 +91,7 @@ type configResponse struct {
 type limitsResponse struct {
 	MinImages      int   `json:"minImages"`
 	MaxImages      int   `json:"maxImages"`
+	MaxSceneImages int   `json:"maxSceneImages"`
 	MaxImageBytes  int64 `json:"maxImageBytes"`
 	MaxUploadBytes int64 `json:"maxUploadBytes"`
 	MaxImagePixels int64 `json:"maxImagePixels"`
@@ -106,7 +107,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	l := s.cfg.Limits
 	writeJSON(w, http.StatusOK, configResponse{
 		Limits: limitsResponse{
-			MinImages: l.MinImages, MaxImages: l.MaxImages, MaxImageBytes: l.MaxImageBytes,
+			MinImages: l.MinImages, MaxImages: l.MaxImages, MaxSceneImages: l.MaxSceneImages, MaxImageBytes: l.MaxImageBytes,
 			MaxUploadBytes: l.MaxUploadBytes, MaxImagePixels: l.MaxImagePixels, MinImageSide: l.MinImageSide,
 		},
 		RetentionHours: s.cfg.Jobs.Retention.Hours(),
@@ -168,6 +169,15 @@ func (s *Server) handleResumeScan(w http.ResponseWriter, r *http.Request) {
 // notResumableMessage は「続きを撮る」と位置合わせができないスキャンへの説明。
 const notResumableMessage = "このスキャンには続きを撮れません。完成していて、位置合わせ用の地図（カメラ位置と特徴点）が残っているものだけが対象です。"
 
+// captureMode はスキャンの撮り方を返す（作業ディレクトリに残した印。無ければ物）。
+func (s *Server) captureMode(id string) reconstruction.CaptureMode {
+	ws, err := s.root.Scan(id)
+	if err != nil {
+		return reconstruction.ModeObject
+	}
+	return reconstruction.ReadCaptureMode(ws)
+}
+
 // resumable は、スキャンが「続きを撮る」と位置合わせ（VPS）に使えるかを返す。
 // 完成していて（見られる3Dデータがある）、地図のファイルが残っているもの。
 func (s *Server) resumable(sc scan.Scan) bool {
@@ -183,6 +193,13 @@ func (s *Server) createScan(w http.ResponseWriter, r *http.Request, parent *scan
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if mediaType != "multipart/form-data" {
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "multipart/form-data で送信してください。")
+		return
+	}
+	// 撮り方（?mode=scene で風景モード）。写真の上限と、SfM の照合のしかたが変わる。
+	// 続きの版は元の版の撮り方を引き継ぐ（下で決める）。
+	mode, ok := reconstruction.ParseCaptureMode(r.URL.Query().Get("mode"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "bad_mode", "撮り方（mode）は object か scene にしてください。")
 		return
 	}
 
@@ -261,17 +278,21 @@ func (s *Server) createScan(w http.ResponseWriter, r *http.Request, parent *scan
 
 	// 続きの版: 元の版の写真と地図を引き継ぎ、今回の写真はその続きの番号で保存する。
 	var inherited workspace.Inherited
-	opts := upload.Options{}
+	if parent != nil {
+		mode = reconstruction.ReadCaptureMode(parentWS)
+	}
+	maxImages := s.cfg.Limits.MaxImagesFor(mode == reconstruction.ModeScene)
+	opts := upload.Options{MaxImages: maxImages}
 	if parent != nil {
 		if inherited, err = ws.InheritFrom(parentWS); err != nil {
 			s.log.Error("元の版を引き継げません", "scan", id, "parent", parent.ID, "error", err)
 			writeError(w, http.StatusInternalServerError, "internal", "元の3Dデータを引き継げませんでした。")
 			return
 		}
-		room := s.cfg.Limits.MaxImages - inherited.Frames
+		room := maxImages - inherited.Frames
 		if room < 1 {
 			writeError(w, http.StatusBadRequest, "too_many_images",
-				fmt.Sprintf("これ以上写真を追加できません（元の写真と合わせて%d枚までです）。", s.cfg.Limits.MaxImages))
+				fmt.Sprintf("これ以上写真を追加できません（元の写真と合わせて%d枚までです）。", maxImages))
 			return
 		}
 		opts = upload.Options{FirstNumber: inherited.NextNumber, MinImages: 1, MaxImages: room}
@@ -303,6 +324,12 @@ func (s *Server) createScan(w http.ResponseWriter, r *http.Request, parent *scan
 		if err := reconstruction.WriteCameraHint(ws, hint); err != nil {
 			s.log.Warn("焦点距離の手掛かりを保存できません", "scan", id, "error", err)
 		}
+	}
+
+	if err := reconstruction.WriteCaptureMode(ws, mode); err != nil {
+		s.log.Error("撮り方を保存できません", "scan", id, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal", "サーバー内部でエラーが発生しました。")
+		return
 	}
 
 	// AR で撮った写真のカメラ位置があれば残す（SfM の後で、実際の大きさと重力の向きを求めるのに使う）。
@@ -379,6 +406,8 @@ type scanResponse struct {
 	BaseFrameCount int `json:"baseFrameCount"`
 	// Resumable は「続きを撮る」と位置合わせ（VPS）に使えるか。
 	Resumable bool `json:"resumable"`
+	// CaptureMode は撮り方（object: 物を囲んで撮った / scene: 歩きながら空間を撮った）。
+	CaptureMode reconstruction.CaptureMode `json:"captureMode"`
 	// Continuations はこの版を元にした続きの版（新しい順）。
 	Continuations []continuationResponse `json:"continuations"`
 	// SplatJob は、あとで作る 3DGS が待ち行列にあればその状況（無ければ省略）。
@@ -459,6 +488,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		StartedAt: sc.StartedAt, FinishedAt: sc.FinishedAt, FrameCount: sc.FrameCount,
 		Saved: sc.Saved, Title: sc.Title, ThumbnailURL: s.thumbnailURL(sc),
 		ParentID: sc.ParentID, BaseFrameCount: sc.BaseFrameCount, Resumable: s.resumable(sc),
+		CaptureMode:   s.captureMode(sc.ID),
 		Continuations: []continuationResponse{},
 		Steps:         []stepResponse{}, Assets: []assetResponse{},
 	}

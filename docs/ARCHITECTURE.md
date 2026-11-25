@@ -195,6 +195,30 @@ API とワーカーを同じ Pod・同じプロセスにしているのは、作
   中心の真下で、中心から水平に 1.5 × radius 以内の頂点の高さの下から 2% を底（y = 0）にする（遠くの床に引っ張られないように）。
 - 大きさ: `metersPerUnit` があれば実物大（画面に「実物大」）。無ければ radius が 15cm になる目安の大きさ。
 
+### 風景モード
+
+物を囲まずに、歩きながら空間（部屋・庭・街並み）を撮る。撮影画面の上の切り替え（`capture.scene` として端末に保存）で選び、
+1 枚でも撮ったら切り替えられない。送信は `POST /api/scans?mode=scene`。サーバーは作業ディレクトリに `capture_mode` を残し
+（続きの版は元の版から引き継ぐ）、スキャンの `captureMode` で返す。
+
+| 項目 | 物（既定） | 風景 |
+| --- | --- | --- |
+| 写真の上限 | `MAX_IMAGES`（80） | `MAX_SCENE_IMAGES`（150） |
+| 送る写真 | 長辺 2048px・画質 0.9 | 長辺 1600px・画質 0.85（`sceneEncoding`。特徴抽出は 1600px に縮めてから行うので精度は同じ） |
+| AR の写真の選び方 | 1/3 秒ごとの区間 | 動いた量ごとの区間（`MotionMeter`: 区間の始めから 15cm 動くか 12° 向きが変わったら次。立ち止まると進まない） |
+| AR の画面 | ドーム | 歩いた道の図（自分が真ん中で向きが上）と警告（`MotionWarnings`: spin・fast） |
+| 照合 | `exhaustive_matcher` | `matches_importer --match_type pairs`（`ScenePairs`） |
+
+`ScenePairs`（`server/internal/reconstruction/scene_mode.go`）が作る組:
+
+- 撮った順（ファイル名の順）で前後 8 枚
+- 撮った順で 16・32・64・128 枚離れたもの（1 周して戻ってきたときにつなぐ）
+- AR の位置が近い 5 枚（同じ AR の回の中で、視線のなす角が 90° 未満のもの。同じ所を 2 回通ったときにつなぐ）
+- 続きの版では、今回の各写真 × 引き継いだ写真から等間隔に選んだ 30 枚（引き継いだ写真どうしは照合済み）
+
+150 枚なら全部の組（11,175）に対して 1,500 組ほど。SfM の説明には、位置を推定できなかった写真を撮った順の番号のひと続き
+（`UnregisteredRuns`、例「7、41〜55枚目」）と、mapper が出したモデルの数（写真が何か所に分かれてつながったか）を出す。
+
 ### 実際の大きさ（AR の位置との突き合わせ）
 
 `server/internal/reconstruction/arpose.go`。受付時に、写真ごとのメタデータの `arPose` を `ar_poses.json` に残す
@@ -333,7 +357,7 @@ COLMAP が書き換える `database.db` だけは、ワーカーが処理の始�
 
 | ステップ | コマンド | 出力 |
 | --- | --- | --- |
-| `sfm` | `colmap feature_extractor` → `exhaustive_matcher` → `mapper` → `model_converter` | `sparse/0/`、`output/sparse.ply`、`output/scene.json` |
+| `sfm` | `colmap feature_extractor` → `exhaustive_matcher`（風景モードは `matches_importer`）→ `mapper` → `model_converter` | `sparse/0/`、`output/sparse.ply`、`output/scene.json` |
 | `mvs`（GPU あり） | `colmap image_undistorter` → `patch_match_stereo` → `stereo_fusion` | `dense/fused.ply` |
 | `mesh`（GPU あり） | `colmap poisson_mesher` → `mesh_texturer` → PLY→OBJ（Go）→ `gltfpack` | `output/mesh.glb` |
 | `mesh`（GPU なし） | `colmap image_undistorter` → `delaunay_mesher --input_type sparse` → `mesh_texturer` → PLY→OBJ（Go）→ `gltfpack` | `output/mesh.glb` |

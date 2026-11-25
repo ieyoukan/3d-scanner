@@ -102,7 +102,7 @@ func newTestEnv(t *testing.T, mutate func(*config.Config)) *testEnv {
 		DataDir: t.TempDir(),
 		WebDir:  webDir,
 		Limits: config.Limits{
-			MinImages: 3, MaxImages: 6, MaxImageBytes: 200 * 1024, MaxUploadBytes: 600 * 1024,
+			MinImages: 3, MaxImages: 6, MaxSceneImages: 9, MaxImageBytes: 200 * 1024, MaxUploadBytes: 600 * 1024,
 			MaxImagePixels: 1_000_000, MinImageSide: 32, MinFreeDiskBytes: 1, MaxQueuedScans: 2,
 		},
 		Jobs: config.Jobs{Retention: 24 * time.Hour, ExpiredRowRetention: time.Hour, MaxAttempts: 2,
@@ -967,5 +967,39 @@ func TestFocalHintIsSaved(t *testing.T) {
 	ws, _ = e.root.Scan(id)
 	if _, ok := reconstruction.ReadCameraHint(ws); ok {
 		t.Fatal("焦点距離が無いのに手掛かりを作った")
+	}
+}
+
+func TestSceneMode(t *testing.T) {
+	e := newTestEnv(t, nil)
+
+	// 物（既定）は 6 枚まで。風景モードは 9 枚まで受け付ける。
+	body, ct := uploadBody(t, 7)
+	wantError(t, e.do("POST", "/api/scans", body, ct), http.StatusRequestEntityTooLarge, "too_many_images")
+	body, ct = uploadBody(t, 7)
+	rec := e.do("POST", "/api/scans?mode=scene", body, ct)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("風景モードの 7 枚が %d: %s", rec.Code, rec.Body.String())
+	}
+	id := decode[createResponse](t, rec).ID
+	if got := decode[scanResponse](t, e.do("GET", "/api/scans/"+id, nil)); got.CaptureMode != reconstruction.ModeScene {
+		t.Errorf("captureMode = %q", got.CaptureMode)
+	}
+	ws, _ := e.root.Scan(id)
+	if reconstruction.ReadCaptureMode(ws) != reconstruction.ModeScene {
+		t.Error("作業ディレクトリに撮り方が残っていない")
+	}
+
+	// 物のスキャンは object。知らない撮り方は断る。
+	if got := decode[scanResponse](t, e.do("GET", "/api/scans/"+e.createScan(3), nil)); got.CaptureMode != reconstruction.ModeObject {
+		t.Errorf("captureMode = %q", got.CaptureMode)
+	}
+	body, ct = uploadBody(t, 3)
+	wantError(t, e.do("POST", "/api/scans?mode=room", body, ct), http.StatusBadRequest, "bad_mode")
+
+	// 設定に風景モードの上限が出る。
+	cfg := decode[configResponse](t, e.do("GET", "/api/config", nil))
+	if cfg.Limits.MaxSceneImages != 9 {
+		t.Errorf("maxSceneImages = %d", cfg.Limits.MaxSceneImages)
 	}
 }

@@ -10,6 +10,11 @@
 //              対象を向いて撮った方向のタイルが緑になる。次に撮るタイルは琥珀色で、画面の端に矢印が出る
 //   finishing  停止したら、最後の写真ができるのを待って AR を終える
 //
+// 風景モード（scene: true）は、物を囲まずに歩きながら空間を撮る。中心もドームも無く、すぐ ready から始める:
+//   写真    時間ではなく「動いた量」（15cm か 12°）ごとの区間で一番くっきりしたコマ（sceneMotion.ts）。
+//           立ち止まっても同じ写真が溜まらない。サーバーに送る写真は長辺 1600px（枚数が多いので）
+//   画面    歩いた道を真上から見た小さな図（撮った所の点と向き）。その場で向きだけ変えている・速すぎるときは警告
+//
 // 続きを撮る（reference を渡したとき）は、中心を置く代わりに locating から始める:
 //   locating   カメラ画像を位置合わせ（VPS）に送り、前回の3Dデータ（地図）の座標を AR に重ねる（resume/arAlign.ts）。
 //              重なったら、ドームの中心を前回の被写体の中心に置き、前回撮った方向のタイルを最初から緑にし、
@@ -41,7 +46,8 @@ import {
   type PoseSample,
   type Vec3,
 } from './coverage';
-import { fit, frameFromVideoFrame, releaseFrame, type ArPose, type Frame } from './frames';
+import { fit, frameFromVideoFrame, releaseFrame, sceneEncoding, type ArPose, type Frame } from './frames';
+import { MotionMeter, MotionWarnings, type MotionWarning } from './sceneMotion';
 import { thinPairs } from './liveVideo';
 import { laplacianVariance, toGray } from './sharpness';
 import { BestPerWindow, FrameCollector, framesPerSecond } from './video';
@@ -108,6 +114,21 @@ export interface ArState {
   locate: LocateState | null;
   /** 前回のメッシュを重ねて見せているか（重ねるメッシュが無ければ null）。 */
   meshShown: boolean | null;
+  /** 風景モード（中心もドームも無い）。 */
+  scene: boolean;
+  /** 風景モード: 撮った写真の位置と向き（真上から見た x, z と、方位角 yaw ラジアン）。 */
+  path: PathPoint[];
+  /** 風景モード: いまの位置と向き。 */
+  here: PathPoint | null;
+  /** 風景モード: その場で向きだけ変えている（spin）・速すぎる（fast）。 */
+  warn: MotionWarning | null;
+}
+
+/** 真上から見た位置と向き（yaw は +x 方向が正の方位角。atan2(視線の x, 視線の -z)）。 */
+export interface PathPoint {
+  x: number;
+  z: number;
+  yaw: number;
 }
 
 export interface ArController {
@@ -143,6 +164,8 @@ export async function startAr(opts: {
   onEnded: () => void;
   /** 続きを撮る: 前回の3Dデータに重ねる。 */
   reference?: ArReference;
+  /** 風景モード: 歩きながら空間を撮る。 */
+  scene?: boolean;
 }): Promise<ArController> {
   const xr = navigator.xr;
   if (!xr) throw new Error('この端末では AR を使えません。');
@@ -209,8 +232,14 @@ export async function startAr(opts: {
   let nextLocateAt = 0;
   let locateAbort: AbortController | null = null;
 
+  // ---- 風景モード ----
+  const sceneMode = !!opts.scene && !reference;
+  const meter = new MotionMeter();
+  const warnings = new MotionWarnings();
+  let warn: MotionWarning | null = null;
+
   // ---- 状態 ----
-  let phase: ArPhase = reference ? 'locating' : 'placing';
+  let phase: ArPhase = reference ? 'locating' : sceneMode ? 'ready' : 'placing';
   let tracking = false;
   /** 撮影中のカメラの位置と視線（中心の寄せ直しと、撮れた方向の数え直し用）。 */
   const samples: PoseSample[] = [];
@@ -230,11 +259,14 @@ export async function startAr(opts: {
   let elapsed = 0;
 
   // ---- 写真の選び方（liveVideo.ts と同じ: 1/3 秒ごとの区間で一番くっきりしたもの、上限で間引く） ----
+  // 風景モードは、時間の代わりに動いた量（MotionMeter の座標。1 = 15cm か 12°）で区間を切る。
   const room = Math.max(1, opts.room);
   let stage = 0;
   let stageStart = 0;
-  let intervalSec = 1 / framesPerSecond;
-  let picker = BestPerWindow.every(intervalSec);
+  /** 区間を数える座標のいまの値（物: 撮り始めてからの秒数、風景: 動いた量）。 */
+  let progress = 0;
+  let interval = sceneMode ? 1 : 1 / framesPerSecond;
+  let picker = BestPerWindow.every(interval);
   const key = (w: number) => stage * 1_000_000 + w;
   const collector = new FrameCollector(null, () => {
     if (collector.frames.length >= room && room >= 2) {
@@ -243,11 +275,11 @@ export async function startAr(opts: {
       collector.replace(kept);
       closeCandidate(picker.finish().map(key));
       stage += 1;
-      stageStart = elapsed;
-      intervalSec *= 2;
-      picker = BestPerWindow.every(intervalSec);
+      stageStart = progress;
+      interval *= 2;
+      picker = BestPerWindow.every(interval);
     }
-  });
+  }, sceneMode ? sceneEncoding : undefined);
   const grab = makeGrabber(renderer);
   /** いま控えている候補の区間と撮影時刻と、そのときのカメラの位置と向き。 */
   let candidate: { key: number; capturedAt: string; pose: ArPose } | null = null;
@@ -278,6 +310,10 @@ export async function startAr(opts: {
       noCameraImage,
       locate: phase === 'locating' ? { ...locate } : null,
       meshShown: hasMesh ? meshShown : null,
+      scene: sceneMode,
+      path: sceneMode ? pathOf(collector.frames) : [],
+      here: sceneMode && tracking ? { x: pos.x, z: pos.z, yaw: Math.atan2(fwd.x, -fwd.z) } : null,
+      warn,
     });
   }
 
@@ -469,8 +505,15 @@ export async function startAr(opts: {
       else locateOnce(tex, xrCamera.width, xrCamera.height, now);
     }
 
+    if (phase === 'recording' && sceneMode && now - lastSample >= sampleIntervalMs) {
+      lastSample = now;
+      warnings.push(now, p, f);
+      warn = warnings.warning(now);
+    }
+
     if (phase === 'recording') {
       elapsed = (now - recordStart) / 1000;
+      progress = sceneMode ? meter.update(p, f, interval) : elapsed;
       const xrCamera = (view as XRView & { camera?: XRCameraLike }).camera;
       const tex = xrCamera ? renderer.xr.getCameraTexture(xrCamera as unknown as Parameters<typeof renderer.xr.getCameraTexture>[0]) : undefined;
       if (!xrCamera || !tex) {
@@ -478,11 +521,11 @@ export async function startAr(opts: {
       } else if (now - lastScore >= scoreIntervalMs) {
         lastScore = now;
         const score = grab.score(tex, xrCamera.width, xrCamera.height);
-        const r = picker.offer(elapsed - stageStart, score);
+        const r = picker.offer(progress - stageStart, score);
         // 先に前の区間の候補を読み出してから、新しい候補で上書きする。
         closeCandidate(r.closed.map(key));
         if (r.keep) {
-          grab.keepCandidate(tex, xrCamera.width, xrCamera.height);
+          grab.keepCandidate(tex, xrCamera.width, xrCamera.height, sceneMode ? sceneEncoding.maxEdge : photoEdge);
           candidate = {
             key: key(r.window),
             capturedAt: new Date().toISOString(),
@@ -616,8 +659,8 @@ function makeGrabber(renderer: THREE.WebGLRenderer) {
       return laplacianVariance(toGray(smallPixels, gray), s.width, s.height);
     },
     /** いまのカメラ画像を、写真の候補として控える（前の候補は上書き）。 */
-    keepCandidate(tex: THREE.Texture, width: number, height: number) {
-      const s = fit(width, height, photoEdge);
+    keepCandidate(tex: THREE.Texture, width: number, height: number, maxEdge = photoEdge) {
+      const s = fit(width, height, maxEdge);
       full = ensure(full, s.width, s.height);
       draw(tex, full);
     },
@@ -641,6 +684,19 @@ function makeGrabber(renderer: THREE.WebGLRenderer) {
 // ---------------------------------------------------------------------------
 // 3D の表示（照準とドーム）
 // ---------------------------------------------------------------------------
+
+/** 風景モード: 撮った写真の位置と向き（真上から見たもの）。 */
+function pathOf(frames: readonly Frame[]): PathPoint[] {
+  const out: PathPoint[] = [];
+  for (const f of frames) {
+    const a = f.arPose;
+    if (!a) continue;
+    const q = new THREE.Quaternion(...a.orientation);
+    const v = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
+    out.push({ x: a.position[0], z: a.position[2], yaw: Math.atan2(v.x, -v.z) });
+  }
+  return out;
+}
 
 /** ドームの半径: 対象までの水平の距離の 4 割（小さすぎ・大きすぎは丸める）。 */
 function domeRadius(distance: number): number {

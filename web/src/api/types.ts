@@ -78,6 +78,8 @@ export interface Scan {
   baseFrameCount: number;
   /** 「続きを撮る」と位置合わせ（VPS）に使えるか。 */
   resumable: boolean;
+  /** 撮り方（object: 物を囲んで撮った / scene: 歩きながら空間を撮った）。 */
+  captureMode: CaptureMode;
   /** この版を元にした続きの版（新しい順）。 */
   continuations: Continuation[];
   /** あとで作る 3DGS が待ち行列にあればその状況。無ければ省略。 */
@@ -106,9 +108,14 @@ export interface Continuation {
   frameCount: number;
 }
 
+/** 撮り方。object は物を1つ囲んで撮る、scene は歩きながら空間（部屋・庭・街並み）を撮る。 */
+export type CaptureMode = 'object' | 'scene';
+
 export interface Limits {
   minImages: number;
   maxImages: number;
+  /** 風景モード（歩きながら空間を撮る）の写真の上限。 */
+  maxSceneImages: number;
   maxImageBytes: number;
   maxUploadBytes: number;
   maxImagePixels: number;

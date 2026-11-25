@@ -5,11 +5,13 @@
 //              撮れた方向は緑、次に撮る方向は琥珀色
 //   画面の端    次に撮る方向へ、左・右・上の矢印
 //   下          録画ボタン（赤い丸 → 赤い四角）。横の1周が埋まったら緑に光る
+//   風景モード  ドームの図の代わりに、歩いた道を真上から見た図（自分の向きがいつも上）。撮った所が緑の点と向き。
+//              その場で向きだけ変えている・速すぎるときは、真ん中に「横に歩く」「ゆっくり」
 //   続きを撮る  最初は位置合わせ中の照準（前回撮った所を映してもらう）。重なったら、前回のメッシュを
 //              見せる・隠すボタン（目の形）を右上に出す
 import { useEffect, useRef } from 'react';
 import { tiles } from './coverage';
-import type { ArState } from './arSession';
+import type { ArState, PathPoint } from './arSession';
 
 interface Props {
   state: ArState | null;
@@ -38,6 +40,7 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace, onToggleMe
 
   const phase = state?.phase ?? 'placing';
   const locating = phase === 'locating';
+  const scene = !!state?.scene;
   const sideDone = state ? tiles.filter((t, i) => t.band === 'side' && state.covered[i]).length : 0;
   const loopDone = sideDone === tiles.filter((t) => t.band === 'side').length;
   const turn = phase === 'recording' || phase === 'ready' ? state?.target?.turn : undefined;
@@ -49,7 +52,7 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace, onToggleMe
         <RoundButton label="閉じる" onClick={onCancel}>
           <path d="M6 6l12 12M18 6L6 18" />
         </RoundButton>
-        {state && phase !== 'placing' && !locating && <DomeMap state={state} />}
+        {state && phase !== 'placing' && !locating && (scene ? <PathMap path={state.path} here={state.here} /> : <DomeMap state={state} />)}
         {state?.meshShown != null && !locating ? (
           <RoundButton label={state.meshShown ? '前回のメッシュを隠す' : '前回のメッシュを見せる'} onClick={onToggleMesh}>
             <path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z" />
@@ -106,7 +109,23 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace, onToggleMe
       )}
 
       {/* 対象を向いていない（撮っても緑にならない）ときは、画面の中央に照準を出して「対象に向ける」と伝える */}
-      {state && !state.facing && (phase === 'ready' || phase === 'recording') && (
+      {/* 風景モード: 端末の位置が分かるまでは「ゆっくり動かす」。撮影中の警告 */}
+      {scene && !state?.tracking && phase === 'ready' && (
+        <div className="absolute inset-x-0 top-1/2 mt-16 flex flex-col items-center gap-2 drop-shadow">
+          <MovePhone />
+          <p className="text-center text-base font-semibold">ゆっくり動かす</p>
+        </div>
+      )}
+      {scene && phase === 'recording' && state?.warn && (
+        <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 flex-col items-center gap-2 drop-shadow">
+          {state.warn === 'spin' && <WalkSideways />}
+          <p className="rounded-full bg-black/60 px-4 py-1.5 text-base font-semibold text-amber">
+            {state.warn === 'spin' ? '横に歩く' : 'ゆっくり'}
+          </p>
+        </div>
+      )}
+
+      {state && !scene && !state.facing && (phase === 'ready' || phase === 'recording') && (
         <span className="absolute left-1/2 top-1/2 size-16 -translate-x-1/2 -translate-y-1/2 animate-pulse rounded-full border-4 border-paper/80" />
       )}
 
@@ -159,6 +178,55 @@ export function MovePhone() {
         <path d="M30 29h4" />
       </g>
       <path d="M10 20h-6m0 0l3-3m-3 3l3 3M54 20h6m0 0l-3-3m3 3l-3 3" strokeOpacity="0.7" />
+    </svg>
+  );
+}
+
+/**
+ * 風景モード: 歩いた道を真上から見た図。自分（琥珀色の三角）が真ん中で、向いている方がいつも上。
+ * 撮った所は緑の点と、その写真の向きの短い線。全体が収まるように縮める（最低でも半径 1m 分）。
+ */
+function PathMap({ path, here }: { path: PathPoint[]; here: PathPoint | null }) {
+  const size = 84;
+  const c = size / 2;
+  const origin = here ?? path.at(-1) ?? { x: 0, z: 0, yaw: 0 };
+  const cos = Math.cos(origin.yaw);
+  const sin = Math.sin(origin.yaw);
+  // 自分の向きが上（SVG の -y）になるように回す。
+  const local = (p: PathPoint) => {
+    const dx = p.x - origin.x;
+    const dz = p.z - origin.z;
+    return { x: dx * cos + dz * sin, y: -dx * sin + dz * cos };
+  };
+  const far = Math.max(1, ...path.map((p) => Math.hypot(p.x - origin.x, p.z - origin.z)));
+  const scale = (c - 8) / far;
+  return (
+    <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size} aria-hidden>
+      <circle cx={c} cy={c} r={c - 1} fill="rgba(0,0,0,0.45)" />
+      {path.map((p, i) => {
+        const l = local(p);
+        const x = c + l.x * scale;
+        const y = c + l.y * scale;
+        const a = p.yaw - origin.yaw;
+        return (
+          <g key={i} stroke="#34d399" fill="#34d399">
+            <line x1={x} y1={y} x2={x + 6 * Math.sin(a)} y2={y - 6 * Math.cos(a)} strokeWidth={1.5} strokeLinecap="round" />
+            <circle cx={x} cy={y} r={2} stroke="none" />
+          </g>
+        );
+      })}
+      <path d={`M${c} ${c - 6} L${c + 5} ${c + 5} L${c} ${c + 2} L${c - 5} ${c + 5} Z`} fill="#f5a524" />
+    </svg>
+  );
+}
+
+/** 風景モードの「横に歩く」の絵（人と左右の矢印）。 */
+function WalkSideways() {
+  return (
+    <svg viewBox="0 0 64 40" width="72" height="45" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <circle cx="32" cy="8" r="4" />
+      <path d="M32 13v12M32 25l-5 10M32 25l5 10M24 18h16" />
+      <path d="M14 22H4m0 0l4-4m-4 4l4 4M50 22h10m0 0l-4-4m4 4l-4 4" strokeOpacity="0.8" />
     </svg>
   );
 }

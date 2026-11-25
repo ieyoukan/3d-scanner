@@ -21,6 +21,7 @@ function scan(status: ScanStatus, statuses: Partial<Record<StepName, StepStatus>
     title: '',
     baseFrameCount: 0,
     resumable: false,
+    captureMode: 'object',
     continuations: [],
     error: null,
     steps: names.map((n) => step(n, statuses[n] ?? 'pending')),

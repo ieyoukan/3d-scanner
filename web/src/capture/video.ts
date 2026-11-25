@@ -18,7 +18,7 @@
 //   そういう区間は、再生の後でその区間の中央へ移動して1枚取る（1周の中に抜けを作らない）。
 //
 // 選んだコマはその場で JPEG にする。全部の区間のコマを展開したまま持つと、スマホのメモリが足りなくなるため。
-import { FrameError, fit, frameFromVideoFrame, releaseFrame, type ArPose, type Frame } from './frames';
+import { FrameError, fit, frameFromVideoFrame, releaseFrame, type ArPose, type Frame, type FrameEncoding } from './frames';
 import { laplacianVariance, toGray } from './sharpness';
 
 /** 1秒あたりに選ぶ写真の枚数。 */
@@ -118,10 +118,12 @@ export class FrameCollector {
   /**
    * @param source  写し取る映像（keep を使うときだけ要る。AR では add で画像を直接渡す）
    * @param onFrame 写真が1枚できるたびに呼ばれる
+   * @param encode  写真の大きさと画質（省略すると通常の写真と同じ）
    */
   constructor(
     private readonly source: HTMLVideoElement | null,
     private readonly onFrame?: (frame: Frame) => void,
+    private readonly encode?: FrameEncoding,
   ) {}
 
   /** いま表示されているコマを、区間 key の候補として写し取る（前の候補は捨てる）。 */
@@ -148,7 +150,7 @@ export class FrameCollector {
       try {
         bitmap = await image;
         if (this.discarded) return;
-        const frame = await frameFromVideoFrame(bitmap, capturedAt);
+        const frame = await frameFromVideoFrame(bitmap, capturedAt, this.encode);
         if (arPose) frame.arPose = arPose;
         if (this.discarded) {
           releaseFrame(frame);
@@ -218,13 +220,15 @@ export interface VideoOptions {
   room: number;
   signal: AbortSignal;
   onProgress: (p: VideoProgress) => void;
+  /** 写真の大きさと画質（風景モードは小さめ）。 */
+  encode?: FrameEncoding;
 }
 
 /** 動画ファイルから写真を選ぶ。中止したら AbortError（DOMException）で終わる。 */
 export async function framesFromVideo(file: File, opts: VideoOptions): Promise<Frame[]> {
   const { video, signal } = opts;
   const url = URL.createObjectURL(file);
-  const collector = new FrameCollector(video);
+  const collector = new FrameCollector(video, undefined, opts.encode);
   const cleanups: (() => void)[] = [];
   try {
     video.muted = true;

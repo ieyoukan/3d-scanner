@@ -63,6 +63,8 @@ type SceneInfo struct {
 	names []string
 	// poses は位置を推定できた写真のカメラ。AR の位置との突き合わせに使う。scene.json には書かない。
 	poses []ImagePose
+	// models は mapper が出したモデルの数（写真が何か所に分かれてつながったか）。scene.json には書かない。
+	models int
 }
 
 // ImagePose は images.txt から読んだ写真1枚ぶんのカメラの位置と向き（世界座標）。

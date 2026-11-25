@@ -19,6 +19,7 @@ function scan(assets: AssetKind[], steps: Partial<Record<StepName, Partial<Step>
     title: '',
     baseFrameCount: 0,
     resumable: false,
+    captureMode: 'object',
     continuations: [],
     error: null,
     steps: names.map((name) => ({

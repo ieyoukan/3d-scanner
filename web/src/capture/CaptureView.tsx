@@ -29,10 +29,11 @@ import { useCamera } from '../camera/useCamera';
 import { Button, buttonClass } from '../ui/Button';
 import { AlertIcon, CameraIcon, ForwardIcon, ImagesIcon, VideoIcon } from '../ui/icons';
 import { decide, initialAutoState, markCaptured, signatureOf, type AutoAdvice, type AutoState } from './autoCapture';
-import { frameFromCapture, frameFromFile, frameFromPhoto, FrameError, type Frame } from './frames';
+import { frameFromCapture, frameFromFile, frameFromPhoto, FrameError, sceneEncoding, type Frame } from './frames';
 import { captureHint } from './validation';
 import { ArHud } from './ArHud';
 import type { ArController, ArReference, ArState } from './arSession';
+import { usePreference } from './usePreference';
 import { arSupported } from './arSupport';
 import { startLiveRecording, type LiveProgress, type LiveRecording } from './liveVideo';
 import { framesFromVideo, type VideoProgress } from './video';
@@ -42,30 +43,6 @@ const autoIntervalMs = 200;
 /** 判断に使う映像の大きさ（4:3）。 */
 const sampleWidth = 64;
 const sampleHeight = 48;
-
-/** 端末に覚えておく設定（次に開いたときも同じにする）。 */
-function usePreference(key: string, initial: boolean): [boolean, (v: boolean) => void] {
-  const [value, setValue] = useState(() => {
-    try {
-      const saved = window.localStorage.getItem(key);
-      return saved === null ? initial : saved === '1';
-    } catch {
-      return initial;
-    }
-  });
-  const set = useCallback(
-    (v: boolean) => {
-      setValue(v);
-      try {
-        window.localStorage.setItem(key, v ? '1' : '0');
-      } catch {
-        // 保存できない（プライベートモードなど）ときは、この画面の間だけ覚える。
-      }
-    },
-    [key],
-  );
-  return [value, set];
-}
 
 /** 自動撮影の案内。 */
 function autoHint(advice: AutoAdvice | null, tooFar: boolean): string {
@@ -121,9 +98,14 @@ interface Props {
   paused?: boolean;
   /** 続きを撮る: AR で撮るとき、前回の3Dデータを位置合わせして重ねる。 */
   arReference?: ArReference;
+  /**
+   * 風景モード（歩きながら空間を撮る）。AR は中心もドームも使わず歩いた道を出し、写真は動いた量ごとに選ぶ。
+   * 動画で撮るときも、写真を小さめ（長辺 1600px）にする（枚数が多いので）。
+   */
+  scene?: boolean;
 }
 
-export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, paused = false, arReference }: Props) {
+export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, paused = false, arReference, scene = false }: Props) {
   const camera = useCamera();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -314,6 +296,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
     framesFromVideo(importFile, {
       video,
       room: roomRef.current,
+      encode: scene ? sceneEncoding : undefined,
       signal: controller.signal,
       onProgress: (p) => {
         if (active) setImportProgress(p);
@@ -372,6 +355,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
       overlay: overlayEl,
       room: limits.maxImages - frames.length,
       reference: arReference,
+      scene,
       onState: setArState,
       onEnded: () => {
         arCtl.current = null;
@@ -423,6 +407,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
     try {
       rec = startLiveRecording(video, {
         room: limits.maxImages - frames.length,
+        encode: scene ? sceneEncoding : undefined,
         // 毎コマ描き直さないよう、秒か枚数が変わったときだけ表示を更新する。
         onProgress: (p) =>
           setRecording((prev) =>
@@ -536,9 +521,11 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
               {paused
                 ? '写真を送信しています。送信が終わるまで撮影を止めています。'
                 : mode === 'ar'
-                  ? 'AR で撮ると、撮れた方向が緑になります'
+                  ? scene
+                    ? 'AR で撮ると、歩いた道が出ます。横に歩きながら撮ります'
+                    : 'AR で撮ると、撮れた方向が緑になります'
                   : mode === 'video'
-                  ? videoHint(isRecording, finishing)
+                  ? videoHint(isRecording, finishing, scene)
                   : auto
                     ? autoHint(advice, tooFar)
                     : (hint ?? captureHint(frames.length, limits))}
@@ -553,7 +540,9 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
           <Overlay>
             <VideoIcon width={36} height={36} className="text-mute" />
             <p className="max-w-xs text-center text-sm text-mute">
-              いちばん簡単なのは、対象のまわりを歩きながら動画で1周撮ることです。写真を1枚ずつ撮ることもできます。
+              {scene
+                ? '撮りたい場所を、横に歩きながら動画で撮るのがいちばん簡単です。その場で向きだけ変えると立体になりません。'
+                : 'いちばん簡単なのは、対象のまわりを歩きながら動画で1周撮ることです。写真を1枚ずつ撮ることもできます。'}
             </p>
             <div className="grid w-full max-w-xs grid-cols-2 gap-2">
               {arOk && (
@@ -765,8 +754,13 @@ function isShown(el: HTMLElement | null): boolean {
 }
 
 /** 動画で撮るときの案内。 */
-function videoHint(recording: boolean, finishing: boolean): string {
+function videoHint(recording: boolean, finishing: boolean, scene: boolean): string {
   if (finishing) return '写真にしています…';
+  if (scene) {
+    return recording
+      ? '横に歩きながら、ゆっくり撮ってください。その場で向きだけ変えると、奥行きが分かりません。'
+      : '録画ボタンを押して、撮りたい場所を横に歩きながら撮ります。その場で回らないでください。';
+  }
   if (recording) return '対象のまわりを、歩きながらゆっくり1周してください。1周したら停止します。';
   return '録画ボタンを押して、対象のまわりを歩きながら1周撮ります（10〜30秒）。';
 }

@@ -281,11 +281,33 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 	// (2) マッチング: 写真の全ペアについて、記述子が似ている特徴点どうしを対応づける。
 	//   入力: database.db の特徴点    出力: database.db に「画像Aの点i ↔ 画像Bの点j」の対応
 	//   exhaustive（総当たり）は N 枚で N(N-1)/2 ペアを調べる。数十枚なら確実で速い。
-	//   数百枚を超えたら sequential_matcher や vocab_tree_matcher に替える。
+	//   風景モード（歩きながら空間を撮った）は写真が多く、総当たりでは遅すぎるので、撮った順に近い写真・
+	//   1周分離れた写真・AR の位置が近い写真の組だけを照合する（scene_mode.go の ScenePairs）。
 	//   対応はエピポーラ幾何（2台のカメラの位置関係が満たすべき式）で検証され、誤対応が除かれる。
-	args = []string{"exhaustive_matcher",
-		"--database_path", ws.DatabasePath(),
-		"--FeatureMatching.use_gpu", boolArg(p.cfg.ColmapUseGPU),
+	mode := ReadCaptureMode(ws)
+	names, err := listImageNames(ws.ImagesDir())
+	if err != nil {
+		return "", err
+	}
+	pairCount := 0
+	if mode == ModeScene {
+		pairs := ScenePairs(names, inherited, ReadARPoses(ws))
+		pairCount = len(pairs)
+		pairsPath := filepath.Join(ws.Dir(), "pairs.txt")
+		if err := WritePairs(pairsPath, pairs); err != nil {
+			return "", err
+		}
+		args = []string{"matches_importer",
+			"--database_path", ws.DatabasePath(),
+			"--match_list_path", pairsPath,
+			"--match_type", "pairs",
+			"--FeatureMatching.use_gpu", boolArg(p.cfg.ColmapUseGPU),
+		}
+	} else {
+		args = []string{"exhaustive_matcher",
+			"--database_path", ws.DatabasePath(),
+			"--FeatureMatching.use_gpu", boolArg(p.cfg.ColmapUseGPU),
+		}
 	}
 	args = p.withThreads(args, "--FeatureMatching.num_threads")
 	if err := p.colmap(ctx, logPath, p.cfg.SfMTimeout, args...); err != nil {
@@ -382,6 +404,21 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		return "", err
 	}
 
+	// つながらなかった写真を「◯〜◯枚目」で伝える（撮り直す所が分かるように）。
+	missingNote := ""
+	if runs := UnregisteredRuns(names, info.names); len(runs) > 0 {
+		missingNote = fmt.Sprintf("位置を推定できなかった写真（%s）は、以降の処理では使われません。", describeRuns(runs))
+		if mode == ModeScene {
+			missingNote += "その辺りで、速く動いた・その場で向きだけ変えた・白い壁など模様の無い所を写した可能性があります。"
+		}
+	}
+	if info.models > 1 {
+		missingNote += fmt.Sprintf("写真が%dか所に分かれてつながったので、いちばん大きいもの（%d枚）を使いました。", info.models, info.RegisteredImages)
+	}
+	if mode == ModeScene {
+		missingNote += fmt.Sprintf("風景モード: 撮った順と位置が近い写真の%d組を照合しました。", pairCount)
+	}
+
 	focalNote := ""
 	if hasHint {
 		focalNote = fmt.Sprintf("写真に記録された焦点距離（35mm 換算 %gmm）を手掛かりにしました。", hint.FocalLength35mm)
@@ -393,14 +430,11 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		if added < addedTotal {
 			msg += "位置を合わせられなかった写真は、以降の処理では使われません。"
 		}
-		return msg + focalNote + arNote, nil
+		return msg + missingNote + focalNote + arNote, nil
 	}
 	msg := fmt.Sprintf("%d枚中%d枚のカメラ位置を推定し、%d個の3D点を得ました（平均再投影誤差 %.2f px）。",
 		info.TotalImages, info.RegisteredImages, info.Points, info.MeanReprojectionError)
-	if info.RegisteredImages < info.TotalImages {
-		msg += "位置を推定できなかった写真は、以降の処理では使われません。"
-	}
-	return msg + focalNote + arNote, nil
+	return msg + missingNote + focalNote + arNote, nil
 }
 
 // noNewImagesMessage は、続きの版で今回の写真を1枚も地図に合わせられなかったときの説明。
@@ -438,6 +472,7 @@ func (p *Pipeline) selectBestModel(ctx context.Context, ws *workspace.Scan, logP
 	}
 	var best *SceneInfo
 	bestName := ""
+	models := 0
 	for _, e := range entries {
 		// mapper が作るモデルのディレクトリ名は 0, 1, 2 ... の数字。
 		if _, convErr := strconv.Atoi(e.Name()); !e.IsDir() || convErr != nil {
@@ -460,6 +495,7 @@ func (p *Pipeline) selectBestModel(ctx context.Context, ws *workspace.Scan, logP
 			p.log.Warn("モデルを読めないので候補から外します", "model", e.Name(), "error", err)
 			continue
 		}
+		models++
 		if best == nil || info.RegisteredImages > best.RegisteredImages {
 			best, bestName = info, e.Name()
 		}
@@ -468,6 +504,7 @@ func (p *Pipeline) selectBestModel(ctx context.Context, ws *workspace.Scan, logP
 	if best == nil {
 		return nil, friendly(noModelMessage)
 	}
+	best.models = models
 	if best.RegisteredImages < minRegisteredImages {
 		return nil, friendly(fmt.Sprintf("%d枚中%d枚しかカメラの位置を推定できませんでした。"+
 			"写真の重なりが足りないか、ぶれている可能性があります。枚数を増やして撮り直してください。",

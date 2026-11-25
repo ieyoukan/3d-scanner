@@ -60,7 +60,10 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
   // 引き継ぐ写真の枚数。サーバーは元の版の写真を全部引き継ぐ。
   const base = scan.frameCount;
   // 処理には全部の写真を使うので、上限は引き継ぐ写真と合わせた枚数で決まる。今回は1枚からでよい。
-  const room = config.limits.maxImages - base;
+  // 風景モードで撮ったスキャンは、風景モードの上限（サーバーも元の版の撮り方を引き継ぐ）。
+  const scene = scan.captureMode === 'scene';
+  const maxTotal = scene ? config.limits.maxSceneImages : config.limits.maxImages;
+  const room = maxTotal - base;
   const limits = useMemo<Limits>(
     () => ({ ...config.limits, minImages: 1, maxImages: Math.max(room, 0) }),
     [config.limits, room],
@@ -73,12 +76,13 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
   const info = useSceneInfo(scan);
   // AR で撮るときは、前回の3Dデータを位置合わせして重ねる（地図の真上・中心・カメラ位置と、メッシュ）。
   const meshUrl = scan.assets.find((a) => a.kind === 'mesh_glb')?.url ?? null;
+  // 風景モードのスキャンは、中心とドームを使わないので重ねない（歩いた道を出す、ふつうの風景モードで撮る）。
   const arReference = useMemo<ArReference | undefined>(
     () =>
-      info
+      info && !scene
         ? { info, meshUrl, localize: (image: Blob, signal: AbortSignal) => localizeFrame(scan.id, image, signal) }
         : undefined,
-    [info, meshUrl, scan.id],
+    [info, meshUrl, scan.id, scene],
   );
   const { state, fixes, check: locate, forget, reset } = useLocalize(scan.id);
 
@@ -125,7 +129,7 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
       <main className="flex min-h-dvh flex-col items-center justify-center gap-4 px-6 text-center text-sm text-mute">
         <AlertIcon width={28} height={28} className="text-amber" />
         <p className="max-w-sm">
-          このスキャンは写真が{base}枚あり、上限（{config.limits.maxImages}枚）に達しているので、これ以上追加できません。
+          このスキャンは写真が{base}枚あり、上限（{maxTotal}枚）に達しているので、これ以上追加できません。
         </p>
         <Link to={backTo} className={buttonClass('primary')}>
           3Dデータに戻る
@@ -161,6 +165,7 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
             onReview={() => setPhase('review')}
             paused={sending}
             arReference={arReference}
+            scene={scene}
             hint={resumeHint(frames.length, limits.maxImages, state)}
             overlay={
               <div className="flex items-start justify-between gap-3">

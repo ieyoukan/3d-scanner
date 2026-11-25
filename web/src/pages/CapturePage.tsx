@@ -5,13 +5,20 @@
 //   phase   いま「撮影」と「確認」のどちらを見ているか
 //
 // 送信が受け付けられたら /scans/<id> に移動する。以降の進行状況はそちらの画面が担当する。
+//
+// 撮るもの（上の切り替え）:
+//   物    物を1つ囲んで撮る（既定）。AR はドームで撮れた方向を見せる
+//   風景  歩きながら空間（部屋・庭・街並み）を撮る。写真の上限が多く（maxSceneImages）、サーバーは撮った順・
+//         位置の近い写真だけを照合する。AR は歩いた道を見せ、その場で回る・速すぎるときに警告する
+//   1枚でも撮ったら切り替えられない（1回の送信の写真は、同じ撮り方でそろえる）。
 import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import type { ServerConfig } from '../api/types';
+import type { Limits, ServerConfig } from '../api/types';
 import { CaptureView } from '../capture/CaptureView';
 import { FrameGallery } from '../capture/FrameGallery';
 import { findBlurry } from '../capture/sharpness';
 import { useFrames } from '../capture/useFrames';
+import { usePreference } from '../capture/usePreference';
 import { checkFrames } from '../capture/validation';
 import { Button } from '../ui/Button';
 import { BackIcon, GridIcon, InfoIcon } from '../ui/icons';
@@ -24,7 +31,12 @@ interface Props {
 }
 
 export function CapturePage({ config }: Props) {
-  const { limits } = config;
+  const [scene, setScene] = usePreference('capture.scene', false);
+  // 風景モードは写真の上限が多い。
+  const limits = useMemo<Limits>(
+    () => (scene ? { ...config.limits, maxImages: config.limits.maxSceneImages } : config.limits),
+    [config.limits, scene],
+  );
   const navigate = useNavigate();
   const { frames, add, remove, clear } = useFrames(limits.maxImages);
   const [phase, setPhase] = useState<Phase>('capture');
@@ -54,7 +66,10 @@ export function CapturePage({ config }: Props) {
             撮影に戻る
           </button>
         ) : (
-          <h1 className="text-base font-semibold tracking-wide">3D Scanner</h1>
+          <>
+            <h1 className="sr-only">3D Scanner</h1>
+            <SubjectSwitch scene={scene} onChange={setScene} disabled={frames.length > 0 || sending} />
+          </>
         )}
         <div className="-mr-2 flex items-center">
           <button
@@ -80,7 +95,14 @@ export function CapturePage({ config }: Props) {
       */}
       <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] lg:gap-4 lg:px-4 lg:pb-4">
         <div className={`min-h-0 overflow-hidden lg:block lg:rounded-xl lg:border lg:border-line ${phase === 'capture' ? '' : 'hidden'}`}>
-          <CaptureView frames={frames} limits={limits} onAdd={add} onReview={() => setPhase('review')} paused={sending} />
+          <CaptureView
+            frames={frames}
+            limits={limits}
+            onAdd={add}
+            onReview={() => setPhase('review')}
+            paused={sending}
+            scene={scene}
+          />
         </div>
 
         <div className={`min-h-0 flex-col lg:flex ${phase === 'review' ? 'flex' : 'hidden'}`}>
@@ -103,6 +125,7 @@ export function CapturePage({ config }: Props) {
               keepCompleted={config.keepCompleted}
               pipeline={config.pipeline}
               onSendingChange={setSending}
+              mode={scene ? 'scene' : 'object'}
               onCreated={(result) => {
                 // 送信済みの写真はもう不要。メモリを空けてから移動する。
                 clear();
@@ -113,14 +136,49 @@ export function CapturePage({ config }: Props) {
         </div>
       </div>
 
-      {showGuide && <CaptureGuide minImages={limits.minImages} onClose={() => setShowGuide(false)} />}
+      {showGuide && (
+        <CaptureGuide minImages={limits.minImages} maxSceneImages={config.limits.maxSceneImages} onClose={() => setShowGuide(false)} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * 撮るもの（物 / 風景）の切り替え。1枚でも撮ったら切り替えられない（写真の撮り方がそろわなくなるため）。
+ */
+function SubjectSwitch({ scene, onChange, disabled }: { scene: boolean; onChange: (scene: boolean) => void; disabled: boolean }) {
+  const options = [
+    { value: false, label: '物' },
+    { value: true, label: '風景' },
+  ];
+  return (
+    <div role="radiogroup" aria-label="撮るもの" className="flex rounded-lg bg-ink p-1">
+      {options.map((o) => (
+        <button
+          key={o.label}
+          type="button"
+          role="radio"
+          aria-checked={scene === o.value}
+          disabled={disabled && scene !== o.value}
+          onClick={() => onChange(o.value)}
+          className={`min-h-9 rounded-md px-4 text-sm ${
+            scene === o.value ? 'bg-panel font-semibold text-paper' : 'text-mute disabled:opacity-40'
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
     </div>
   );
 }
 
 /** 撮り方の説明。なぜそう撮るのか（SfM の都合）を一言ずつ添える。 */
-function CaptureGuide({ minImages, onClose }: { minImages: number; onClose: () => void }) {
+function CaptureGuide({ minImages, maxSceneImages, onClose }: { minImages: number; maxSceneImages: number; onClose: () => void }) {
   const tips: { title: string; why: string }[] = [
+    {
+      title: '部屋や庭など空間は「風景」で、横に歩きながら',
+      why: `上の切り替えを「風景」にすると、写真を最大${maxSceneImages}枚まで撮れます。その場で向きだけ変えると奥行きが分からないので、撮りたい物から目を離さずに横へ歩きます。AR なら歩いた道が出て、その場で回ったり速すぎたりすると知らせます。遠くの山や空は立体になりません。`,
+    },
     {
       title: 'AR なら、撮れた方向が色でわかる',
       why: '対応する Android では「AR」で撮れます。対象に合わせてタップすると半球が出て、撮れた方向が緑に、次に撮る方向が琥珀色になります。矢印の方へ回るだけです。',
