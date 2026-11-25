@@ -361,7 +361,19 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		return "", err
 	}
 
-	// (6) ビューア用の要約（上方向・中心・カメラ位置）を書き出す。
+	// (6) AR で撮った写真があれば、AR が測ったカメラ位置と突き合わせて、実際の大きさと重力の向きを入れる。
+	arNote := ""
+	if ar := ReadARPoses(ws); len(ar) > 0 {
+		if al, ok := AlignToAR(info.poses, ar); ok {
+			info.MetersPerUnit, info.Up = al.Scale, al.Up
+			arNote = fmt.Sprintf("AR で測った%d枚の位置から、実際の大きさが分かりました（ずれ %.1f cm）。", al.Images, al.RMS*100)
+			p.log.Info("AR の位置と合わせました", "scan", job.ID, "images", al.Images, "metersPerUnit", al.Scale, "rmsMeters", al.RMS)
+		} else {
+			p.log.Info("AR の位置と合わせられませんでした", "scan", job.ID, "arPoses", len(ar))
+		}
+	}
+
+	// (7) ビューア用の要約（上方向・中心・カメラ位置・大きさ）を書き出す。
 	scenePath := filepath.Join(ws.OutputDir(), "scene.json")
 	if err := WriteSceneInfo(info, scenePath); err != nil {
 		return "", err
@@ -381,14 +393,14 @@ func (p *Pipeline) runSfM(ctx context.Context, job Job, rep Reporter) (string, e
 		if added < addedTotal {
 			msg += "位置を合わせられなかった写真は、以降の処理では使われません。"
 		}
-		return msg + focalNote, nil
+		return msg + focalNote + arNote, nil
 	}
 	msg := fmt.Sprintf("%d枚中%d枚のカメラ位置を推定し、%d個の3D点を得ました（平均再投影誤差 %.2f px）。",
 		info.TotalImages, info.RegisteredImages, info.Points, info.MeanReprojectionError)
 	if info.RegisteredImages < info.TotalImages {
 		msg += "位置を推定できなかった写真は、以降の処理では使われません。"
 	}
-	return msg + focalNote, nil
+	return msg + focalNote + arNote, nil
 }
 
 // noNewImagesMessage は、続きの版で今回の写真を1枚も地図に合わせられなかったときの説明。

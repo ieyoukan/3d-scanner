@@ -116,7 +116,7 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
 }
 
 /** 端末を左右にゆっくり動かす絵（AR が周りを見つけるには、端末を少し動かす必要がある）。 */
-function MovePhone() {
+export function MovePhone() {
   return (
     <svg viewBox="0 0 64 40" width="72" height="45" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
       <g className="ar-sway">

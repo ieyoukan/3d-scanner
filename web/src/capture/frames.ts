@@ -30,6 +30,16 @@ export interface Frame {
    * 映像や動画から切り出したコマには EXIF が無いので、いつも null。
    */
   focalLength35mm: number | null;
+  /** AR で撮ったときの、撮った瞬間のカメラの位置と向き（サーバーが実際の大きさを求めるのに使う）。 */
+  arPose?: ArPose;
+}
+
+/** AR（WebXR）が測ったカメラの位置（メートル、y が上）と向き（四元数 x, y, z, w）。 */
+export interface ArPose {
+  /** AR を始めてから終えるまでの1回の印。AR の座標系は回ごとに違う。 */
+  session: string;
+  position: [number, number, number];
+  orientation: [number, number, number, number];
 }
 
 /** サムネイルの長辺（画素）。 */

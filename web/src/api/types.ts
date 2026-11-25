@@ -187,6 +187,8 @@ export interface SceneInfo {
   /** 中心からの広がりの目安。 */
   radius: number;
   cameraPositions: [number, number, number][];
+  /** 座標の 1 が何メートルか。AR で撮った写真の位置から求められたときだけある（そのとき up は重力の向き）。 */
+  metersPerUnit?: number;
 }
 
 /** 位置合わせ（VPS）の結果（POST /api/scans/:id/localize）。座標は地図（scene.json と同じ）の座標系。 */

@@ -29,4 +29,22 @@ describe('buildMetadata', () => {
     expect(JSON.stringify(meta)).not.toContain('blob:thumb');
     expect(JSON.stringify(meta)).not.toContain('sharpness');
   });
+
+  it('AR で撮った写真は、カメラの位置と向きも送る', () => {
+    const arPose = { session: 's1', position: [0.1, 1.2, -0.3], orientation: [0, 0, 0, 1] } as Frame['arPose'];
+    const frame: Frame = {
+      id: 'f1',
+      blob: new Blob(['x']),
+      thumbUrl: 'blob:thumb',
+      width: 1920,
+      height: 1080,
+      capturedAt: '2026-11-25T09:00:00.000Z',
+      source: 'video',
+      sharpness: 1,
+      focalLength35mm: null,
+      arPose,
+    };
+    const meta = JSON.parse(buildMetadata([frame], {})) as { frames: { arPose?: unknown }[] };
+    expect(meta.frames[0]!.arPose).toEqual(arPose);
+  });
 });

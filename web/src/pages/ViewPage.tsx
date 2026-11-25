@@ -8,6 +8,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { fetchSceneInfo, renameScan, requestSplat } from '../api/client';
 import type { Scan, SceneInfo, ServerConfig } from '../api/types';
+import { arSupported } from '../capture/arSupport';
 import { formatBytes } from '../capture/validation';
 import { displayTitle } from '../gallery/gallery';
 import { useScan } from '../progress/useScan';
@@ -17,11 +18,14 @@ import {
   AlertIcon,
   BackIcon,
   CloseIcon,
+  CubeIcon,
   DownloadIcon,
   PencilIcon,
   ResetViewIcon,
   SpinnerIcon,
 } from '../ui/icons';
+import type { ArViewController, ArViewState } from '../viewer/arView';
+import { ArViewHud } from '../viewer/ArViewHud';
 import { computeViewFrame } from '../viewer/sceneFrame';
 import { buildDownloads, buildTabs, defaultTab, type TabKey, type ViewerTab } from '../viewer/tabs';
 import type { ViewerHandle, ViewerState } from '../viewer/types';
@@ -87,6 +91,10 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
 
   // ビューアに渡す関数は useCallback で同じものを保つ（理由は frame と同じ）。
   const onState = useCallback((next: ViewerState) => setState(next), []);
+
+  const ar = useArView();
+  // AR で見るのはメッシュだけ（向きと大きさに scene.json を使う）。
+  const arTarget = active?.key === 'mesh' && active.url && info ? { url: active.url, info } : null;
 
   // 生成できなかった出力。隠さずに一覧で示す。
   const missing = tabs.filter((t) => t.url === null);
@@ -167,6 +175,13 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
             <DownloadIcon />
             保存
           </Button>
+          {ar.ok && arTarget && (
+            <Button className="col-span-2" onClick={() => ar.start(arTarget.url, arTarget.info)} disabled={ar.active}>
+              <CubeIcon />
+              AR で見る
+            </Button>
+          )}
+          {ar.notice && <p className="col-span-2 text-xs text-amber">{ar.notice}</p>}
           {scan.resumable && (
             // 位置合わせ（VPS）をしながら撮り足し、この3Dデータを作り直す。
             <Link to={`/scans/${scan.id}/resume`} className={buttonClass('secondary', 'col-span-2')}>
@@ -176,6 +191,20 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
           )}
         </div>
       </footer>
+
+      {/* AR の上に重ねる画面の根。AR の間はブラウザが全画面に広げる。ふだんは空で場所を取らない。 */}
+      <div ref={ar.root}>
+        {ar.active && (
+          <ArViewHud
+            state={ar.state}
+            onClose={() => ar.ctl.current?.end()}
+            onReplace={() => ar.ctl.current?.replace()}
+            onRotate={(r) => ar.ctl.current?.rotateBy(r)}
+            onZoom={(f) => ar.ctl.current?.zoomBy(f)}
+            onResetZoom={() => ar.ctl.current?.resetZoom()}
+          />
+        )}
+      </div>
 
       {showDownloads && (
         <div role="dialog" aria-modal="true" aria-label="ファイルを保存" className="fixed inset-0 z-20 flex items-end bg-black/60 sm:items-center sm:justify-center">
@@ -360,4 +389,66 @@ function MakeSplatButton({ scan }: { scan: Scan }) {
       {error && <span className="block text-bad">{error}</span>}
     </>
   );
+}
+
+/**
+ * AR で見る（viewer/arView.ts）。対応端末（Android の Chrome）だけ使える。
+ * AR 本体（three.js を含む）は、AR が使える端末でだけ先に読み込んでおく。ボタンを押してから読み込むと、
+ * ブラウザが「操作の直後」と認めず AR を始めさせないことがある。
+ */
+function useArView() {
+  const [ok, setOk] = useState(false);
+  const [active, setActive] = useState(false);
+  const [state, setState] = useState<ArViewState | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const root = useRef<HTMLDivElement>(null);
+  const ctl = useRef<ArViewController | null>(null);
+  const module = useRef<typeof import('../viewer/arView') | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void arSupported().then((supported) => {
+      if (!alive || !supported) return;
+      setOk(true);
+      void import('../viewer/arView').then((m) => {
+        module.current = m;
+      });
+    });
+    return () => {
+      alive = false;
+      ctl.current?.end();
+    };
+  }, []);
+
+  const start = (meshUrl: string, info: SceneInfo) => {
+    const overlay = root.current;
+    if (!overlay || active) return;
+    setNotice(null);
+    setState(null);
+    setActive(true);
+    const begin = (m: typeof import('../viewer/arView')) =>
+      m.startArView({
+        overlay,
+        meshUrl,
+        info,
+        onState: setState,
+        onEnded: () => {
+          ctl.current = null;
+          setActive(false);
+          setState(null);
+        },
+      });
+    // 読み込み済みなら、この操作の中ですぐ始める。
+    const started = module.current ? begin(module.current) : import('../viewer/arView').then(begin);
+    started
+      .then((c) => {
+        ctl.current = c;
+      })
+      .catch((err: unknown) => {
+        setActive(false);
+        setNotice(err instanceof Error ? err.message : 'AR を始められませんでした。');
+      });
+  };
+
+  return { ok, active, state, notice, root, ctl, start };
 }
