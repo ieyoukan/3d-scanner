@@ -140,6 +140,28 @@ func (f *fakeRunner) produce(key string, args []string) error {
 			return err
 		}
 		return write(filepath.Join(out, "texture.png"), "\x89PNG\r\n\x1a\n"+pad)
+	case "InterfaceCOLMAP":
+		return write(argValue(args, "-o"), "MVSI"+pad)
+	case "DensifyPointCloud":
+		out := argValue(args, "-o")
+		if err := write(out, "MVSI"+pad); err != nil {
+			return err
+		}
+		return write(strings.TrimSuffix(out, ".mvs")+".ply", "ply\nformat binary_little_endian 1.0\nelement vertex 295010\nproperty float x\nend_header\n"+pad)
+	case "ReconstructMesh":
+		return write(argValue(args, "-o"), asciiMeshPLY(false)+pad)
+	case "TextureMesh":
+		out := argValue(args, "-o")
+		base := strings.TrimSuffix(out, ".obj")
+		obj := "mtllib textured.mtl\nv 0 0 0\nv 1 0 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nusemtl material_00\nf 1/1 2/2 3/3\nf 1/1 3/3 2/2\n"
+		if err := write(out, obj+strings.Repeat("# pad\n", 50)); err != nil {
+			return err
+		}
+		mtl := "newmtl material_00\nKa 1.000000 1.000000 1.000000\nKd 1 1 1\nTr 1.000000\nillum 1\nmap_Kd textured_material_00_map_Kd.jpg\n"
+		if err := write(base+".mtl", mtl); err != nil {
+			return err
+		}
+		return write(base+"_material_00_map_Kd.jpg", "\xff\xd8\xff"+pad)
 	case "gltfpack":
 		return write(argValue(args, "-o"), "glTF"+pad)
 	case "opensplat":
@@ -228,6 +250,7 @@ func testPipelineConfig() config.Pipeline {
 	return config.Pipeline{
 		ColmapBin: "colmap", OpenSplatBin: "opensplat", GltfpackBin: "gltfpack", SplatTransformBin: "splat-transform",
 		EnableMesh: true, EnableSplat: true, MeshMode: config.MeshModeAuto,
+		OpenMVSDir: "/opt/openmvs", OpenMVSResolutionLevel: 1, OpenMVSMaxFaces: 150000, OpenMVSTextureSize: 4096,
 		ColmapMaxImageSize: 1600, SplatIterations: 300, SplatDownscale: 2, SplatForceCPU: true,
 		SfMTimeout: time.Minute, MVSTimeout: time.Minute, MeshTimeout: time.Minute, SplatTimeout: time.Minute, SOGTimeout: time.Minute,
 	}
@@ -428,6 +451,84 @@ func TestRunDenseModeWithGPU(t *testing.T) {
 	}
 	if !strings.Contains(rep.messages[scan.StepMVS], "9000点") {
 		t.Errorf("MVS の要約 = %q", rep.messages[scan.StepMVS])
+	}
+}
+
+// TestRunOpenMVSMode: GPU が無く OpenMVS があれば、OpenMVS で密なメッシュを作る（コマンドの順番と引数）。
+func TestRunOpenMVSMode(t *testing.T) {
+	run, rep, job := newFakeRunner(), newFakeReporter(), newJob(t)
+	cfg := testPipelineConfig()
+	cfg.NumThreads = 4
+	p := New(cfg, run, Capabilities{OpenMVS: true}, nil)
+	if p.MeshKind() != MeshKindOpenMVS {
+		t.Fatalf("MeshKind = %q", p.MeshKind())
+	}
+	if err := p.Run(context.Background(), job, rep); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(run.calls, " | ")
+	want := "colmap image_undistorter | InterfaceCOLMAP | DensifyPointCloud | ReconstructMesh | TextureMesh | gltfpack"
+	if !strings.Contains(got, want) {
+		t.Fatalf("OpenMVS の順番が違う:\n got: %s\nwant(部分): %s", got, want)
+	}
+	wantSteps(t, rep, map[scan.StepName]scan.StepStatus{
+		scan.StepSfM: scan.StepSucceeded, scan.StepMVS: scan.StepSucceeded, scan.StepMesh: scan.StepSucceeded,
+		scan.StepSplat: scan.StepSucceeded, scan.StepSOG: scan.StepSucceeded,
+	})
+	for key, want := range map[string]string{
+		"DensifyPointCloud": "--resolution-level 1 --max-threads 4",
+		"ReconstructMesh":   "--target-face-num 150000 --max-threads 4",
+		"TextureMesh":       "--export-type obj --max-texture-size 4096 --global-seam-leveling 0 --local-seam-leveling 0 --max-threads 4",
+	} {
+		if args := strings.Join(run.args[key], " "); !strings.Contains(args, want) {
+			t.Errorf("%s の引数 = %s, want(部分) %s", key, args, want)
+		}
+	}
+	if !strings.Contains(rep.messages[scan.StepMVS], "295010点") || !strings.Contains(rep.messages[scan.StepMesh], "2 面") {
+		t.Errorf("要約: MVS=%q Mesh=%q", rep.messages[scan.StepMVS], rep.messages[scan.StepMesh])
+	}
+	// MTL の「Tr 1（透明）」は消え、不透明（d 1）になっている。
+	mtl, _ := os.ReadFile(filepath.Join(job.WS.DenseDir(), "openmvs", "textured.mtl"))
+	if strings.Contains(string(mtl), "Tr ") || !strings.Contains(string(mtl), "d 1") || !strings.Contains(string(mtl), "map_Kd") {
+		t.Errorf("MTL が直っていない:\n%s", mtl)
+	}
+}
+
+// TestMeshKindAuto: auto は GPU があれば COLMAP、無ければ OpenMVS、どちらも無ければ簡易メッシュ。
+func TestMeshKindAuto(t *testing.T) {
+	cfg := testPipelineConfig()
+	for _, c := range []struct {
+		caps Capabilities
+		want MeshKind
+	}{
+		{Capabilities{ColmapGPU: true, OpenMVS: true}, MeshKindDense},
+		{Capabilities{OpenMVS: true}, MeshKindOpenMVS},
+		{Capabilities{}, MeshKindSparse},
+	} {
+		if got := New(cfg, newFakeRunner(), c.caps, nil).MeshKind(); got != c.want {
+			t.Errorf("caps %+v: MeshKind = %q, want %q", c.caps, got, c.want)
+		}
+	}
+	cfg.MeshMode = config.MeshModeOpenMVS
+	if got := New(cfg, newFakeRunner(), Capabilities{ColmapGPU: true}, nil).MeshKind(); got != MeshKindOpenMVS {
+		t.Errorf("MESH_MODE=openmvs なのに %q", got)
+	}
+}
+
+func TestDetectOpenMVS(t *testing.T) {
+	dir := t.TempDir()
+	if DetectOpenMVS("") || DetectOpenMVS(dir) {
+		t.Error("実行ファイルが無いのに見つかったことになった")
+	}
+	for _, name := range openMVSTools {
+		os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"), 0o755)
+	}
+	if !DetectOpenMVS(dir) {
+		t.Error("4 つそろっているのに見つからない")
+	}
+	os.Chmod(filepath.Join(dir, "TextureMesh"), 0o644)
+	if DetectOpenMVS(dir) {
+		t.Error("実行できないファイルがあるのに見つかったことになった")
 	}
 }
 

@@ -1,10 +1,11 @@
-# ローカルで全体（Web + API + ワーカー + PostgreSQL）を動かすための構成。
+# ローカルで全体（web + api + worker + PostgreSQL）を動かすための構成。本番（Kubernetes）と同じ 3 つのイメージを使う。
 #
 #   ./scripts/dev-env.sh        # .env を作る（ランダムなDBパスワード）
-#   docker compose up --build   # 初回は COLMAP 等のビルドに 40〜60 分かかる
+#   docker compose up --build   # 初回は worker の COLMAP・OpenMVS 等のビルドに 1 時間ほどかかる
 #   → http://localhost:8080 を開く（ポートは .env の APP_PORT で変更可）。ログインは無い。127.0.0.1 にだけ公開する
 #
-# 本番（Kubernetes）の配備は charts/3d-scanner を使う。こちらは手元で試すためのもの。
+# 本番では Ingress が /api を api、それ以外を web に振り分ける。手元では web の nginx が /api を api に転送する
+# （deploy/docker/nginx-api-proxy.conf を差し込む）。
 services:
   db:
     image: postgres:17-alpine
@@ -15,23 +16,24 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?.env に POSTGRES_PASSWORD を設定してください（scripts/dev-env.sh で作れます）}
     volumes:
       - db-data:/var/lib/postgresql/data
-    # ポートは公開しない。DB に触れるのは同じ compose ネットワーク内の app だけ。
+    # ポートは公開しない。DB に触れるのは同じ compose ネットワーク内の api と worker だけ。
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U scanner -d scanner"]
       interval: 5s
       timeout: 3s
       retries: 10
 
-  app:
-    image: 3d-scanner:dev
+  # 復元ジョブ・3DGS・位置合わせ。api からの頼みごとを 8081 で受ける（外には公開しない）。
+  worker:
+    image: 3d-scanner-worker:dev
     build:
       context: .
       dockerfile: deploy/docker/Dockerfile
+      target: worker
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      # DB の接続先は部品ごとに渡す（パスワードに記号が入っていても、サーバー側で正しく URL に組み立てる）。
+    environment: &app-env
       DB_HOST: db
       DB_USER: scanner
       DB_NAME: scanner
@@ -40,13 +42,51 @@ services:
       SPLAT_ITERATIONS: ${SPLAT_ITERATIONS:-300}
       SPLAT_DOWNSCALE: ${SPLAT_DOWNSCALE:-2}
       RETENTION: ${RETENTION:-24h}
+    volumes:
+      - scan-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # 受付・状態・成果物の配信。worker と同じ作業領域（scan-data）を使う。
+  api:
+    image: 3d-scanner-api:dev
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      target: api
+    depends_on:
+      db:
+        condition: service_healthy
+      # 作業領域のボリュームは、最初にマウントしたコンテナのイメージの /data（所有者 10001）で初期化される。
+      # api のイメージ（distroless）には /data が無いので、worker を先に起動しておく。
+      worker:
+        condition: service_started
+    environment:
+      <<: *app-env
+      ROLE: api
+      WORKER_URL: http://worker:8081
+    volumes:
+      - scan-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # 画面。/api は api に転送する。
+  web:
+    image: 3d-scanner-web:dev
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      target: web
+    depends_on:
+      - api
     ports:
       # 127.0.0.1 に限定して公開する（同じ LAN の他の機器からは見えない）。
       # 8080 番を他のプログラムが使っているときは、.env に APP_PORT=18080 のように書いて変える。
       - "127.0.0.1:${APP_PORT:-8080}:8080"
     volumes:
-      - scan-data:/data
-    # 読み取り専用のルートファイルシステムで動くことを、手元でも確かめておく（本番の設定と揃える）。
+      - ./deploy/docker/nginx-api-proxy.conf:/etc/nginx/extra/api-proxy.conf:ro
     read_only: true
     tmpfs:
       - /tmp

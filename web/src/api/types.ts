@@ -125,7 +125,8 @@ export interface Limits {
 export interface PipelineInfo {
   meshEnabled: boolean;
   /** dense = 密な復元あり / sparse = 疎な点群からの簡易メッシュ */
-  meshMode: 'dense' | 'sparse';
+  /** dense: COLMAP の密な復元（GPU）、openmvs: OpenMVS の密な復元（CPU）、sparse: 疎な点群からの簡易メッシュ。 */
+  meshMode: 'dense' | 'openmvs' | 'sparse';
   splatEnabled: boolean;
   splatIterations: number;
   splatDevice: 'cpu' | 'gpu';

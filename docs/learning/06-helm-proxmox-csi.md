@@ -34,9 +34,12 @@
 ### chart が作るもの
 
 ```text
-Deployment  scanner              アプリ本体（Web + API + ワーカー）。replicas: 1、Recreate
-Service     scanner              ポート 80 → コンテナの 8080
-Ingress     scanner              外部公開（任意）
+Deployment  scanner-web          画面（nginx）。RollingUpdate
+Deployment  scanner-api          API（Go、ROLE=api）。RollingUpdate。PVC を使う
+Deployment  scanner-worker       ワーカー（Go、ROLE=worker ＋ COLMAP・OpenMVS 等）。replicas: 1、Recreate。PVC を使う
+Service     scanner-web / scanner-api   ポート 80 → コンテナの 8080
+Service     scanner-worker       ポート 8081（クラスタの中だけ。api からの頼みごと）
+Ingress     scanner              外部公開（任意）。/api → scanner-api、それ以外 → scanner-web
 ConfigMap   scanner              秘密でない設定（環境変数）
 PVC         scanner-data         作業領域 /data
 StatefulSet scanner-postgresql   PostgreSQL（任意。既存の DB に切り替え可）
@@ -79,9 +82,9 @@ Proxmox CSI は、この要求を受けて Proxmox 上に**仮想ディスク**�
 StorageClass の `volumeBindingMode: WaitForFirstConsumer` は「Pod の配置先が決まってからディスクを作る」設定。
 先にディスクを作ると、Pod が別のノードに配置されたときに接続できなくなるため。
 
-### なぜレプリカを 1 に固定するのか
+### なぜワーカーのレプリカを 1 に固定するのか
 
-`templates/deployment.yaml` では `replicas: 1` を直接書いていて、values では変えられない。理由は 2 つ。
+`templates/worker.yaml` では `replicas: 1` を直接書いていて、values では変えられない。理由は 2 つ。
 
 1. **ストレージ**: 2 つ目の Pod が別のノードに載ると、同じディスクをマウントできずに起動しない。
 2. **ジョブの回復**: ワーカーは起動時に「`running` のまま残ったジョブ」を、前回の自分の残骸として
@@ -92,7 +95,20 @@ StorageClass の `volumeBindingMode: WaitForFirstConsumer` は「Pod の配置�
 更新中は数十秒つながらなくなるが、MVP では整合性を優先した。
 
 処理能力を増やしたくなったら、レプリカを増やすのではなく、構成を変える必要がある
-（成果物をオブジェクトストレージに置く、ワーカーを別の Deployment に分けて回復の仕組みを直す、など）。
+（成果物をオブジェクトストレージに置く、回復の仕組みを「自分が取ったジョブだけ」に直す、など）。
+
+### 役割を分けた理由と、同じノードに載せる仕組み
+
+以前は 1 つの Deployment（Web + API + ワーカーが 1 プロセス、Recreate）だった。そのため画面を少し直してデプロイする
+だけで処理中の 3D 生成が止まり、数十秒つながらなくなった。今は web・api・worker の 3 つに分け、CI は中身の変わった
+イメージだけを公開するので、画面や API の更新では worker は入れ替わらない。web と api は RollingUpdate
+（新しい Pod が準備できてから古い Pod を止める）なので、更新中も止まらない。
+
+api と worker は同じ PVC を使う。ReadWriteOnce なので、2 つは同じノードに居なければならない。両方の Pod に
+`3d-scanner/data-volume: scanner-data` のラベルを付け、`requiredDuringSchedulingIgnoredDuringExecution` の podAffinity で
+「このラベルの Pod が居るノードに載る」ようにしている。最初の 1 つは相手が居なくても載せられる
+（自分自身がラベルに一致する場合の Kubernetes の決まり）。api の RollingUpdate で一時的に 2 つになっても、
+同じノードなので同じディスクをマウントできる。
 
 ### PostgreSQL は StatefulSet
 

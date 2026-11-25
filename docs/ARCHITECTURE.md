@@ -71,13 +71,21 @@
   React: 撮影・写真の確認・送信・処理状況・3D 表示
         |
         v HTTPS（Cloudflare Tunnel。1 リクエスト 100MB まで）
-[Go サーバー]  1 Pod・1 プロセス・replicas=1
-  ├─ HTTP API   受付、状態の問い合わせ、成果物と Web の配信
-  ├─ ワーカー   待ち行列から 1 件ずつ取り出して外部 CLI を実行
-  └─ 掃除係     保存期限の過ぎたスキャンを削除
+[Ingress]  /api → api、それ以外 → web
+   |                         |
+   v                         v
+[web]  nginx（静的ファイル）  [api]  Go（ROLE=api、distroless）
+                               受付、状態の問い合わせ、成果物の配信
+                                     |  中止・削除・3DGS・位置合わせは内部用 HTTP（:8081）で頼む
+                                     v
+                             [worker]  Go（ROLE=worker）＋ COLMAP・OpenMVS・OpenSplat 等。replicas=1
+                               ├─ ワーカー   待ち行列から 1 件ずつ取り出して外部 CLI を実行
+                               ├─ 3DGS      別の待ち行列（あとで作る）
+                               ├─ 位置合わせ  COLMAP で写真 1 枚を地図に合わせる
+                               └─ 掃除係     保存期限の過ぎたスキャンを削除
         |                      |
         v                      v
-  [PostgreSQL]           [/data: PVC（ReadWriteOnce）]
+  [PostgreSQL]           [/data: PVC（ReadWriteOnce）。api と worker が共有（同じノードに載せる）]
    ジョブの状態            写真・中間ファイル・成果物・ログ
                                |
                                v
@@ -87,7 +95,10 @@
                        v                v
               メッシュ分岐            3DGS 分岐
         (GPU あり) MVS → Poisson      OpenSplat の学習
-        (GPU なし) Delaunay（疎）          |
+        (GPU なし) OpenMVS               |
+          （密な点群 → メッシュ →       |
+            テクスチャ → gltfpack）      |
+        (どちらも無し) Delaunay（疎）      |
                mesh_texturer              v
                PLY → OBJ（Go）         splat.ply
                gltfpack                splat-transform
@@ -96,9 +107,19 @@
                    mesh.glb           scene.sog
 ```
 
-API とワーカーを同じ Pod・同じプロセスにしているのは、作業領域の PVC が `ReadWriteOnce`
-（同時に 1 ノードからしかマウントできない）ため。分けると「同じノードに載る」保証が必要になる。
-ジョブは 1 件ずつ実行する（SfM も 3DGS も全コアとメモリを使うため）。
+1 つの Go バイナリを、役割（`ROLE`）ごとに別の Pod で動かす。以前は 1 Pod・1 プロセス（API とワーカーと Web の配信）に
+まとめていたが、画面を少し直してデプロイするだけで処理中の 3D 生成が止まり、数十秒つながらなくなった。分けたので、
+web と api は止めずに入れ替わり（RollingUpdate）、worker は worker を直したときだけ入れ替わる（CI が中身の変わった
+イメージだけを公開する）。
+
+- api と worker は同じ作業領域（PVC、`ReadWriteOnce`）を使うので、同じノードに載せる（podAffinity）。
+  写真は api が受け取って PVC に書き、worker が読む。成果物は worker が書き、api が配る。
+- api から worker への頼みごとは 4 つだけ（`server/internal/workerapi`）: 起こす（待ち行列に入れた直後。届かなくても
+  worker は 5 秒ごとに待ち行列を見る）、3DGS の予約、中止・削除（処理中なら外部プロセスを止める）、位置合わせ
+  （写真は PVC の一時ディレクトリに置き、その場所を渡す）。エラーは状態コードで返し、api 側で元のエラーに戻すので、
+  ハンドラは 1 プロセスで動かすとき（`ROLE=all`）と同じ書き方のまま。worker に届かないときは画面に 503 で伝える。
+- `/api/config` の「このサーバーで何が出来るか」は worker に問い合わせる（1 分控える）。届かなければ設定から分かる値。
+- ジョブは 1 件ずつ実行する（SfM も OpenMVS も 3DGS も全コアとメモリを使うため）。
 
 ## 4. 画面
 
@@ -449,11 +470,16 @@ ieyoukan/home-manifests
 
 Helm chart の要点（詳細は `charts/3d-scanner/values.yaml` のコメント）:
 
-- アプリは Deployment、`replicas: 1` 固定、更新方式は `Recreate`。
+- web・api・worker の 3 つの Deployment。web と api は `RollingUpdate`、worker は `replicas: 1` 固定で `Recreate`。
+- イメージのタグ（`web/api/worker.image.tag`）は必須。無いと描画を止める（存在しないタグで Pod を作らず、
+  Argo CD は今動いているものをそのまま残す）。
+- api と worker は同じ作業領域の PVC を使うので、両方に `3d-scanner/data-volume` のラベルを付けて互いに引き寄せる
+  （`requiredDuringScheduling` の podAffinity。最初の 1 つは相手が居なくても載る）。
 - 作業領域の PVC と、PostgreSQL（StatefulSet、1 レプリカ）の PVC。どちらも `ReadWriteOnce`。
   `postgresql.enabled=false` で既存の DB に切り替えられる。
 - 秘密の値は `existingSecret` で受け取る。未設定なら `helm template` の時点で止まる。
-- 非 root（UID 10001）、読み取り専用のルートファイルシステム、権限の昇格なし。
+- 非 root（api と worker は UID 10001、web は nginx の 101）、読み取り専用のルートファイルシステム、権限の昇格なし。
+- worker の内部用 HTTP（8081）は Ingress に出さない。`networkPolicy.enabled` で api の Pod からだけに絞れる。
 - 変えられる値: イメージ名とタグ、Ingress のホスト、StorageClass、PVC の容量、DB の接続先、
   GPU リソース、保存期間、各種の上限とパイプラインの設定。
 

@@ -1,28 +1,57 @@
 # 3d-scanner の既定値。
 #
-# 構成（MVP）:
-#   Deployment  アプリ本体（Web + API + ワーカーが1プロセス）。必ず 1 レプリカ。
-#   PVC         作業領域 /data（写真・中間ファイル・成果物）。ReadWriteOnce。
-#   StatefulSet PostgreSQL（ジョブの状態を保存）。既存の DB を使うなら無効にできる。
-#   Ingress     外部公開（任意）。
+# 構成（役割ごとに分けた 3 つの Deployment）:
+#   web         画面（静的ファイル）を nginx で配る。止めずに入れ替える（RollingUpdate）
+#   api         受付・状態・成果物の配信（Go、distroless）。止めずに入れ替える（RollingUpdate）
+#   worker      復元ジョブ（COLMAP・OpenMVS）・3DGS・位置合わせ・掃除。必ず 1 レプリカ、Recreate で入れ替える
+#   PVC         作業領域 /data（写真・中間ファイル・成果物）。ReadWriteOnce。api と worker が共有する
+#   StatefulSet PostgreSQL（ジョブの状態）。既存の DB を使うなら無効にできる
+#   Ingress     外部公開（任意）。/api は api、それ以外は web へ
 #
-# なぜ 1 レプリカ固定なのか:
-#   作業領域の PVC は ReadWriteOnce（同時に1ノードからしかマウントできない）。
-#   また、ワーカーは「実行中のジョブは自分のもの」という前提で起動時の回復を行う。
-#   レプリカを増やすと両方の前提が崩れるので、テンプレート側で 1 に固定してある。
-#   詳しくは docs/learning/06-helm-proxmox-csi.md を参照。
+# api と worker は同じ PVC を使う。PVC は ReadWriteOnce（同時に1ノードからしかマウントできない）なので、
+# 2 つを同じノードに載せる（podAffinity。テンプレートで自動で付ける）。
+# worker は「running のまま残ったジョブは前回の自分の残骸」として起動時に回復するので、1 レプリカに固定してある。
+# 詳しくは docs/learning/06-helm-proxmox-csi.md を参照。
 
-# -- リソース名の基になる名前。空なら "scanner"。
+# -- リソース名の基になる名前。空なら "scanner"（scanner-web / scanner-api / scanner-worker）。
 # （Service の名前は英字で始める必要があるため、chart 名の "3d-scanner" はそのまま使えない）
 fullnameOverride: ""
 
-image:
-  # -- コンテナイメージ。GitHub Actions が main への push ごとに GHCR へ公開する。
-  repository: ghcr.io/ieyoukan/3d-scanner
-  # -- タグ。空なら Chart.yaml の appVersion。
-  # "latest" を使う場合は pullPolicy を Always にしないと、ノードに残った古いイメージが使われる。
-  tag: ""
-  pullPolicy: IfNotPresent
+# 役割ごとのイメージ。GitHub Actions が main への push ごとに、中身が変わったものだけを GHCR へ公開する
+# （:sha-<コミット>）。タグが空だと描画を止める（存在しないタグで Pod を作らないため）。
+web:
+  image:
+    repository: ghcr.io/ieyoukan/3d-scanner-web
+    tag: ""
+    pullPolicy: IfNotPresent
+  # -- 画面の Pod の数。状態を持たないので増やしてよい。
+  replicas: 1
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 128Mi
+
+api:
+  image:
+    repository: ghcr.io/ieyoukan/3d-scanner-api
+    tag: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    # 縮小画像（サムネイル）を作るとき、写真 1 枚を展開する（最大 40 メガ画素 × 4 バイト）。
+    limits:
+      memory: 1Gi
+
+worker:
+  image:
+    repository: ghcr.io/ieyoukan/3d-scanner-worker
+    tag: ""
+    pullPolicy: IfNotPresent
+  # worker の CPU・メモリは下の resources、GPU は gpu、停止の猶予は terminationGracePeriodSeconds。
 
 # -- 非公開レジストリから取得する場合の認証情報（Secret 名の一覧）。
 imagePullSecrets: []
@@ -43,9 +72,11 @@ ingress:
   # -- TLS の設定。Cloudflare Tunnel を使う場合は Cloudflare 側で TLS を終端するので空でよい。
   tls: []
 
-service:
-  type: ClusterIP
-  port: 80
+# -- worker の内部用 HTTP（中止・削除・位置合わせ）に、api の Pod からだけ届くようにする NetworkPolicy。
+# kubelet のヘルスチェックはノードから来るので、ノードの網を nodeCIDRs に入れる（例: ["192.168.0.0/24"]）。
+networkPolicy:
+  enabled: false
+  nodeCIDRs: []
 
 # ---------------------------------------------------------------------------
 # 作業領域（写真・中間ファイル・成果物）
@@ -139,10 +170,21 @@ config:
     # -- 3D Gaussian Splatting を作るか。
     enableSplat: true
     # -- メッシュの作り方。
-    #   auto:   COLMAP が CUDA 対応なら dense、そうでなければ sparse
-    #   dense:  密な復元（patch_match_stereo）。NVIDIA GPU と CUDA 入りイメージが必要
-    #   sparse: 疎な点群からの簡易メッシュ。CPU で動くが粗い
+    #   auto:    COLMAP が CUDA 対応なら dense、そうでなく OpenMVS があれば openmvs、どちらも無ければ sparse
+    #   openmvs: OpenMVS で密な復元（CPU で動く。31 枚で数分。細い物や模様の少ない面も出る）
+    #   dense:   COLMAP の密な復元（patch_match_stereo）。NVIDIA GPU と CUDA 入りイメージが必要
+    #   sparse:  疎な点群からの簡易メッシュ。CPU で速いが粗い
     meshMode: auto
+    # OpenMVS の設定（meshMode が openmvs のとき）
+    openmvs:
+      # -- 写真を何回半分にしてから奥行きを推定するか（1 で縦横半分。0 は等倍で数倍遅い）。
+      resolutionLevel: 1
+      # -- メッシュの面の数の上限（スマホで表示できる大きさにする）。
+      maxFaces: 150000
+      # -- テクスチャ画像の 1 辺の上限（画素）。
+      textureSize: 4096
+      # -- テクスチャの継ぎ目の明るさをならす。手元（arm64）のビルドで壊れた（黒や色の縁取り）ので既定は false。
+      seamLeveling: false
     # -- 特徴抽出・歪み補正時の画像の長辺の上限（画素）。大きいほど精密で遅い。
     colmapMaxImageSize: 1600
     # -- 外部CLIが使うスレッド数。resources.limits.cpu と同じ値にする。
@@ -194,7 +236,7 @@ gpu:
   count: 1
 
 # ---------------------------------------------------------------------------
-# Pod の設定
+# Pod の設定（resources・terminationGracePeriodSeconds は worker のもの）
 # ---------------------------------------------------------------------------
 resources:
   # requests は「このぶんは必ず確保してほしい」量。スケジューラがノードを選ぶ基準になる。
@@ -207,9 +249,11 @@ resources:
     cpu: "4"
     memory: 8Gi
 
-# -- 配置するノードの条件。復元は重いので、余力のあるノードに寄せたいときに使う。
+# -- 配置するノードの条件（3 つの Pod すべてに付ける）。復元は重いので、余力のあるノードに寄せたいときに使う。
 nodeSelector: {}
 tolerations: []
+# -- affinity.nodeAffinity は 3 つの Pod すべてに付ける。api と worker には、同じノードに載せるための
+# podAffinity をテンプレートが自動で足す（values で podAffinity を書いても api と worker では使わない）。
 affinity: {}
 
 podAnnotations: {}
@@ -217,7 +261,8 @@ podAnnotations: {}
 # -- Pod 全体のセキュリティ設定。
 podSecurityContext:
   runAsNonRoot: true
-  # イメージ内の scanner ユーザー（deploy/docker/Dockerfile で UID 10001 として作成）。
+  # api と worker のユーザー（deploy/docker/Dockerfile で UID 10001）。同じ PVC のファイルを読み書きするので揃える。
+  # web（nginx）はイメージの既定のユーザー（UID 101）で動き、PVC は使わない。
   runAsUser: 10001
   runAsGroup: 10001
   # fsGroup: マウントしたボリュームの所有グループをこの GID にする。

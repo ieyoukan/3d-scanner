@@ -102,30 +102,37 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
       - name: helm lint
-        run: helm lint charts/3d-scanner --set postgresql.auth.existingSecret=dummy
+        run: helm lint charts/3d-scanner --set postgresql.auth.existingSecret=dummy --set web.image.tag=sha-test --set api.image.tag=sha-test --set worker.image.tag=sha-test
       - name: helm template（代表的な3通りの構成）
+        env:
+          TAGS: --set web.image.tag=sha-test --set api.image.tag=sha-test --set worker.image.tag=sha-test
         run: |
           mkdir -p rendered
           # 1. 自宅クラスタと同じ形: 既存の Secret、Cloudflare の Ingress、Proxmox CSI
-          helm template scanner charts/3d-scanner -n 3d-scanner \
+          helm template scanner charts/3d-scanner -n 3d-scanner $TAGS \
             --set postgresql.auth.existingSecret=3d-scanner-secrets \
             --set ingress.enabled=true --set ingress.className=cloudflare \
             --set 'ingress.hosts[0].host=scanner.example.com' \
             --set persistence.storageClass=proxmox-data \
             --set postgresql.persistence.storageClass=proxmox-data > rendered/home.yaml
           # 2. 外部の DB を使う
-          helm template scanner charts/3d-scanner \
+          helm template scanner charts/3d-scanner $TAGS \
             --set postgresql.enabled=false \
             --set externalDatabase.host=db.example --set externalDatabase.existingSecret=db > rendered/external-db.yaml
           # 3. GPU を割り当て、作業領域を emptyDir にする
-          helm template scanner charts/3d-scanner \
+          helm template scanner charts/3d-scanner $TAGS \
             --set postgresql.auth.existingSecret=s \
-            --set gpu.enabled=true --set persistence.enabled=false > rendered/gpu.yaml
+            --set gpu.enabled=true --set persistence.enabled=false \
+            --set networkPolicy.enabled=true --set 'networkPolicy.nodeCIDRs[0]=192.168.0.0/24' > rendered/gpu.yaml
       - name: 秘密の値が未設定なら止まることの確認
         run: |
           # 何も指定しないと、DB パスワードが無いので失敗するのが正しい。
           if helm template scanner charts/3d-scanner > /dev/null 2>&1; then
             echo "秘密の値が未設定なのに template が成功してしまった"; exit 1
+          fi
+          # イメージのタグが無いときも止まる（存在しないタグで Pod を作らず、動いているものを残すため）。
+          if helm template scanner charts/3d-scanner --set postgresql.auth.existingSecret=s > /dev/null 2>&1; then
+            echo "イメージのタグが未設定なのに template が成功してしまった"; exit 1
           fi
       - name: Kubernetes のスキーマに合っているか（kubeconform）
         run: |

@@ -9,9 +9,9 @@ metadata:
   labels:
     {{- include "3d-scanner.labels" . | nindent 4 }}
 data:
-  LISTEN_ADDR: ":8080"
+  # ROLE・LISTEN_ADDR・WORKER_URL は役割ごとに違うので、各 Deployment の env で渡す。
   DATA_DIR: /data
-  WEB_DIR: /app/web
+  OPENMVS_DIR: /usr/local/bin/OpenMVS
   {{- if .Values.postgresql.enabled }}
   DB_HOST: {{ include "3d-scanner.postgresql.fullname" . | quote }}
   DB_PORT: "5432"
@@ -40,6 +40,10 @@ data:
   ENABLE_MESH: {{ .enableMesh | quote }}
   ENABLE_SPLAT: {{ .enableSplat | quote }}
   MESH_MODE: {{ .meshMode | quote }}
+  OPENMVS_RESOLUTION_LEVEL: {{ .openmvs.resolutionLevel | quote }}
+  OPENMVS_MAX_FACES: {{ .openmvs.maxFaces | quote }}
+  OPENMVS_TEXTURE_SIZE: {{ .openmvs.textureSize | quote }}
+  OPENMVS_SEAM_LEVELING: {{ .openmvs.seamLeveling | quote }}
   COLMAP_MAX_IMAGE_SIZE: {{ .colmapMaxImageSize | quote }}
   NUM_THREADS: {{ .numThreads | quote }}
   SPLAT_ITERATIONS: {{ .splatIterations | quote }}

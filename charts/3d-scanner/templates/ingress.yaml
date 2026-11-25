@@ -1,4 +1,7 @@
 {{- if .Values.ingress.enabled }}
+{{- /*
+外部公開。/api/ は api の Pod、それ以外（画面）は web の Pod に振り分ける。
+*/ -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -22,19 +25,19 @@ spec:
     - host: {{ .host | quote }}
       http:
         paths:
-          {{- /*
-          paths を省略したホストは「/ 以下すべて」とみなす。
-          helm の --set 'ingress.hosts[0].host=...' はリストを丸ごと置き換えるので、
-          既定値の paths が消える。そのままだと経路の無い不正な Ingress になってしまう。
-          */}}
-          {{- range (.paths | default (list (dict "path" "/" "pathType" "Prefix"))) }}
-          - path: {{ .path | quote }}
-            pathType: {{ .pathType | default "Prefix" }}
+          - path: /api
+            pathType: Prefix
             backend:
               service:
-                name: {{ include "3d-scanner.fullname" $ }}
+                name: {{ include "3d-scanner.componentName" (list $ "api") }}
                 port:
                   name: http
-          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "3d-scanner.componentName" (list $ "web") }}
+                port:
+                  name: http
     {{- end }}
 {{- end }}

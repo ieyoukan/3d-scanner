@@ -85,11 +85,13 @@ CPU での 3DGS の学習は数十分かかるので、既定では自動で作�
 
 | 出力 | GPU なし（既定） | NVIDIA GPU あり（別イメージが必要。未検証） |
 | --- | --- | --- |
-| メッシュ | 疎な点群からの**簡易メッシュ**（粗い。数秒） | 密な復元（MVS）によるメッシュ |
+| メッシュ | **OpenMVS** で密な復元（CPU。31 枚で数分） | COLMAP の密な復元（MVS）によるメッシュ |
 | 3DGS | CPU で学習（1 反復あたり約 1 秒。遅い） | GPU で学習 |
 
-COLMAP の密な復元（`patch_match_stereo`）は CUDA が必須で、CPU では実行できない。
-この場合、画面には「実行しなかった」ことと理由が表示される。
+COLMAP の密な復元（`patch_match_stereo`）は CUDA が必須で、CPU では実行できない。そこで GPU が無いときは
+OpenMVS（CPU で動く）で密な点群 → メッシュ → テクスチャを作る（`MESH_MODE=auto` の既定）。1 周の動画（31 枚）で、
+疎な点群からの簡易メッシュ（9,507 面。細い棒が消え、白い天板が平らになり、背景の膜が広がる）に比べ、
+約 15 万面で棒と上の看板まで出た。OpenMVS も無い環境では、従来どおり簡易メッシュを作る。
 
 ## 必要なもの
 
@@ -106,8 +108,11 @@ COLMAP などの外部ツールはコンテナイメージに入っているの�
 
 ```bash
 ./scripts/dev-env.sh          # .env を作る（DB パスワードを乱数で生成）
-docker compose up --build     # 初回は COLMAP と OpenSplat のビルドに 40〜60 分かかる
+docker compose up --build     # 初回は worker の COLMAP・OpenMVS・OpenSplat のビルドに 1 時間ほどかかる
 ```
+
+本番と同じく、web（nginx）・api・worker・PostgreSQL の 4 つのコンテナで動く。手元では web の nginx が `/api` を
+api に転送する（本番では Ingress が振り分ける）。
 
 `http://localhost:8080` を開く（アプリ自体にログインは無い。ポートは手元の 127.0.0.1 にだけ公開される）。
 8080 番を他のプログラムが使っている場合は、`.env` に `APP_PORT=18080` のように書く。
@@ -174,9 +179,11 @@ docker run --rm -v "$PWD/samples/sceaux:/work" -e SPLAT_ITERATIONS=300 \
 
 | 変数 | 既定値 | 内容 |
 | --- | --- | --- |
+| `ROLE` | `all` | 役割。`api`（受付・配信。重い処理は worker に頼む）/ `worker`（復元・3DGS・位置合わせ。内部用 HTTP を待ち受ける）/ `all`（1 プロセスで両方。開発用） |
+| `WORKER_URL` | – | `ROLE=api` のとき、worker の内部用 HTTP（例 `http://scanner-worker:8081`） |
 | `DATABASE_URL` | – | PostgreSQL の接続文字列。または `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` を個別に指定 |
-| `DATA_DIR` | `/data` | 作業領域（PVC のマウント先） |
-| `WEB_DIR` | – | ビルド済み Web の場所。空なら API のみ |
+| `DATA_DIR` | `/data` | 作業領域（PVC のマウント先）。api と worker で同じ場所にする |
+| `WEB_DIR` | – | ビルド済み Web の場所（`ROLE=all` で画面も配るとき）。本番は web の Pod が配る |
 | `RETENTION` | `24h` | 保存期間（ギャラリーに保存したものには効かない） |
 | `KEEP_COMPLETED` | `true` | 完成したスキャン（成功・一部成功）をギャラリーに保存し、期限で消さない |
 | `MIN_IMAGES` / `MAX_IMAGES` | `8` / `80` | 写真の枚数 |
@@ -185,7 +192,12 @@ docker run --rm -v "$PWD/samples/sceaux:/work" -e SPLAT_ITERATIONS=300 \
 | `MAX_QUEUED_SCANS` | `5` | 順番待ち＋実行中の上限 |
 | `MIN_FREE_DISK_MB` | `2048` | 空きがこれを下回ったら受付を断る |
 | `ENABLE_MESH` / `ENABLE_SPLAT` | `true` | 各分岐を実行するか |
-| `MESH_MODE` | `auto` | `auto` / `dense` / `sparse` |
+| `MESH_MODE` | `auto` | `auto`（GPU があれば `dense`、無く OpenMVS があれば `openmvs`、どちらも無ければ `sparse`）/ `openmvs` / `dense` / `sparse` |
+| `OPENMVS_DIR` | – | OpenMVS の実行ファイルの場所（worker イメージでは `/usr/local/bin/OpenMVS`） |
+| `OPENMVS_RESOLUTION_LEVEL` | `1` | 密な復元で写真を何回半分にするか（0 は等倍で数倍遅い） |
+| `OPENMVS_MAX_FACES` | `150000` | メッシュの面の数の上限 |
+| `OPENMVS_TEXTURE_SIZE` | `4096` | テクスチャ画像の 1 辺の上限 |
+| `OPENMVS_SEAM_LEVELING` | `false` | テクスチャの継ぎ目の明るさをならす（手元の arm64 ビルドで壊れたので既定は切る） |
 | `COLMAP_MAX_IMAGE_SIZE` | `1600` | 特徴抽出・歪み補正時の長辺の上限 |
 | `NUM_THREADS` | `0` | 外部 CLI のスレッド数（0 は全コア）。CPU 制限と同じ値にする |
 | `SPLAT_ITERATIONS` | `1000` | 3DGS の学習反復回数（CPU では 1 反復あたり約 1 秒） |
@@ -273,28 +285,41 @@ curl -X DELETE "$BASE/api/scans/$ID"
 
 ## コンテナイメージ
 
+役割ごとに 3 つのイメージを作る（`--target` で選ぶ）。
+
 ```bash
-docker build -f deploy/docker/Dockerfile -t 3d-scanner:dev .
+docker build -f deploy/docker/Dockerfile --target web    -t 3d-scanner-web:dev .
+docker build -f deploy/docker/Dockerfile --target api    -t 3d-scanner-api:dev .
+docker build -f deploy/docker/Dockerfile --target worker -t 3d-scanner-worker:dev .
 ```
 
-COLMAP 4.2.1、OpenSplat 1.2.2、gltfpack 1.3、splat-transform 3.11.2 を CPU 専用でビルドし、
-Go のサーバーとビルド済みの Web を同梱する（約 1.5GB）。linux/amd64 と linux/arm64 でビルドできる。
-main に push すると、GitHub Actions が `ghcr.io/ieyoukan/3d-scanner` に公開する
-（タグは `latest` と `sha-<コミット>`）。
+| イメージ | 土台 | 中身 |
+| --- | --- | --- |
+| web | nginx（非 root、Alpine） | ビルド済みの画面 |
+| api | distroless（Debian 13。シェルもパッケージ管理も無い） | Go の単一バイナリ |
+| worker | Debian 13（slim） | Go のバイナリと、CPU 専用でビルドした COLMAP 4.2.1・OpenMVS 2.4.0・OpenSplat 1.2.2・gltfpack 1.3・splat-transform 3.11.2 |
+
+worker の実行に要る共有ライブラリは、ビルドした実行ファイルから `ldd` と `dpkg -S` で割り出して入れる
+（OS の版を上げてもパッケージ名を手で直さずに済む）。CI は linux/amd64 でビルドする（worker は約 30 分）。
+linux/arm64（Apple Silicon の Mac など）でもビルドできる作りだが、メモリ 8GB の環境では COLMAP・OpenMVS・OpenSplat の
+コンパイルが同時に走ってメモリが足りなくなり、確認できていない（`--build-arg BUILD_JOBS=1` で並列数を下げる）。
+main に push すると、GitHub Actions が**中身の変わったイメージだけ**を `ghcr.io/ieyoukan/3d-scanner-{web,api,worker}` に
+公開する（タグは `latest` と `sha-<コミット>`）。画面だけを直したときに worker が入れ替わらない（処理中のジョブが止まらない）ため。
 
 ## Kubernetes への配備（Helm）
 
 ```bash
-# 構文と出力の確認
-helm lint charts/3d-scanner --set postgresql.auth.existingSecret=x
-helm template scanner charts/3d-scanner --set postgresql.auth.existingSecret=x
+# 構文と出力の確認（イメージのタグは必須。無いと描画を止める）
+TAGS="--set web.image.tag=sha-xxxxxxx --set api.image.tag=sha-xxxxxxx --set worker.image.tag=sha-xxxxxxx"
+helm lint charts/3d-scanner --set postgresql.auth.existingSecret=x $TAGS
+helm template scanner charts/3d-scanner --set postgresql.auth.existingSecret=x $TAGS
 
 # 配備の例（秘密の値は先に Secret として作っておく）
 kubectl create namespace 3d-scanner
 kubectl -n 3d-scanner create secret generic 3d-scanner-secrets \
   --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 
-helm install scanner charts/3d-scanner -n 3d-scanner \
+helm install scanner charts/3d-scanner -n 3d-scanner $TAGS \
   --set postgresql.auth.existingSecret=3d-scanner-secrets \
   --set persistence.storageClass=proxmox-data \
   --set postgresql.persistence.storageClass=proxmox-data \
@@ -308,7 +333,8 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 
 | 値 | 内容 |
 | --- | --- |
-| `image.repository` / `image.tag` | イメージ名とタグ |
+| `web.image.*` / `api.image.*` / `worker.image.*` | 役割ごとのイメージ名とタグ（タグは必須） |
+| `web.replicas` / `web.resources` / `api.resources` | 画面と API の Pod の数と資源 |
 | `ingress.hosts[].host` / `ingress.className` | 公開するホスト名と IngressClass |
 | `persistence.storageClass` / `persistence.size` | 作業領域の StorageClass と容量 |
 | `postgresql.enabled` / `externalDatabase.*` | 内蔵の PostgreSQL を使うか、既存の DB に繋ぐか |
@@ -316,7 +342,20 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | `config.retention` | 保存期間 |
 | `config.pipeline.*` | メッシュの作り方、3DGS の反復回数など |
 | `gpu.enabled` / `gpu.resourceName` | GPU の割り当て（既定のイメージでは使われない） |
-| `resources` | CPU とメモリの要求・上限 |
+| `resources` | worker の CPU とメモリの要求・上限 |
+| `affinity.nodeAffinity` | 載せるノードの条件（3 つの Pod すべて）。api と worker は同じノードに載せる（自動） |
+| `networkPolicy.enabled` | worker の内部用 HTTP に api の Pod からだけ届くようにする（ノードの網を `networkPolicy.nodeCIDRs` に） |
+
+Pod の構成:
+
+| Pod | 入れ替え方 | 作業領域（PVC） |
+| --- | --- | --- |
+| scanner-web | RollingUpdate（止まらない） | 使わない |
+| scanner-api | RollingUpdate（止まらない） | 使う |
+| scanner-worker | Recreate（処理中のジョブは止まり、次の起動でやり直す） | 使う |
+
+PVC は ReadWriteOnce（同時に 1 ノードからしかマウントできない）なので、api と worker は同じノードに載せる
+（podAffinity。チャートが自動で付ける）。Ingress は `/api` を api、それ以外を web に振り分ける。
 
 自宅クラスタ（Argo CD）への登録は `ieyoukan/home-manifests` の `argocd-apps/3d-scanner.yaml` で行う。
 仕組みは [docs/learning/06-helm-proxmox-csi.md](docs/learning/06-helm-proxmox-csi.md)。
@@ -338,6 +377,7 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 | 項目 | 方法 | 結果 |
 | --- | --- | --- |
 | Go | `go vet ./...`、`go test -race ./...` | 成功（9 パッケージ） |
+| 役割の分割と OpenMVS（通し） | CI が公開した amd64 の 3 イメージ（web 63MB・api 15MB・worker 1.7GB）を手元の docker compose（Rosetta）で動かし、1 周の動画（31 枚）を画面と同じ経路（web → api）で送った | worker は COLMAP 4.2.1・OpenMVS ありと判断して `meshMode: openmvs`。SfM 122 秒（31/31 枚、0.42px）→ OpenMVS の密な点群 141 秒（27 万点）→ メッシュ 23 秒（149,945 面、GLB 6.5MB）。ビューアで棒・看板・床が表示された。順番待ちの削除（api → worker）は cancelled、位置合わせ（api → worker）は 3,697 点が一致して成功 |
 | 風景モードの照合（組を絞る） | 物の 1 周の動画 2 本（31 枚・40 枚、1 秒に 3 枚・長辺 1600px）で、全部の組と `ScenePairs` と同じ組（前後 8 枚＋16・32 枚離れたもの）を COLMAP 4.2.1 で比べた（手元の Docker、CPU） | どちらも全部の写真の位置が求まった。組 465→227、780→316。照合の時間 74→54 秒、273→221 秒（近い写真どうしの照合に時間の大半がかかるので、30〜40 枚では 2〜3 割しか縮まない。150 枚では全部の組 11,175 に対し約 1,500 組）。点の数は 4%・14% 減った |
 | PostgreSQL 実装 | 契約テストを PostgreSQL 17 に対して実行 | 成功 |
 | Web | `tsc --noEmit`、`vitest run`、`vite build` | 成功（単体テスト 69 件） |
@@ -370,7 +410,9 @@ helm install scanner charts/3d-scanner -n 3d-scanner \
 
 | 項目 | 理由 | 確認の手順 |
 | --- | --- | --- |
-| 密な復元（MVS）によるメッシュ | CUDA 対応の GPU が無い。単体テストでコマンドの順番と引数だけ確認 | CUDA 入りのイメージを作り、`MESH_MODE=dense` で実行する（[docs/learning/03-mvs.md](docs/learning/03-mvs.md)） |
+| COLMAP の密な復元（MVS）によるメッシュ | CUDA 対応の GPU が無い。単体テストでコマンドの順番と引数だけ確認 | CUDA 入りのイメージを作り、`MESH_MODE=dense` で実行する（[docs/learning/03-mvs.md](docs/learning/03-mvs.md)） |
+| OpenMVS の amd64 での動作とテクスチャの継ぎ目 | 手元（arm64）では 1 周の動画 2 本で動いた。継ぎ目をならす処理（seam leveling）は arm64 のビルドで壊れたので既定で切ってある。本番（amd64）では未確認 | 本番で 1 件作り、メッシュの見た目と処理時間を確かめる。`OPENMVS_SEAM_LEVELING=true` で継ぎ目が直るか試す |
+| 役割の分割（web・api・worker）の本番での動作 | 手元の docker compose では確かめた（上の「確認できたこと」）。本番の Ingress（Cloudflare）の /api の振り分けと、api と worker が同じノードに載るかは未確認 | 配備後に 3 つの Pod が Running か、api と worker が同じノードか、画面と API が両方開くかを見る |
 | GPU での 3DGS 学習 | 同上 | CUDA 版の OpenSplat を入れ、`SPLAT_FORCE_CPU=false` |
 | スマホ実機（Android Chrome）での撮影 | 開発環境から実機に繋いでいない | HTTPS の URL を用意し、実機で撮影から閲覧まで通す |
 | amd64 の実機での所要時間 | amd64 イメージの動作はエミュレーションで確認したが、処理時間は実機と異なる | 配備後に、実際の所要時間を測る |

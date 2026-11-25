@@ -72,7 +72,38 @@ type Capabilities struct {
 	// ColmapGPU は COLMAP が CUDA（または HIP）つきでビルドされているか。
 	// false だと patch_match_stereo（密な復元）が実行できない。
 	ColmapGPU bool
+	// OpenMVS は OpenMVS の実行ファイル（OPENMVS_DIR）がそろっているか。
+	OpenMVS bool
 }
+
+// openMVSTools はこのアプリが使う OpenMVS の実行ファイル。
+var openMVSTools = []string{"InterfaceCOLMAP", "DensifyPointCloud", "ReconstructMesh", "TextureMesh"}
+
+// DetectOpenMVS は dir に OpenMVS の実行ファイルがそろっているかを返す（dir が空なら false）。
+func DetectOpenMVS(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	for _, t := range openMVSTools {
+		st, err := os.Stat(filepath.Join(dir, t))
+		if err != nil || !st.Mode().IsRegular() || st.Mode().Perm()&0o111 == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// MeshKind はメッシュ分岐の作り方。
+type MeshKind string
+
+const (
+	// MeshKindDense: COLMAP の密な復元（CUDA 必須）。
+	MeshKindDense MeshKind = "dense"
+	// MeshKindOpenMVS: OpenMVS の密な復元（CPU で動く）。
+	MeshKindOpenMVS MeshKind = "openmvs"
+	// MeshKindSparse: 疎な点群からの簡易メッシュ。
+	MeshKindSparse MeshKind = "sparse"
+)
 
 var colmapVersionPattern = regexp.MustCompile(`COLMAP (\S+)`)
 
@@ -117,20 +148,33 @@ func New(cfg config.Pipeline, run cmdrun.Runner, caps Capabilities, log *slog.Lo
 	return &Pipeline{cfg: cfg, run: run, caps: caps, log: log}
 }
 
-// DenseMesh は、メッシュ分岐で密な復元（MVS）を使うかどうかを返す。
+// MeshKind は、メッシュ分岐をどの方法で作るかを返す。
 //
-//   - auto:   COLMAP が GPU 対応なら dense、そうでなければ sparse。
-//   - dense:  常に dense（GPU が無ければ patch_match_stereo が失敗し、その失敗がそのまま画面に出る）。
-//   - sparse: 常に sparse。
-func (p *Pipeline) DenseMesh() bool {
+//   - auto:    COLMAP が GPU 対応なら dense、そうでなく OpenMVS があれば openmvs、どちらも無ければ sparse。
+//     （この OpenMVS は CUDA なしでビルドしているので、GPU があれば COLMAP の方が速い）
+//   - dense:   常に dense（GPU が無ければ patch_match_stereo が失敗し、その失敗がそのまま画面に出る）。
+//   - openmvs: 常に openmvs。
+//   - sparse:  常に sparse。
+func (p *Pipeline) MeshKind() MeshKind {
 	switch p.cfg.MeshMode {
 	case config.MeshModeDense:
-		return true
+		return MeshKindDense
+	case config.MeshModeOpenMVS:
+		return MeshKindOpenMVS
 	case config.MeshModeSparse:
-		return false
+		return MeshKindSparse
 	}
-	return p.caps.ColmapGPU
+	switch {
+	case p.caps.ColmapGPU:
+		return MeshKindDense
+	case p.caps.OpenMVS:
+		return MeshKindOpenMVS
+	}
+	return MeshKindSparse
 }
+
+// DenseMesh は、メッシュ分岐で COLMAP の密な復元（MVS）を使うかどうかを返す。
+func (p *Pipeline) DenseMesh() bool { return p.MeshKind() == MeshKindDense }
 
 // Run は1件のジョブを最後まで実行する。
 //
@@ -538,23 +582,31 @@ func (p *Pipeline) runMeshBranch(ctx context.Context, job Job, rep Reporter) boo
 		return false
 	}
 
-	dense := p.DenseMesh()
-	if dense {
-		if err := p.step(ctx, rep, scan.StepMVS, func() (string, error) { return p.runDenseMVS(ctx, job) }); err != nil {
+	kind := p.MeshKind()
+	switch kind {
+	case MeshKindDense, MeshKindOpenMVS:
+		mvs := func() (string, error) { return p.runDenseMVS(ctx, job) }
+		if kind == MeshKindOpenMVS {
+			mvs = func() (string, error) { return p.runOpenMVSDensify(ctx, job) }
+		}
+		if err := p.step(ctx, rep, scan.StepMVS, mvs); err != nil {
 			if ctx.Err() == nil {
 				rep.StepFinished(ctx, scan.StepMesh, scan.StepSkipped, "MVS が失敗したため実行していません。")
 			}
 			return false
 		}
-	} else {
+	default:
 		// 「実行しなかった」ことと理由を隠さず記録する。
 		rep.StepFinished(ctx, scan.StepMVS, scan.StepSkipped,
-			"このサーバーの COLMAP は GPU（CUDA）に対応していないため、密な復元（patch_match_stereo）を実行できません。"+
+			"このサーバーには密な復元の手段（CUDA 対応の COLMAP か OpenMVS）が無いため、実行できません。"+
 				"代わりに、疎な点群から簡易メッシュを作ります。")
 	}
 
 	// メッシュ分岐の失敗は 3DGS 分岐を止めない。エラーは step が Reporter に伝え済み。
-	return p.step(ctx, rep, scan.StepMesh, func() (string, error) { return p.runMesh(ctx, job, rep, dense) }) == nil
+	if kind == MeshKindOpenMVS {
+		return p.step(ctx, rep, scan.StepMesh, func() (string, error) { return p.runOpenMVSMesh(ctx, job, rep) }) == nil
+	}
+	return p.step(ctx, rep, scan.StepMesh, func() (string, error) { return p.runMesh(ctx, job, rep, kind == MeshKindDense) }) == nil
 }
 
 // undistort は「レンズの歪みを取り除いた画像」と、それに対応するカメラ（歪みなしの PINHOLE）を作る。

@@ -155,7 +155,13 @@ export function UploadPanel({ frames, check, limits, retentionHours, keepComplet
 function describePipeline(p: PipelineInfo): string {
   const parts: string[] = [];
   if (p.meshEnabled) {
-    parts.push(p.meshMode === 'dense' ? 'メッシュ（密な復元）' : 'メッシュ（簡易版。このサーバーは GPU が無いため粗くなります）');
+    parts.push(
+      p.meshMode === 'dense'
+        ? 'メッシュ（密な復元）'
+        : p.meshMode === 'openmvs'
+          ? 'メッシュ（密な復元。数分かかります）'
+          : 'メッシュ（簡易版。このサーバーは密な復元ができないため粗くなります）',
+    );
   }
   if (p.splatEnabled && !p.splatDeferred && !p.splatManual) {
     parts.push(p.splatDevice === 'cpu' ? '3D Gaussian Splatting（CPU で学習するため時間がかかります）' : '3D Gaussian Splatting');
