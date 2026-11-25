@@ -1,17 +1,20 @@
 // AR で見ている間に、カメラ映像の上に重ねる画面（WebXR の DOM overlay）。
 //
-//   上      閉じる・置き直す
-//   真ん中  置く前: 「ゆっくり動かす」→「置く所をタップ」
-//           置いた後: 1本指で左右になぞると回る、2本指でつまむと大きさが変わる（画面全体で受ける）
-//   下      大きさ（「実物大」または倍率）。押すと元の大きさに戻る
+//   上      閉じる。右は、重ねているときは「透かす」、机に置いたときは「置き直す」。位置を見失ったら真ん中に「！」
+//   真ん中  重ねるまで: メーター（capture/LocateMeter.tsx）。机に置く前: 「ゆっくり動かす」→「置く所をタップ」
+//           机に置いた後: 1本指で左右になぞると回る、2本指でつまむと大きさが変わる（画面全体で受ける）
+//   下      見方の切り替え（「机に置く」⇔「実物に重ねる」）。机に置いたときは大きさ（押すと元の大きさ）
 import { useEffect, useRef } from 'react';
-import { MovePhone } from '../capture/ArHud';
+import { MovePhone } from '../capture/arIcons';
+import { LocateMeter } from '../capture/LocateMeter';
 import type { ArViewState } from './arView';
 
 interface Props {
   state: ArViewState | null;
   onClose: () => void;
-  onReplace: () => void;
+  onPlace: () => void;
+  onOverlay: () => void;
+  onSeeThrough: () => void;
   onRotate: (radians: number) => void;
   onZoom: (factor: number) => void;
   onResetZoom: () => void;
@@ -20,7 +23,7 @@ interface Props {
 /** 1本指で画面の幅をなぞったときに回る角度（ラジアン）。 */
 const radiansPerScreen = 2 * Math.PI;
 
-export function ArViewHud({ state, onClose, onReplace, onRotate, onZoom, onResetZoom }: Props) {
+export function ArViewHud({ state, onClose, onPlace, onOverlay, onSeeThrough, onRotate, onZoom, onResetZoom }: Props) {
   const root = useRef<HTMLDivElement>(null);
   const phase = state?.phase ?? 'loading';
 
@@ -45,6 +48,8 @@ export function ArViewHud({ state, onClose, onReplace, onRotate, onZoom, onReset
         ? '実物大'
         : `実物の ${formatZoom(state.zoom)} 倍`
       : `目安の大きさ${Math.abs(state.zoom - 1) < 0.01 ? '' : ` × ${formatZoom(state.zoom)}`}`;
+  // 置いた・重ねた後に位置を見失ったら知らせる（その間はメッシュが正しい所に出ない）。
+  const lostAfter = state && !state.tracking && (phase === 'placed' || phase === 'overlay');
 
   return (
     <div ref={root} className="pointer-events-none fixed inset-0 z-50 select-none text-paper">
@@ -55,10 +60,18 @@ export function ArViewHud({ state, onClose, onReplace, onRotate, onZoom, onReset
         <RoundButton label="閉じる" onClick={onClose}>
           <path d="M6 6l12 12M18 6L6 18" />
         </RoundButton>
+        {lostAfter && (
+          <span className="mt-1 rounded-full bg-black/60 px-3 py-1.5 text-sm font-semibold text-amber">! ゆっくり動かす</span>
+        )}
         {phase === 'placed' ? (
-          <RoundButton label="置き直す" onClick={onReplace}>
+          <RoundButton label="置き直す" onClick={onPlace}>
             <circle cx="12" cy="12" r="7" />
             <circle cx="12" cy="12" r="1.5" fill="currentColor" />
+          </RoundButton>
+        ) : phase === 'overlay' ? (
+          <RoundButton label={state?.seeThrough ? '透かすのをやめる' : '透かして実物と見比べる'} onClick={onSeeThrough}>
+            <rect x="4" y="4" width="11" height="11" rx="1.5" />
+            <rect x="9" y="9" width="11" height="11" rx="1.5" fill={state?.seeThrough ? 'currentColor' : 'none'} fillOpacity="0.35" />
           </RoundButton>
         ) : (
           <span className="size-11" />
@@ -69,6 +82,10 @@ export function ArViewHud({ state, onClose, onReplace, onRotate, onZoom, onReset
         <p className="absolute inset-x-6 top-1/2 rounded-lg bg-black/70 p-3 text-center text-sm text-amber">{state.error}</p>
       ) : phase === 'loading' ? (
         <span className="absolute left-1/2 top-1/2 size-8 -translate-x-1/2 -translate-y-1/2 animate-spin rounded-full border-2 border-paper border-t-transparent" />
+      ) : phase === 'locating' && state?.locate ? (
+        <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
+          <LocateMeter progress={state.locate} />
+        </div>
       ) : (
         phase === 'placing' && (
           <div className="absolute inset-x-0 top-1/2 mt-16 flex flex-col items-center gap-2 drop-shadow">
@@ -78,20 +95,49 @@ export function ArViewHud({ state, onClose, onReplace, onRotate, onZoom, onReset
         )
       )}
 
-      {phase === 'placed' && state && (
-        <div className="pad-safe-b absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 pb-6">
-          <button
-            type="button"
-            onClick={onResetZoom}
-            aria-label="元の大きさに戻す"
-            className="tabular pointer-events-auto rounded-full bg-black/60 px-4 py-2 text-sm"
-          >
-            {sizeLabel}
-          </button>
-          <GestureHint />
-        </div>
-      )}
+      <div className="pad-safe-b absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 pb-6">
+        {phase === 'placed' && state && (
+          <>
+            <button
+              type="button"
+              onClick={onResetZoom}
+              aria-label="元の大きさに戻す"
+              className="tabular pointer-events-auto rounded-full bg-black/60 px-4 py-2 text-sm"
+            >
+              {sizeLabel}
+            </button>
+            <GestureHint />
+          </>
+        )}
+        {/* 見方の切り替え。重ねている・重ねようとしている間は「机に置く」、机に置いている間は「実物に重ねる」。 */}
+        {(phase === 'locating' || phase === 'overlay') && (
+          <PillButton onClick={onPlace} label="机に置く">
+            <path d="M4 17h16M7 17l2-6h6l2 6" />
+          </PillButton>
+        )}
+        {(phase === 'placing' || phase === 'placed') && state?.canOverlay && (
+          <PillButton onClick={onOverlay} label="実物に重ねる">
+            <rect x="4" y="6" width="10" height="10" rx="1.5" />
+            <rect x="10" y="9" width="10" height="10" rx="1.5" />
+          </PillButton>
+        )}
+      </div>
     </div>
+  );
+}
+
+function PillButton({ onClick, label, children }: { onClick: () => void; label: string; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="pointer-events-auto flex min-h-11 items-center gap-2 rounded-full bg-black/60 px-4 text-sm font-semibold"
+    >
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+        {children}
+      </svg>
+      {label}
+    </button>
   );
 }
 

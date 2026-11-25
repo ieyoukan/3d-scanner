@@ -16,9 +16,14 @@
 //   画面    歩いた道を真上から見た小さな図（撮った所の点と向き）。その場で向きだけ変えている・速すぎるときは警告
 //
 // 続きを撮る（reference を渡したとき）は、中心を置く代わりに locating から始める:
-//   locating   カメラ画像を位置合わせ（VPS）に送り、前回の3Dデータ（地図）の座標を AR に重ねる（resume/arAlign.ts）。
+//   locating   カメラ画像を位置合わせ（VPS）に送り、前回の3Dデータ（地図）の座標を AR に重ねる（arLocator.ts）。
+//              画面のメーターで「周りを覚える → 照合 → （横へ）」の進み具合を見せる。
 //              重なったら、ドームの中心を前回の被写体の中心に置き、前回撮った方向のタイルを最初から緑にし、
 //              前回のメッシュを半透明で重ねる。大きさが分からないスキャンは、横に動いてもう1か所で合わせる
+//
+// アンカー（arAnchor.ts）: ドームと前回のメッシュは、置いた（重ねた）所のアンカーに結び付ける。AR が自分の位置の推定を
+// 直しても、現実に貼り付いたままになる。位置を見失っている間（AR が向きしか分からない）は、置く・撮れた方向を数える・
+// 位置合わせを止める。
 //
 // 中心の寄せ直し: 撮影中、カメラの視線が集まる点（対象の中心）を求め、置いた中心をそこへ少しずつ寄せる。
 // 空中に置いた・対象の手前の面に置いた等で中心がずれていても、回るうちに対象の中心に合っていく。
@@ -33,8 +38,10 @@
 // 対応: Android の Chrome（ARCore 対応機種）。iPhone の Safari は WebXR の AR に対応していない。
 import * as THREE from 'three';
 import type { LocalizeResult, SceneInfo } from '../api/types';
-import { minBaselineMeters, solveAlignment, type ArFix } from '../resume/arAlign';
 import { cameraDistance, cropMesh, keepFraction } from '../viewer/arModel';
+import { createAnchorKeeper } from './arAnchor';
+import { cameraImageOf, makeGrabber, photoEdge } from './arCamera';
+import { createLocator, type LocateProgress } from './arLocator';
 import { createPlacer } from './arPlacement';
 import {
   convergePoint,
@@ -47,16 +54,11 @@ import {
   type PoseSample,
   type Vec3,
 } from './coverage';
-import { fit, frameFromVideoFrame, releaseFrame, sceneEncoding, type ArPose, type Frame } from './frames';
+import { releaseFrame, sceneEncoding, type ArPose, type Frame } from './frames';
 import { MotionMeter, MotionWarnings, type MotionWarning } from './sceneMotion';
 import { thinPairs } from './liveVideo';
-import { laplacianVariance, toGray } from './sharpness';
 import { BestPerWindow, FrameCollector, framesPerSecond } from './video';
 
-/** くっきり度を測るときの長辺（画素）。動画と同じ。 */
-const scoreEdge = 480;
-/** 写真の長辺の上限（画素）。アップロードと同じ。 */
-const photoEdge = 2048;
 /** くっきり度を測る最短の間隔（ミリ秒）。毎フレーム読み出すと AR の描画が遅れるので、間引く。 */
 const scoreIntervalMs = 45;
 /** 状態を画面に知らせる最短の間隔（ミリ秒）。 */
@@ -66,9 +68,6 @@ const sampleIntervalMs = 100;
 const refineIntervalMs = 500;
 /** 1回の寄せ直しで、求めた点へ寄せる割合（急に飛ばないように）。 */
 const refineRate = 0.35;
-/** 位置合わせに失敗・断られたとき、次に試すまで待つ時間（ミリ秒）。 */
-const locateRetryMs = 1500;
-const locateErrorRetryMs = 4000;
 
 export type ArPhase = 'locating' | 'placing' | 'ready' | 'recording' | 'finishing';
 
@@ -82,16 +81,7 @@ export interface ArReference {
 }
 
 /** 位置合わせの進み具合（locating の間）。 */
-export interface LocateState {
-  /** 問い合わせ中。 */
-  checking: boolean;
-  /** 位置が分かった回数。 */
-  found: number;
-  /** 分からなかった回数。 */
-  missed: number;
-  /** 大きさを求めるために、横へ動いてもう1か所で合わせる必要がある。 */
-  needMove: boolean;
-}
+export type LocateState = LocateProgress;
 
 export interface ArState {
   phase: ArPhase;
@@ -145,12 +135,6 @@ export interface ArController {
   toggleMesh(): void;
 }
 
-/** WebXR の camera-access の最小限の型（@types/webxr に無い）。 */
-interface XRCameraLike {
-  width: number;
-  height: number;
-}
-
 /**
  * AR を始める。利用者の操作（タップ）の中で、ほかの await より先に呼ぶこと
  * （ブラウザは、操作の直後でないと AR の開始を許さない）。
@@ -174,6 +158,8 @@ export async function startAr(opts: {
   const sessionPromise = xr.requestSession('immersive-ar', {
     // dom-overlay が無いと録画ボタンなどを出せず操作できなくなるので、必須にする。
     requiredFeatures: ['local', 'hit-test', 'camera-access', 'dom-overlay'],
+    // anchors: 置いたドームを現実に貼り付ける。対応していない端末でも AR は始める（貼り付けなしで動く）。
+    optionalFeatures: ['anchors'],
     domOverlay: { root: opts.overlay },
   } as XRSessionInit);
 
@@ -202,8 +188,20 @@ export async function startAr(opts: {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera();
   scene.add(placer.group);
+  // 置いた物（ドーム・前回のメッシュ）はこのグループに入れ、アンカーの補正（AR の位置の推定の直し）を掛ける。
+  const anchored = new THREE.Group();
+  anchored.matrixAutoUpdate = false;
+  scene.add(anchored);
+  const keeper = createAnchorKeeper();
+  let correction = new THREE.Matrix4();
   let dome: Dome | null = null;
+  /** ドームの中心（置いたときの AR の座標）。いまの AR の座標では correction を掛けたもの（centerNow）。 */
   let center: Vec3 | null = null;
+  const centerNow = (): Vec3 | null => {
+    if (!center) return null;
+    const v = new THREE.Vector3(...center).applyMatrix4(correction);
+    return [v.x, v.y, v.z];
+  };
 
   // ---- 続きを撮る: 前回の3Dデータを重ねる ----
   const reference = opts.reference ?? null;
@@ -211,7 +209,7 @@ export async function startAr(opts: {
   const mapGroup = new THREE.Group();
   mapGroup.matrixAutoUpdate = false;
   mapGroup.visible = false;
-  scene.add(mapGroup);
+  anchored.add(mapGroup);
   let meshShown = true;
   let hasMesh = false;
   let disposeMesh = () => {};
@@ -228,10 +226,6 @@ export async function startAr(opts: {
       emit(performance.now(), true);
     });
   }
-  const fixes: ArFix[] = [];
-  const locate: LocateState = { checking: false, found: 0, missed: 0, needMove: false };
-  let nextLocateAt = 0;
-  let locateAbort: AbortController | null = null;
 
   // ---- 風景モード ----
   const sceneMode = !!opts.scene && !reference;
@@ -282,6 +276,8 @@ export async function startAr(opts: {
     }
   }, sceneMode ? sceneEncoding : undefined);
   const grab = makeGrabber(renderer);
+  // 続きを撮る: 前回の地図に重ねるための位置合わせ（メーターの段階も持つ）。
+  const locator = reference ? createLocator({ info: reference.info, localize: reference.localize, grab }) : null;
   /** いま控えている候補の区間と撮影時刻と、そのときのカメラの位置と向き。 */
   let candidate: { key: number; capturedAt: string; pose: ArPose } | null = null;
   /** この AR の回の印（写真のカメラ位置に付けて送る。AR の座標系は回ごとに違うため）。 */
@@ -309,7 +305,7 @@ export async function startAr(opts: {
       picked: collector.frames.length,
       elapsed,
       noCameraImage,
-      locate: phase === 'locating' ? { ...locate } : null,
+      locate: phase === 'locating' && locator ? locator.progress() : null,
       meshShown: hasMesh ? meshShown : null,
       scene: sceneMode,
       path: sceneMode ? pathOf(collector.frames) : [],
@@ -332,8 +328,11 @@ export async function startAr(opts: {
     // ドームの大きさは、置いたときの対象までの距離の 4 割（小さすぎ・大きすぎは丸める）。
     domeBaseRadius = domeRadius(Math.hypot(pos.x - p.x, pos.z - p.z));
     dome = makeDome(domeBaseRadius);
+    // いまの AR の座標で置き、アンカーで現実に貼り付ける（以後の補正は置いた時点からの差なので、ここで単位行列に戻る）。
+    keeper.anchor(p);
+    correction = new THREE.Matrix4();
     dome.group.position.copy(p);
-    scene.add(dome.group);
+    anchored.add(dome.group);
     placer.hide();
     phase = 'ready';
     emit(performance.now(), true);
@@ -346,8 +345,11 @@ export async function startAr(opts: {
   function refineCenter() {
     // 続きを撮るときの中心は前回の3Dデータで決まっているので、動かさない。
     if (!center || !dome || reference) return;
-    const p = convergePoint(samples);
-    if (!p) return;
+    const found = convergePoint(samples);
+    if (!found) return;
+    // 視線はいまの AR の座標なので、置いたときの座標に戻してから寄せる。
+    const back = new THREE.Vector3(...found).applyMatrix4(correction.clone().invert());
+    const p: Vec3 = [back.x, back.y, back.z];
     const next: Vec3 = [
       center[0] + (p[0] - center[0]) * refineRate,
       placedInAir ? center[1] + (p[1] - center[1]) * refineRate : center[1],
@@ -359,65 +361,7 @@ export async function startAr(opts: {
     // ドームの大きさも、回っているときの対象までの距離に合わせる。
     const ds = samples.map((s) => Math.hypot(s.pos[0] - next[0], s.pos[2] - next[2])).sort((a, b) => a - b);
     dome.group.scale.setScalar(domeRadius(ds[Math.floor(ds.length / 2)]!) / domeBaseRadius);
-    coverageOf(samples, next).forEach((c, i) => (covered[i] = c));
-  }
-
-  /**
-   * いまのカメラ画像を位置合わせに送る。そのときの AR の位置と向きを控えておき、結果と組にする。
-   * 位置が分かるたびに重ね方を解き直し、重なったらドームと前回のメッシュを出す。
-   */
-  function locateOnce(tex: THREE.Texture, width: number, height: number, now: number) {
-    locate.checking = true;
-    nextLocateAt = Infinity;
-    const arPos: Vec3 = [pos.x, pos.y, pos.z];
-    const arFwd: Vec3 = [fwd.x, fwd.y, fwd.z];
-    grab.keepCandidate(tex, width, height);
-    const controller = new AbortController();
-    locateAbort = controller;
-    const done = (retryMs: number) => {
-      locate.checking = false;
-      locateAbort = null;
-      nextLocateAt = performance.now() + retryMs;
-      emit(performance.now(), true);
-    };
-    void (async () => {
-      let bitmap: ImageBitmap | undefined;
-      try {
-        bitmap = await grab.readCandidate();
-        const frame = await frameFromVideoFrame(bitmap, new Date(now).toISOString());
-        releaseFrame(frame);
-        const result = await reference!.localize(frame.blob, controller.signal);
-        if (ended || phase !== 'locating') return;
-        if (!result.localized || !result.position || !result.forward) {
-          locate.missed += 1;
-          done(locateRetryMs);
-          return;
-        }
-        locate.found += 1;
-        fixes.push({ arPos, arFwd, mapPos: result.position, mapFwd: result.forward });
-        const solved = solveAlignment(fixes, reference!.info.up, reference!.info.metersPerUnit);
-        if (solved.kind === 'aligned') {
-          applyAlignment(solved.matrix);
-          done(0);
-          return;
-        }
-        locate.needMove = solved.kind === 'need-baseline';
-        done(0);
-      } catch {
-        if (ended || controller.signal.aborted) return;
-        locate.missed += 1;
-        done(locateErrorRetryMs);
-      } finally {
-        bitmap?.close();
-      }
-    })();
-  }
-
-  /** 次の位置合わせを今してよいか。横へ動く必要があるときは、前に合わせた所から十分離れるまで待つ。 */
-  function readyToLocate(now: number): boolean {
-    if (locate.checking || now < nextLocateAt) return false;
-    if (!locate.needMove) return true;
-    return fixes.every((f) => Math.hypot(f.arPos[0] - pos.x, f.arPos[1] - pos.y, f.arPos[2] - pos.z) >= minBaselineMeters);
+    coverageOf(samples, centerNow()!).forEach((c, i) => (covered[i] = c));
   }
 
   /** 地図を AR に重ねる: ドームを前回の被写体の中心に置き、前回撮った方向を緑にし、メッシュを見せる。 */
@@ -434,8 +378,11 @@ export async function startAr(opts: {
     const ds = cams.map((c) => Math.hypot(c[0] - center![0], c[2] - center![2])).sort((a, b) => a - b);
     domeBaseRadius = domeRadius(ds.length > 0 ? ds[Math.floor(ds.length / 2)]! : 0.5);
     dome = makeDome(domeBaseRadius);
+    // 重ねた所（前回の被写体の中心）のアンカーに貼り付ける。
+    keeper.anchor(new THREE.Vector3(...center));
+    correction = new THREE.Matrix4();
     dome.group.position.set(...center);
-    scene.add(dome.group);
+    anchored.add(dome.group);
     // 前回のカメラは被写体を向いて撮っていたので、いる方向のタイルを撮れたことにする。
     for (const c of cams) {
       const { az: a, el } = directionOf(center, c);
@@ -448,7 +395,8 @@ export async function startAr(opts: {
 
   session.addEventListener('end', () => {
     ended = true;
-    locateAbort?.abort();
+    locator?.dispose();
+    keeper.clear();
     disposeMesh();
     // 停止ボタン以外（戻るボタンなど）で閉じたときは、撮りかけの写真を捨てる。
     if (phase !== 'finishing') void collector.discard();
@@ -464,12 +412,17 @@ export async function startAr(opts: {
   renderer.setAnimationLoop((now: number, frame?: XRFrame) => {
     if (!frame) return;
     const pose = frame.getViewerPose(refSpace);
-    tracking = !!pose;
-    if (!pose) {
+    // emulatedPosition: AR が位置を見失い、向きしか分かっていない（位置は推測）。置く・数える・照合をしない。
+    tracking = !!pose && !pose.emulatedPosition;
+    if (!pose || pose.emulatedPosition) {
       if (phase === 'placing') placer.update(frame, refSpace, null, now);
+      locator?.update(now, null, null);
+      if (pose) renderer.render(scene, camera);
       emit(now);
       return;
     }
+    correction = keeper.update(frame, refSpace).clone();
+    anchored.matrix.copy(correction);
     const view = pose.views[0]!;
     const t = view.transform;
     pos.set(t.position.x, t.position.y, t.position.z);
@@ -481,10 +434,11 @@ export async function startAr(opts: {
     if (phase === 'placing') placer.update(frame, refSpace, { pos, quat, fwd }, now);
 
     let here: number | null = null;
-    if (center) {
-      here = currentTile(p, f, center);
+    const c = centerNow();
+    if (c) {
+      here = currentTile(p, f, c);
       facing = here !== null;
-      az = directionOf(center, p).az;
+      az = directionOf(c, p).az;
       if (phase === 'recording') {
         if (here !== null) covered[here] = true;
         if (now - lastSample >= sampleIntervalMs) {
@@ -496,14 +450,15 @@ export async function startAr(opts: {
           refineCenter();
         }
       }
-      target = nextTarget(covered, p, center);
+      target = nextTarget(covered, p, c);
     }
 
-    if (phase === 'locating' && readyToLocate(now)) {
-      const xrCamera = (view as XRView & { camera?: XRCameraLike }).camera;
-      const tex = xrCamera ? renderer.xr.getCameraTexture(xrCamera as unknown as Parameters<typeof renderer.xr.getCameraTexture>[0]) : undefined;
-      if (!xrCamera || !tex) noCameraImage = true;
-      else locateOnce(tex, xrCamera.width, xrCamera.height, now);
+    if (phase === 'locating' && locator) {
+      const image = cameraImageOf(renderer, view);
+      if (!image) noCameraImage = true;
+      locator.update(now, { pos, fwd }, image);
+      const m = locator.alignment();
+      if (m) applyAlignment(m);
     }
 
     if (phase === 'recording' && sceneMode && now - lastSample >= sampleIntervalMs) {
@@ -515,18 +470,18 @@ export async function startAr(opts: {
     if (phase === 'recording') {
       elapsed = (now - recordStart) / 1000;
       progress = sceneMode ? meter.update(p, f, interval) : elapsed;
-      const xrCamera = (view as XRView & { camera?: XRCameraLike }).camera;
-      const tex = xrCamera ? renderer.xr.getCameraTexture(xrCamera as unknown as Parameters<typeof renderer.xr.getCameraTexture>[0]) : undefined;
-      if (!xrCamera || !tex) {
+      const image = cameraImageOf(renderer, view);
+      if (!image) {
         noCameraImage = true;
       } else if (now - lastScore >= scoreIntervalMs) {
         lastScore = now;
-        const score = grab.score(tex, xrCamera.width, xrCamera.height);
+        const { tex } = image;
+        const score = grab.score(tex, image.width, image.height);
         const r = picker.offer(progress - stageStart, score);
         // 先に前の区間の候補を読み出してから、新しい候補で上書きする。
         closeCandidate(r.closed.map(key));
         if (r.keep) {
-          grab.keepCandidate(tex, xrCamera.width, xrCamera.height, sceneMode ? sceneEncoding.maxEdge : photoEdge);
+          grab.keepCandidate(tex, image.width, image.height, sceneMode ? sceneEncoding.maxEdge : photoEdge);
           candidate = {
             key: key(r.window),
             capturedAt: new Date().toISOString(),
@@ -584,10 +539,12 @@ export async function startAr(opts: {
     replace() {
       if (phase !== 'ready' || reference) return;
       if (dome) {
-        scene.remove(dome.group);
+        anchored.remove(dome.group);
         dome.dispose();
         dome = null;
       }
+      keeper.clear();
+      correction = new THREE.Matrix4();
       center = null;
       az = null;
       covered.fill(false);
@@ -595,89 +552,6 @@ export async function startAr(opts: {
       placer.hide();
       phase = 'placing';
       emit(performance.now(), true);
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// カメラ画像の取り込み
-// ---------------------------------------------------------------------------
-
-/** カメラ画像（ExternalTexture）を描き直して読み出す係。 */
-function makeGrabber(renderer: THREE.WebGLRenderer) {
-  // 上下を反転して描く（読み出した画素が、画像の上の行から並ぶように）。
-  const material = new THREE.ShaderMaterial({
-    uniforms: { tex: { value: null } },
-    vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
-    fragmentShader:
-      'uniform sampler2D tex; varying vec2 vUv; void main() { gl_FragColor = texture2D(tex, vec2(vUv.x, 1.0 - vUv.y)); }',
-    depthTest: false,
-    depthWrite: false,
-  });
-  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
-  const quadScene = new THREE.Scene();
-  quadScene.add(quad);
-  const quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-
-  let small: THREE.WebGLRenderTarget | null = null;
-  let smallPixels = new Uint8Array(0);
-  let gray = new Float32Array(0);
-  let full: THREE.WebGLRenderTarget | null = null;
-
-  const ensure = (rt: THREE.WebGLRenderTarget | null, w: number, h: number) => {
-    if (rt && rt.width === w && rt.height === h) return rt;
-    rt?.dispose();
-    return new THREE.WebGLRenderTarget(w, h, { depthBuffer: false });
-  };
-
-  /**
-   * XR の描画を一時的に止めて、描画先 rt にカメラ画像を描く。
-   * AR の間、three.js は毎フレーム描画先を AR の画面（XR の framebuffer）にしている。
-   * null（ふつうの canvas）に戻すとドームが AR の画面に出なくなるので、元の描画先に戻す。
-   */
-  const draw = (tex: THREE.Texture, rt: THREE.WebGLRenderTarget) => {
-    material.uniforms.tex!.value = tex;
-    const previous = renderer.getRenderTarget();
-    const xrEnabled = renderer.xr.enabled;
-    renderer.xr.enabled = false;
-    renderer.setRenderTarget(rt);
-    renderer.render(quadScene, quadCamera);
-    renderer.xr.enabled = xrEnabled;
-    renderer.setRenderTarget(previous);
-  };
-
-  return {
-    /** くっきり度（長辺 480px に縮めたラプラシアン分散）。 */
-    score(tex: THREE.Texture, width: number, height: number): number {
-      const s = fit(width, height, scoreEdge);
-      small = ensure(small, s.width, s.height);
-      if (smallPixels.length !== s.width * s.height * 4) {
-        smallPixels = new Uint8Array(s.width * s.height * 4);
-        gray = new Float32Array(s.width * s.height);
-      }
-      draw(tex, small);
-      renderer.readRenderTargetPixels(small, 0, 0, s.width, s.height, smallPixels);
-      return laplacianVariance(toGray(smallPixels, gray), s.width, s.height);
-    },
-    /** いまのカメラ画像を、写真の候補として控える（前の候補は上書き）。 */
-    keepCandidate(tex: THREE.Texture, width: number, height: number, maxEdge = photoEdge) {
-      const s = fit(width, height, maxEdge);
-      full = ensure(full, s.width, s.height);
-      draw(tex, full);
-    },
-    /** 控えた候補を読み出して画像にする（読み出しの命令はすぐ出すので、この後に上書きしてよい）。 */
-    async readCandidate(): Promise<ImageBitmap> {
-      const rt = full;
-      if (!rt) throw new Error('候補がありません');
-      const pixels = new Uint8Array(rt.width * rt.height * 4);
-      await renderer.readRenderTargetPixelsAsync(rt, 0, 0, rt.width, rt.height, pixels);
-      return createImageBitmap(new ImageData(new Uint8ClampedArray(pixels.buffer), rt.width, rt.height));
-    },
-    dispose() {
-      small?.dispose();
-      full?.dispose();
-      quad.geometry.dispose();
-      material.dispose();
     },
   };
 }
