@@ -214,8 +214,11 @@ type Client struct {
 	fallback httpapi.PipelineInfo
 }
 
-// infoTTL は「このワーカーで何が出来るか」を控えておく時間。
-const infoTTL = time.Minute
+// infoTTL は「このワーカーで何が出来るか」を控えておく時間。infoRetry は、届かなかったときに次に試すまでの時間。
+const (
+	infoTTL   = time.Minute
+	infoRetry = 10 * time.Second
+)
 
 // NewClient はクライアントを作る。base はワーカーの URL（http://scanner-worker:8081）。
 // fallback はワーカーに届かないときに /api/config で返す値（設定から分かる範囲）。
@@ -289,6 +292,10 @@ func (c *Client) PipelineInfo(ctx context.Context) httpapi.PipelineInfo {
 	var info httpapi.PipelineInfo
 	if err := c.do(ctx, http.MethodGet, "/internal/info", nil, &info); err != nil {
 		c.log.Warn("ワーカーの構成を取得できません。設定から分かる値を返します", "error", err)
+		// 届かない間に画面を開くたび 3 秒待たせないよう、しばらく（infoRetry）は設定から分かる値を控えておく。
+		c.mu.Lock()
+		c.info, c.infoAt = c.fallback, time.Now().Add(infoRetry-infoTTL)
+		c.mu.Unlock()
 		return c.fallback
 	}
 	c.mu.Lock()

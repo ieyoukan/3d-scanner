@@ -300,7 +300,9 @@ docker build -f deploy/docker/Dockerfile --target worker -t 3d-scanner-worker:de
 | worker | Debian 13（slim） | Go のバイナリと、CPU 専用でビルドした COLMAP 4.2.1・OpenMVS 2.4.0・OpenSplat 1.2.2・gltfpack 1.3・splat-transform 3.11.2 |
 
 worker の実行に要る共有ライブラリは、ビルドした実行ファイルから `ldd` と `dpkg -S` で割り出して入れる
-（OS の版を上げてもパッケージ名を手で直さずに済む）。linux/amd64 と linux/arm64 でビルドできる。
+（OS の版を上げてもパッケージ名を手で直さずに済む）。CI は linux/amd64 でビルドする（worker は約 30 分）。
+linux/arm64（Apple Silicon の Mac など）でもビルドできる作りだが、メモリ 8GB の環境では COLMAP・OpenMVS・OpenSplat の
+コンパイルが同時に走ってメモリが足りなくなり、確認できていない（`--build-arg BUILD_JOBS=1` で並列数を下げる）。
 main に push すると、GitHub Actions が**中身の変わったイメージだけ**を `ghcr.io/ieyoukan/3d-scanner-{web,api,worker}` に
 公開する（タグは `latest` と `sha-<コミット>`）。画面だけを直したときに worker が入れ替わらない（処理中のジョブが止まらない）ため。
 
