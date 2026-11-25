@@ -11,7 +11,9 @@
 //              見せる・隠すボタン（目の形）を右上に出す
 import { useEffect, useRef } from 'react';
 import { tiles } from './coverage';
+import { MovePhone, WalkSideways } from './arIcons';
 import type { ArState, PathPoint } from './arSession';
+import { LocateMeter } from './LocateMeter';
 
 interface Props {
   state: ArState | null;
@@ -79,26 +81,10 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace, onToggleMe
         </div>
       )}
 
-      {/* 続きを撮る: 位置合わせ中。前回撮った所を映してもらう（横へ動く必要があれば、その絵） */}
+      {/* 続きを撮る: 前回の3Dデータに重ねるまでのメーター */}
       {locating && state?.locate && (
-        <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 flex-col items-center gap-3 drop-shadow">
-          {state.locate.needMove ? (
-            <MovePhone />
-          ) : (
-            <span className="relative grid size-24 place-items-center">
-              <span className="absolute inset-0 animate-pulse rounded-full border-4 border-paper/80" />
-              {state.locate.checking && (
-                <span className="size-7 animate-spin rounded-full border-2 border-paper border-t-transparent" />
-              )}
-            </span>
-          )}
-          <p className="text-center text-base font-semibold">
-            {state.locate.needMove
-              ? '横へ 30cm ほど動く'
-              : state.locate.missed >= 3
-                ? '前回と同じ所から映す'
-                : '前回撮った所を映す'}
-          </p>
+        <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
+          <LocateMeter progress={state.locate} />
         </div>
       )}
 
@@ -169,18 +155,6 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace, onToggleMe
   );
 }
 
-/** 端末を左右にゆっくり動かす絵（AR が周りを見つけるには、端末を少し動かす必要がある）。 */
-export function MovePhone() {
-  return (
-    <svg viewBox="0 0 64 40" width="72" height="45" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-      <g className="ar-sway">
-        <rect x="24" y="6" width="16" height="28" rx="3" />
-        <path d="M30 29h4" />
-      </g>
-      <path d="M10 20h-6m0 0l3-3m-3 3l3 3M54 20h6m0 0l-3-3m3 3l-3 3" strokeOpacity="0.7" />
-    </svg>
-  );
-}
 
 /**
  * 風景モード: 歩いた道を真上から見た図。自分（琥珀色の三角）が真ん中で、向いている方がいつも上。
@@ -220,16 +194,6 @@ function PathMap({ path, here }: { path: PathPoint[]; here: PathPoint | null }) 
   );
 }
 
-/** 風景モードの「横に歩く」の絵（人と左右の矢印）。 */
-function WalkSideways() {
-  return (
-    <svg viewBox="0 0 64 40" width="72" height="45" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <circle cx="32" cy="8" r="4" />
-      <path d="M32 13v12M32 25l-5 10M32 25l5 10M24 18h16" />
-      <path d="M14 22H4m0 0l4-4m-4 4l4 4M50 22h10m0 0l-4-4m4 4l-4 4" strokeOpacity="0.8" />
-    </svg>
-  );
-}
 
 function RoundButton({ label, onClick, children }: { label: string; onClick: () => void; children: React.ReactNode }) {
   return (

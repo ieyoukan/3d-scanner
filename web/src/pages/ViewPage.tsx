@@ -6,8 +6,8 @@
 //   下: 読み込み状況、視点リセット、ダウンロード
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { fetchSceneInfo, renameScan, requestSplat } from '../api/client';
-import type { Scan, SceneInfo, ServerConfig } from '../api/types';
+import { fetchSceneInfo, localizeFrame, renameScan, requestSplat } from '../api/client';
+import type { LocalizeResult, Scan, SceneInfo, ServerConfig } from '../api/types';
 import { arSupported } from '../capture/arSupport';
 import { formatBytes } from '../capture/validation';
 import { displayTitle } from '../gallery/gallery';
@@ -95,7 +95,17 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
   const ar = useArView();
   // AR で見るのはメッシュだけ（向きと大きさに scene.json を使う）。
   const arTarget =
-    active?.key === 'mesh' && active.url && info ? { url: active.url, info, scene: scan.captureMode === 'scene' } : null;
+    active?.key === 'mesh' && active.url && info
+      ? {
+          url: active.url,
+          info,
+          scene: scan.captureMode === 'scene',
+          // 位置合わせ用の地図があれば、撮った場所で開いたときに実物に重ねられる。
+          localize: scan.resumable
+            ? (image: Blob, signal: AbortSignal) => localizeFrame(scan.id, image, signal)
+            : undefined,
+        }
+      : null;
 
   // 生成できなかった出力。隠さずに一覧で示す。
   const missing = tabs.filter((t) => t.url === null);
@@ -177,7 +187,7 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
             保存
           </Button>
           {ar.ok && arTarget && (
-            <Button className="col-span-2" onClick={() => ar.start(arTarget.url, arTarget.info, arTarget.scene)} disabled={ar.active}>
+            <Button className="col-span-2" onClick={() => ar.start(arTarget)} disabled={ar.active}>
               <CubeIcon />
               AR で見る
             </Button>
@@ -199,7 +209,9 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
           <ArViewHud
             state={ar.state}
             onClose={() => ar.ctl.current?.end()}
-            onReplace={() => ar.ctl.current?.replace()}
+            onPlace={() => ar.ctl.current?.place()}
+            onOverlay={() => ar.ctl.current?.overlay()}
+            onSeeThrough={() => ar.ctl.current?.toggleSeeThrough()}
             onRotate={(r) => ar.ctl.current?.rotateBy(r)}
             onZoom={(f) => ar.ctl.current?.zoomBy(f)}
             onResetZoom={() => ar.ctl.current?.resetZoom()}
@@ -421,7 +433,12 @@ function useArView() {
     };
   }, []);
 
-  const start = (meshUrl: string, info: SceneInfo, scene: boolean) => {
+  const start = (target: {
+    url: string;
+    info: SceneInfo;
+    scene: boolean;
+    localize?: (image: Blob, signal: AbortSignal) => Promise<LocalizeResult>;
+  }) => {
     const overlay = root.current;
     if (!overlay || active) return;
     setNotice(null);
@@ -430,9 +447,10 @@ function useArView() {
     const begin = (m: typeof import('../viewer/arView')) =>
       m.startArView({
         overlay,
-        meshUrl,
-        info,
-        scene,
+        meshUrl: target.url,
+        info: target.info,
+        scene: target.scene,
+        localize: target.localize,
         onState: setState,
         onEnded: () => {
           ctl.current = null;
