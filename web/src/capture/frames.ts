@@ -49,6 +49,22 @@ const maxUploadEdge = 2048;
 /** これより大きいファイルは、寸法が小さくても JPEG に圧縮し直して送る。 */
 const maxOriginalBytes = 3 * 1024 * 1024;
 
+/** 映像のコマを写真にするときの大きさと画質。 */
+export interface FrameEncoding {
+  /** 長辺の上限（画素）。 */
+  maxEdge: number;
+  /** JPEG の画質（0〜1）。 */
+  quality: number;
+}
+
+const defaultEncoding: FrameEncoding = { maxEdge: maxUploadEdge, quality: 0.9 };
+
+/**
+ * 風景モードの写真。枚数が多い（最大 150 枚）ので、1回の送信（Cloudflare の 100MB 以内）に収まるよう小さくする。
+ * サーバーの特徴抽出は長辺 1600px に縮めてから行うので、SfM の精度は変わらない。
+ */
+export const sceneEncoding: FrameEncoding = { maxEdge: 1600, quality: 0.85 };
+
 /** 利用者に説明できる読み込み失敗。 */
 export class FrameError extends Error {}
 
@@ -111,9 +127,13 @@ export async function frameFromPhoto(blob: Blob): Promise<Frame> {
  * 動画の1コマ（再生中に createImageBitmap で写し取ったもの）から Frame を作る（video.ts から使う）。
  * bitmap は呼び出し側が閉じる。
  */
-export async function frameFromVideoFrame(bitmap: ImageBitmap, capturedAt: string): Promise<Frame> {
-  const size = fit(bitmap.width, bitmap.height, maxUploadEdge);
-  const blob = await toJpeg(draw(bitmap, size.width, size.height), 0.9);
+export async function frameFromVideoFrame(
+  bitmap: ImageBitmap,
+  capturedAt: string,
+  encode: FrameEncoding = defaultEncoding,
+): Promise<Frame> {
+  const size = fit(bitmap.width, bitmap.height, encode.maxEdge);
+  const blob = await toJpeg(draw(bitmap, size.width, size.height), encode.quality);
   const { thumbUrl, sharpness } = await preview(bitmap);
   return {
     id: newId(),

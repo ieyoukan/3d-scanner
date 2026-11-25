@@ -9,7 +9,7 @@
 //   広く使えないため。数十MBをモバイル回線で送るので、進捗が見えないと不安になる。
 //   ここで表示する % は「実際に送れたバイト数 ÷ 全体」であり、作り物の数字ではない。
 import { toApiError } from '../api/client';
-import type { CreateScanResult } from '../api/types';
+import type { CaptureMode, CreateScanResult } from '../api/types';
 import type { Frame } from '../capture/frames';
 
 export interface UploadProgress {
@@ -59,6 +59,7 @@ export function uploadScan(
   frames: readonly Frame[],
   onProgress: (p: UploadProgress) => void,
   resumeFrom?: string,
+  mode: CaptureMode = 'object',
 ): UploadHandle {
   const form = new FormData();
   frames.forEach((frame, i) => {
@@ -86,7 +87,16 @@ export function uploadScan(
     };
     xhr.onerror = () => reject(new Error('通信が途切れました。電波の良い場所でもう一度お試しください。'));
     xhr.onabort = () => reject(new DOMException('アップロードを中止しました。', 'AbortError'));
-    xhr.open('POST', resumeFrom ? `/api/scans/${encodeURIComponent(resumeFrom)}/resume` : '/api/scans');
+    // 撮り方は URL で伝える（写真より先に分かるので、サーバーは枚数の上限をすぐ決められる）。
+    // 続きの版は、サーバーが元の版の撮り方を引き継ぐ。
+    xhr.open(
+      'POST',
+      resumeFrom
+        ? `/api/scans/${encodeURIComponent(resumeFrom)}/resume`
+        : mode === 'scene'
+          ? '/api/scans?mode=scene'
+          : '/api/scans',
+    );
     // Content-Type は自分で設定しない。FormData を渡すと、ブラウザが区切り文字（boundary）
     // つきの正しいヘッダを自動で付ける。
     xhr.send(form);

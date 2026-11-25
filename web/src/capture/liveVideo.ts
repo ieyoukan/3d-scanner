@@ -7,7 +7,7 @@
 // 長く撮ったとき: 写真が上限（追加できる残りの枚数）に達したら、隣り合う2枚ずつ組にして
 // くっきりした方を残し（約半分になる）、以後は区間の長さを倍にする。何秒撮っても上限に収まり、
 // 1周の中にまんべんなく写真が残る。
-import { releaseFrame, type Frame } from './frames';
+import { releaseFrame, type Frame, type FrameEncoding } from './frames';
 import { BestPerWindow, FrameCollector, framesPerSecond, makeScorer, oneAtATime } from './video';
 
 /**
@@ -55,7 +55,7 @@ export interface LiveRecording {
  */
 export function startLiveRecording(
   video: HTMLVideoElement,
-  opts: { room: number; onProgress: (p: LiveProgress) => void },
+  opts: { room: number; onProgress: (p: LiveProgress) => void; encode?: FrameEncoding },
 ): LiveRecording {
   const room = Math.max(1, opts.room);
   const scorer = makeScorer(video);
@@ -86,7 +86,7 @@ export function startLiveRecording(
       picker = BestPerWindow.every(intervalSec);
     }
     report();
-  });
+  }, opts.encode);
 
   const gate = oneAtATime();
   const tick = (now: number) => {

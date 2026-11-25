@@ -35,6 +35,9 @@ type Config struct {
 type Limits struct {
 	MinImages int
 	MaxImages int
+	// MaxSceneImages は風景モード（歩きながら空間を撮る）の写真の上限。空間は広いので物より多く要る。
+	// 照合は撮った順・位置の近い組だけにするので、処理時間は枚数にほぼ比例する。
+	MaxSceneImages int
 	// MaxImageBytes は写真1枚の最大バイト数。
 	MaxImageBytes int64
 	// MaxUploadBytes は1リクエスト全体の最大バイト数。
@@ -50,6 +53,14 @@ type Limits struct {
 	// MaxQueuedScans は順番待ちジョブの上限。ジョブは1件ずつしか走らないので、
 	// 際限なく受け付けるとディスクと待ち時間が膨らむ。
 	MaxQueuedScans int
+}
+
+// MaxImagesFor は撮り方ごとの写真の上限（scene なら MaxSceneImages）。
+func (l Limits) MaxImagesFor(scene bool) int {
+	if scene {
+		return l.MaxSceneImages
+	}
+	return l.MaxImages
 }
 
 // Jobs はジョブ管理の設定。
@@ -145,6 +156,7 @@ func Load(getenv func(string) string) (Config, error) {
 		Limits: Limits{
 			MinImages:        r.integer("MIN_IMAGES", 8),
 			MaxImages:        r.integer("MAX_IMAGES", 80),
+			MaxSceneImages:   r.integer("MAX_SCENE_IMAGES", 150),
 			MaxImageBytes:    r.megabytes("MAX_IMAGE_MB", 15),
 			MaxUploadBytes:   r.megabytes("MAX_UPLOAD_MB", 95),
 			MaxImagePixels:   int64(r.integer("MAX_IMAGE_MEGAPIXELS", 40)) * 1_000_000,
@@ -255,6 +267,9 @@ func (c Config) validate() []string {
 	}
 	if l.MaxImages < l.MinImages {
 		add("MAX_IMAGES(%d) が MIN_IMAGES(%d) より小さいです", l.MaxImages, l.MinImages)
+	}
+	if l.MaxSceneImages < l.MinImages {
+		add("MAX_SCENE_IMAGES(%d) が MIN_IMAGES(%d) より小さいです", l.MaxSceneImages, l.MinImages)
 	}
 	if l.MaxImageBytes <= 0 || l.MaxUploadBytes <= 0 || l.MaxImagePixels <= 0 {
 		add("MAX_IMAGE_MB / MAX_UPLOAD_MB / MAX_IMAGE_MEGAPIXELS は正の値にしてください")

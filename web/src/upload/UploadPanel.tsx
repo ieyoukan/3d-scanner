@@ -7,7 +7,7 @@
 //                     ├──失敗──▶ idle（エラーを表示。写真はそのまま残るので再送できる）
 //                     └──中止──▶ idle
 import { useEffect, useRef, useState } from 'react';
-import type { CreateScanResult, Limits, PipelineInfo } from '../api/types';
+import type { CaptureMode, CreateScanResult, Limits, PipelineInfo } from '../api/types';
 import type { Frame } from '../capture/frames';
 import { formatBytes, type Check } from '../capture/validation';
 import { Button } from '../ui/Button';
@@ -31,9 +31,11 @@ interface Props {
   resume?: { scanId: string; baseFrameCount: number };
   /** 送信を始めた・終えたときに呼ばれる（送信中は撮影を止めるため）。 */
   onSendingChange?: (sending: boolean) => void;
+  /** 撮り方（風景モードは SfM の照合のしかたと枚数の上限が変わる）。 */
+  mode?: CaptureMode;
 }
 
-export function UploadPanel({ frames, check, limits, retentionHours, keepCompleted, pipeline, onCreated, resume, onSendingChange }: Props) {
+export function UploadPanel({ frames, check, limits, retentionHours, keepCompleted, pipeline, onCreated, resume, onSendingChange, mode = 'object' }: Props) {
   const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const handle = useRef<UploadHandle | null>(null);
@@ -49,7 +51,7 @@ export function UploadPanel({ frames, check, limits, retentionHours, keepComplet
   const start = async () => {
     setError(null);
     setProgress({ sentBytes: 0, totalBytes: check.totalBytes });
-    const upload = uploadScan(frames, setProgress, resume?.scanId);
+    const upload = uploadScan(frames, setProgress, resume?.scanId, mode);
     handle.current = upload;
     try {
       onCreated(await upload.done);

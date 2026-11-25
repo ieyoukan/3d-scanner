@@ -5,6 +5,7 @@ import { captureHint, checkFrames, formatBytes, recommendedImages } from './vali
 const limits: Limits = {
   minImages: 8,
   maxImages: 80,
+  maxSceneImages: 150,
   maxImageBytes: 15 * 1024 * 1024,
   maxUploadBytes: 95 * 1024 * 1024,
   maxImagePixels: 40_000_000,
