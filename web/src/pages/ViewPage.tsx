@@ -94,7 +94,8 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
 
   const ar = useArView();
   // AR で見るのはメッシュだけ（向きと大きさに scene.json を使う）。
-  const arTarget = active?.key === 'mesh' && active.url && info ? { url: active.url, info } : null;
+  const arTarget =
+    active?.key === 'mesh' && active.url && info ? { url: active.url, info, scene: scan.captureMode === 'scene' } : null;
 
   // 生成できなかった出力。隠さずに一覧で示す。
   const missing = tabs.filter((t) => t.url === null);
@@ -176,7 +177,7 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
             保存
           </Button>
           {ar.ok && arTarget && (
-            <Button className="col-span-2" onClick={() => ar.start(arTarget.url, arTarget.info)} disabled={ar.active}>
+            <Button className="col-span-2" onClick={() => ar.start(arTarget.url, arTarget.info, arTarget.scene)} disabled={ar.active}>
               <CubeIcon />
               AR で見る
             </Button>
@@ -420,7 +421,7 @@ function useArView() {
     };
   }, []);
 
-  const start = (meshUrl: string, info: SceneInfo) => {
+  const start = (meshUrl: string, info: SceneInfo, scene: boolean) => {
     const overlay = root.current;
     if (!overlay || active) return;
     setNotice(null);
@@ -431,6 +432,7 @@ function useArView() {
         overlay,
         meshUrl,
         info,
+        scene,
         onState: setState,
         onEnded: () => {
           ctl.current = null;
