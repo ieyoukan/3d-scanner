@@ -12,8 +12,9 @@
 // 今回の写真を地図に合わせる（合わせられた枚数は処理状況の画面に出る）。
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { fetchSceneInfo } from '../api/client';
+import { fetchSceneInfo, localizeFrame } from '../api/client';
 import type { Limits, Scan, SceneInfo, ServerConfig } from '../api/types';
+import type { ArReference } from '../capture/arSession';
 import { CaptureView } from '../capture/CaptureView';
 import { FrameGallery } from '../capture/FrameGallery';
 import { findBlurry } from '../capture/sharpness';
@@ -70,6 +71,15 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
   // 送信中は撮影を止める（自動撮影が、送信中の一覧に写真を足さないように）。
   const [sending, setSending] = useState(false);
   const info = useSceneInfo(scan);
+  // AR で撮るときは、前回の3Dデータを位置合わせして重ねる（地図の真上・中心・カメラ位置と、メッシュ）。
+  const meshUrl = scan.assets.find((a) => a.kind === 'mesh_glb')?.url ?? null;
+  const arReference = useMemo<ArReference | undefined>(
+    () =>
+      info
+        ? { info, meshUrl, localize: (image: Blob, signal: AbortSignal) => localizeFrame(scan.id, image, signal) }
+        : undefined,
+    [info, meshUrl, scan.id],
+  );
   const { state, fixes, check: locate, forget, reset } = useLocalize(scan.id);
 
   // 1枚目を撮ったら、自動で位置を確かめる（いちばん知りたいのは「同じ場所に戻れたか」なので）。
@@ -150,6 +160,7 @@ function Resume({ scan, config }: { scan: Scan; config: ServerConfig }) {
             onAdd={add}
             onReview={() => setPhase('review')}
             paused={sending}
+            arReference={arReference}
             hint={resumeHint(frames.length, limits.maxImages, state)}
             overlay={
               <div className="flex items-start justify-between gap-3">
