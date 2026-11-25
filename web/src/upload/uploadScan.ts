@@ -36,6 +36,8 @@ export function buildMetadata(frames: readonly Frame[], client: Record<string, u
       height: f.height,
       // 写真の EXIF にあった焦点距離（35mm 換算）。サーバーが SfM の初期値に使う。
       ...(f.focalLength35mm ? { focalLength35mm: f.focalLength35mm } : {}),
+      // AR で撮った写真のカメラの位置。サーバーが SfM の結果と突き合わせて、実際の大きさを求める。
+      ...(f.arPose ? { arPose: f.arPose } : {}),
     })),
   });
 }

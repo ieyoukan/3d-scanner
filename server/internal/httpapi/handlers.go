@@ -305,6 +305,18 @@ func (s *Server) createScan(w http.ResponseWriter, r *http.Request, parent *scan
 		}
 	}
 
+	// AR で撮った写真のカメラ位置があれば残す（SfM の後で、実際の大きさと重力の向きを求めるのに使う）。
+	// 続きの版は、元の版の分も引き継ぐ（元の写真のカメラ位置は版をまたいで変わらないので、そのまま使える）。
+	arPoses := reconstruction.ARPosesOf(res.Frames)
+	if parentWS != nil {
+		arPoses = append(reconstruction.ReadARPoses(parentWS), arPoses...)
+	}
+	if len(arPoses) > 0 {
+		if err := reconstruction.WriteARPoses(ws, arPoses); err != nil {
+			s.log.Warn("AR の位置を保存できません", "scan", id, "error", err)
+		}
+	}
+
 	// ギャラリー用の縮小画像を、1枚目の写真から作っておく。失敗しても受付は続ける（一覧で画像が出ないだけ）。
 	// 続きの版は元の版の縮小画像を引き継いでいる（一覧で同じ見た目にする）ので、無いときだけ作る。
 	if _, err := os.Stat(ws.ThumbnailPath()); err != nil && len(res.Frames) > 0 {

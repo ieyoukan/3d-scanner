@@ -22,6 +22,7 @@
 //
 // 対応: Android の Chrome（ARCore 対応機種）。iPhone の Safari は WebXR の AR に対応していない。
 import * as THREE from 'three';
+import { createPlacer } from './arPlacement';
 import {
   convergePoint,
   coverageOf,
@@ -32,7 +33,7 @@ import {
   type PoseSample,
   type Vec3,
 } from './coverage';
-import { fit, releaseFrame, type Frame } from './frames';
+import { fit, releaseFrame, type ArPose, type Frame } from './frames';
 import { thinPairs } from './liveVideo';
 import { laplacianVariance, toGray } from './sharpness';
 import { BestPerWindow, FrameCollector, framesPerSecond } from './video';
@@ -45,10 +46,6 @@ const photoEdge = 2048;
 const scoreIntervalMs = 45;
 /** 状態を画面に知らせる最短の間隔（ミリ秒）。 */
 const stateIntervalMs = 100;
-/** 面も特徴点も見つからないとき、空中に照準を出すまで待つ時間（ミリ秒）。 */
-const airAfterMs = 1500;
-/** 空中に照準を出す距離（前に何かに当たっていればその距離）。 */
-const airDistance = 0.6;
 /** 中心の寄せ直しに使うカメラの位置と視線を控える間隔（ミリ秒）と、寄せ直す間隔。 */
 const sampleIntervalMs = 100;
 const refineIntervalMs = 500;
@@ -134,26 +131,19 @@ export async function startAr(opts: {
   }
   await renderer.xr.setSession(session);
   const refSpace = renderer.xr.getReferenceSpace()!;
-  const viewerSpace = await session.requestReferenceSpace('viewer');
-  // 面だけでなく特徴点（対象の表面など）にも当てる。特徴点に対応していない端末では面だけにする。
-  const hitSource = await requestHitTest(session, viewerSpace);
+  // 照準（面・特徴点・空中。arPlacement.ts）。
+  const placer = await createPlacer(session);
 
   // ---- 3D の表示 ----
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera();
-  const reticle = makeReticle();
-  scene.add(reticle.group);
+  scene.add(placer.group);
   let dome: Dome | null = null;
   let center: Vec3 | null = null;
 
   // ---- 状態 ----
   let phase: ArPhase = 'placing';
   let tracking = false;
-  let aiming = false;
-  /** 端末の位置が分かり始めてから、何にも当たらないまま過ぎた時間を測る起点。 */
-  let noHitSince: number | null = null;
-  /** 照準が最後に何かに当たったときの距離（空中に出すとき使う）。 */
-  let lastHitDistance = airDistance;
   /** 撮影中のカメラの位置と視線（中心の寄せ直しと、撮れた方向の数え直し用）。 */
   const samples: PoseSample[] = [];
   let lastSample = 0;
@@ -191,14 +181,16 @@ export async function startAr(opts: {
     }
   });
   const grab = makeGrabber(renderer);
-  /** いま控えている候補の区間と撮影時刻。 */
-  let candidate: { key: number; capturedAt: string } | null = null;
+  /** いま控えている候補の区間と撮影時刻と、そのときのカメラの位置と向き。 */
+  let candidate: { key: number; capturedAt: string; pose: ArPose } | null = null;
+  /** この AR の回の印（写真のカメラ位置に付けて送る。AR の座標系は回ごとに違うため）。 */
+  const arSessionId = crypto.randomUUID();
   let lastScore = 0;
 
   /** 確定した区間に控えていた候補を、写真にする。 */
   function closeCandidate(keys: number[]) {
     if (!candidate || !keys.includes(candidate.key)) return;
-    collector.add(grab.readCandidate(), candidate.capturedAt);
+    collector.add(grab.readCandidate(), candidate.capturedAt, candidate.pose);
     candidate = null;
   }
 
@@ -208,7 +200,7 @@ export async function startAr(opts: {
     opts.onState({
       phase,
       tracking,
-      aiming,
+      aiming: phase === 'placing' && placer.aiming,
       covered: [...covered],
       target,
       facing,
@@ -226,16 +218,16 @@ export async function startAr(opts: {
 
   // 画面のタップ（DOM の部品の上以外）。置く段階なら、照準の位置に中心を置く。
   session.addEventListener('select', () => {
-    if (phase !== 'placing' || !aiming) return;
-    const p = new THREE.Vector3().setFromMatrixPosition(reticle.group.matrix);
+    if (phase !== 'placing' || !placer.aiming) return;
+    const p = placer.position();
     center = [p.x, p.y, p.z];
-    placedInAir = reticle.inAir;
+    placedInAir = placer.inAir;
     // ドームの大きさは、置いたときの対象までの距離の 4 割（小さすぎ・大きすぎは丸める）。
     domeBaseRadius = domeRadius(Math.hypot(pos.x - p.x, pos.z - p.z));
     dome = makeDome(domeBaseRadius);
     dome.group.position.copy(p);
     scene.add(dome.group);
-    reticle.group.visible = false;
+    placer.hide();
     phase = 'ready';
     emit(performance.now(), true);
   });
@@ -267,9 +259,8 @@ export async function startAr(opts: {
     // 停止ボタン以外（戻るボタンなど）で閉じたときは、撮りかけの写真を捨てる。
     if (phase !== 'finishing') void collector.discard();
     renderer.setAnimationLoop(null);
-    hitSource?.cancel();
+    placer.dispose();
     grab.dispose();
-    reticle.dispose();
     dome?.dispose();
     renderer.dispose();
     opts.onEnded();
@@ -281,10 +272,7 @@ export async function startAr(opts: {
     const pose = frame.getViewerPose(refSpace);
     tracking = !!pose;
     if (!pose) {
-      // 位置が分からなくなった（端末を速く動かした・暗い等）。照準は出さない。
-      aiming = false;
-      reticle.group.visible = false;
-      noHitSince = null;
+      if (phase === 'placing') placer.update(frame, refSpace, null, now);
       emit(now);
       return;
     }
@@ -296,24 +284,7 @@ export async function startAr(opts: {
     const p: Vec3 = [pos.x, pos.y, pos.z];
     const f: Vec3 = [fwd.x, fwd.y, fwd.z];
 
-    if (phase === 'placing') {
-      const hit = hitSource ? frame.getHitTestResults(hitSource)[0] : undefined;
-      const hitPose = hit?.getPose(refSpace);
-      if (hitPose) {
-        noHitSince = null;
-        const m = hitPose.transform.position;
-        // 遠くの壁などに当たったときに空中の照準が遠くへ行きすぎないよう、0.3〜1.5 m に収める。
-        lastHitDistance = Math.min(1.5, Math.max(0.3, Math.hypot(m.x - pos.x, m.y - pos.y, m.z - pos.z)));
-        reticle.onSurface(hitPose.transform.matrix);
-        aiming = true;
-      } else {
-        noHitSince ??= now;
-        // 何も見つからないまましばらく経ったら、前方の空中に照準を出す（白い机など、面を見つけにくい所でも置ける）。
-        aiming = now - noHitSince >= airAfterMs;
-        if (aiming) reticle.inFront(pos, quat, fwd, lastHitDistance);
-        else reticle.group.visible = false;
-      }
-    }
+    if (phase === 'placing') placer.update(frame, refSpace, { pos, quat, fwd }, now);
 
     let here: number | null = null;
     if (center) {
@@ -348,7 +319,15 @@ export async function startAr(opts: {
         closeCandidate(r.closed.map(key));
         if (r.keep) {
           grab.keepCandidate(tex, xrCamera.width, xrCamera.height);
-          candidate = { key: key(r.window), capturedAt: new Date().toISOString() };
+          candidate = {
+            key: key(r.window),
+            capturedAt: new Date().toISOString(),
+            pose: {
+              session: arSessionId,
+              position: [pos.x, pos.y, pos.z],
+              orientation: [quat.x, quat.y, quat.z, quat.w],
+            },
+          };
         }
       }
     }
@@ -400,26 +379,11 @@ export async function startAr(opts: {
       az = null;
       covered.fill(false);
       target = null;
-      noHitSince = null;
+      placer.hide();
       phase = 'placing';
       emit(performance.now(), true);
     },
   };
-}
-
-/** 面と特徴点に当てる hit test を頼む。特徴点に対応していなければ面だけ。どちらも駄目なら undefined。 */
-async function requestHitTest(session: XRSession, space: XRReferenceSpace): Promise<XRHitTestSource | undefined> {
-  const request = session.requestHitTestSource?.bind(session);
-  if (!request) return undefined;
-  try {
-    return await request({ space, entityTypes: ['plane', 'point'] });
-  } catch {
-    try {
-      return await request({ space });
-    } catch {
-      return undefined;
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -512,55 +476,6 @@ function makeGrabber(renderer: THREE.WebGLRenderer) {
 /** ドームの半径: 対象までの水平の距離の 4 割（小さすぎ・大きすぎは丸める）。 */
 function domeRadius(distance: number): number {
   return Math.min(1.0, Math.max(0.12, distance * 0.4));
-}
-
-/**
- * 照準の輪。
- *   面や特徴点に当たったとき  その面に寝かせた、くっきりした白い輪
- *   空中                      こちらを向いた、薄い輪（当たっていないことが見て分かるように）
- */
-function makeReticle() {
-  const group = new THREE.Group();
-  group.matrixAutoUpdate = false;
-  group.visible = false;
-  const ring = (inner: number, outer: number) => new THREE.RingGeometry(inner, outer, 40);
-  const surface = new THREE.Mesh(
-    ring(0.05, 0.065).rotateX(-Math.PI / 2),
-    new THREE.MeshBasicMaterial({ color: 0xffffff }),
-  );
-  const air = new THREE.Mesh(
-    ring(0.045, 0.055),
-    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55, depthWrite: false }),
-  );
-  group.add(surface, air);
-  const m = new THREE.Matrix4();
-  const at = new THREE.Vector3();
-  const one = new THREE.Vector3(1, 1, 1);
-  return {
-    group,
-    inAir: false,
-    onSurface(matrix: Float32Array) {
-      group.matrix.fromArray(matrix);
-      surface.visible = true;
-      air.visible = false;
-      group.visible = true;
-      this.inAir = false;
-    },
-    inFront(pos: THREE.Vector3, quat: THREE.Quaternion, fwd: THREE.Vector3, distance: number) {
-      at.copy(fwd).multiplyScalar(distance).add(pos);
-      group.matrix.copy(m.compose(at, quat, one));
-      surface.visible = false;
-      air.visible = true;
-      group.visible = true;
-      this.inAir = true;
-    },
-    dispose() {
-      surface.geometry.dispose();
-      surface.material.dispose();
-      air.geometry.dispose();
-      air.material.dispose();
-    },
-  };
 }
 
 interface Dome {

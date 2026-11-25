@@ -54,10 +54,15 @@ type SceneInfo struct {
 	Radius float64 `json:"radius"`
 	// CameraPositions は各カメラの位置。初期視点を「撮影した側」に置くために使う。
 	CameraPositions [][3]float64 `json:"cameraPositions"`
+	// MetersPerUnit は SfM の座標の 1 が何メートルか。AR で撮った写真の位置から求められたときだけ入る
+	// （arpose.go）。そのときは Up も、カメラの向きの平均ではなく AR が測った重力の向きになる。
+	MetersPerUnit float64 `json:"metersPerUnit,omitempty"`
 
 	// names は位置を推定できた写真のファイル名（CameraPositions と同じ順）。
 	// 続きの版で「今回の写真が何枚入ったか」を数えるのに使う。scene.json には書かない。
 	names []string
+	// poses は位置を推定できた写真のカメラ。AR の位置との突き合わせに使う。scene.json には書かない。
+	poses []ImagePose
 }
 
 // ImagePose は images.txt から読んだ写真1枚ぶんのカメラの位置と向き（世界座標）。
@@ -98,6 +103,7 @@ func ReadSceneInfo(txtDir string, totalImages int) (*SceneInfo, error) {
 		TotalImages:           totalImages,
 		RegisteredImages:      len(poses),
 		Points:                len(points),
+		poses:                 poses,
 		MeanReprojectionError: meanErr,
 		Up:                    [3]float64{0, -1, 0}, // 求められないときの既定値（カメラ座標の上）
 	}

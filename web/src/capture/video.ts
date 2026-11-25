@@ -18,7 +18,7 @@
 //   そういう区間は、再生の後でその区間の中央へ移動して1枚取る（1周の中に抜けを作らない）。
 //
 // 選んだコマはその場で JPEG にする。全部の区間のコマを展開したまま持つと、スマホのメモリが足りなくなるため。
-import { FrameError, fit, frameFromVideoFrame, releaseFrame, type Frame } from './frames';
+import { FrameError, fit, frameFromVideoFrame, releaseFrame, type ArPose, type Frame } from './frames';
 import { laplacianVariance, toGray } from './sharpness';
 
 /** 1秒あたりに選ぶ写真の枚数。 */
@@ -142,13 +142,14 @@ export class FrameCollector {
   }
 
   /** 選び終えた画像を、順番に写真にする（AR のように、候補を自分で持つ場合に使う）。 */
-  add(image: Promise<ImageBitmap>, capturedAt: string): void {
+  add(image: Promise<ImageBitmap>, capturedAt: string, arPose?: ArPose): void {
     this.encoding = this.encoding.then(async () => {
       let bitmap: ImageBitmap | undefined;
       try {
         bitmap = await image;
         if (this.discarded) return;
         const frame = await frameFromVideoFrame(bitmap, capturedAt);
+        if (arPose) frame.arPose = arPose;
         if (this.discarded) {
           releaseFrame(frame);
           return;
