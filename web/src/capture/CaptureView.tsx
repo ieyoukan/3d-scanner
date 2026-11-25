@@ -32,7 +32,7 @@ import { decide, initialAutoState, markCaptured, signatureOf, type AutoAdvice, t
 import { frameFromCapture, frameFromFile, frameFromPhoto, FrameError, type Frame } from './frames';
 import { captureHint } from './validation';
 import { ArHud } from './ArHud';
-import type { ArController, ArState } from './arSession';
+import type { ArController, ArReference, ArState } from './arSession';
 import { arSupported } from './arSupport';
 import { startLiveRecording, type LiveProgress, type LiveRecording } from './liveVideo';
 import { framesFromVideo, type VideoProgress } from './video';
@@ -119,9 +119,11 @@ interface Props {
    * 送信中に撮った写真は送られず、送信が終わると一覧ごと消えてしまうため。
    */
   paused?: boolean;
+  /** 続きを撮る: AR で撮るとき、前回の3Dデータを位置合わせして重ねる。 */
+  arReference?: ArReference;
 }
 
-export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, paused = false }: Props) {
+export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, paused = false, arReference }: Props) {
   const camera = useCamera();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -369,6 +371,7 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
     const begin = (m: typeof import('./arSession')) => m.startAr({
       overlay: overlayEl,
       room: limits.maxImages - frames.length,
+      reference: arReference,
       onState: setArState,
       onEnded: () => {
         arCtl.current = null;
@@ -747,6 +750,8 @@ export function CaptureView({ frames, limits, onAdd, onReview, overlay, hint, pa
             onStop={() => void stopAr()}
             onCancel={() => arCtl.current?.cancel()}
             onReplace={() => arCtl.current?.replace()}
+            onToggleMesh={() => arCtl.current?.toggleMesh()}
+            canReplace={!arReference}
           />
         )}
       </div>

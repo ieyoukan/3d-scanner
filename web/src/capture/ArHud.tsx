@@ -5,6 +5,8 @@
 //              撮れた方向は緑、次に撮る方向は琥珀色
 //   画面の端    次に撮る方向へ、左・右・上の矢印
 //   下          録画ボタン（赤い丸 → 赤い四角）。横の1周が埋まったら緑に光る
+//   続きを撮る  最初は位置合わせ中の照準（前回撮った所を映してもらう）。重なったら、前回のメッシュを
+//              見せる・隠すボタン（目の形）を右上に出す
 import { useEffect, useRef } from 'react';
 import { tiles } from './coverage';
 import type { ArState } from './arSession';
@@ -15,9 +17,12 @@ interface Props {
   onStop: () => void;
   onCancel: () => void;
   onReplace: () => void;
+  onToggleMesh: () => void;
+  /** 中心を置き直せる（続きを撮るときは、中心は前回の3Dデータで決まるので置き直せない）。 */
+  canReplace: boolean;
 }
 
-export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
+export function ArHud({ state, onRecord, onStop, onCancel, onReplace, onToggleMesh, canReplace }: Props) {
   const root = useRef<HTMLDivElement>(null);
 
   // ボタンを押したときに、AR の「画面のタップ」（中心を置く）が起きないようにする。
@@ -32,6 +37,7 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
   }, []);
 
   const phase = state?.phase ?? 'placing';
+  const locating = phase === 'locating';
   const sideDone = state ? tiles.filter((t, i) => t.band === 'side' && state.covered[i]).length : 0;
   const loopDone = sideDone === tiles.filter((t) => t.band === 'side').length;
   const turn = phase === 'recording' || phase === 'ready' ? state?.target?.turn : undefined;
@@ -43,8 +49,14 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
         <RoundButton label="閉じる" onClick={onCancel}>
           <path d="M6 6l12 12M18 6L6 18" />
         </RoundButton>
-        {state && phase !== 'placing' && <DomeMap state={state} />}
-        {phase === 'ready' ? (
+        {state && phase !== 'placing' && !locating && <DomeMap state={state} />}
+        {state?.meshShown != null && !locating ? (
+          <RoundButton label={state.meshShown ? '前回のメッシュを隠す' : '前回のメッシュを見せる'} onClick={onToggleMesh}>
+            <path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z" />
+            <circle cx="12" cy="12" r="2.5" />
+            {!state.meshShown && <path d="M4 20L20 4" />}
+          </RoundButton>
+        ) : phase === 'ready' && canReplace ? (
           <RoundButton label="中心を置き直す" onClick={onReplace}>
             <circle cx="12" cy="12" r="7" />
             <circle cx="12" cy="12" r="1.5" fill="currentColor" />
@@ -60,6 +72,29 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
           {!state?.aiming && <MovePhone />}
           <p className="text-center text-base font-semibold">
             {state?.aiming ? '対象に合わせてタップ' : 'ゆっくり動かす'}
+          </p>
+        </div>
+      )}
+
+      {/* 続きを撮る: 位置合わせ中。前回撮った所を映してもらう（横へ動く必要があれば、その絵） */}
+      {locating && state?.locate && (
+        <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 flex-col items-center gap-3 drop-shadow">
+          {state.locate.needMove ? (
+            <MovePhone />
+          ) : (
+            <span className="relative grid size-24 place-items-center">
+              <span className="absolute inset-0 animate-pulse rounded-full border-4 border-paper/80" />
+              {state.locate.checking && (
+                <span className="size-7 animate-spin rounded-full border-2 border-paper border-t-transparent" />
+              )}
+            </span>
+          )}
+          <p className="text-center text-base font-semibold">
+            {state.locate.needMove
+              ? '横へ 30cm ほど動く'
+              : state.locate.missed >= 3
+                ? '前回と同じ所から映す'
+                : '前回撮った所を映す'}
           </p>
         </div>
       )}
@@ -87,7 +122,7 @@ export function ArHud({ state, onRecord, onStop, onCancel, onReplace }: Props) {
             {formatTime(state.elapsed)} ・ {state.picked}
           </span>
         )}
-        {phase !== 'placing' && (
+        {phase !== 'placing' && !locating && (
           <button
             type="button"
             aria-label={phase === 'recording' ? '撮影を止める' : '撮り始める'}
