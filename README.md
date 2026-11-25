@@ -377,6 +377,7 @@ PVC は ReadWriteOnce（同時に 1 ノードからしかマウントできな�
 | 項目 | 方法 | 結果 |
 | --- | --- | --- |
 | Go | `go vet ./...`、`go test -race ./...` | 成功（9 パッケージ） |
+| 役割の分割と OpenMVS（通し） | CI が公開した amd64 の 3 イメージ（web 63MB・api 15MB・worker 1.7GB）を手元の docker compose（Rosetta）で動かし、1 周の動画（31 枚）を画面と同じ経路（web → api）で送った | worker は COLMAP 4.2.1・OpenMVS ありと判断して `meshMode: openmvs`。SfM 122 秒（31/31 枚、0.42px）→ OpenMVS の密な点群 141 秒（27 万点）→ メッシュ 23 秒（149,945 面、GLB 6.5MB）。ビューアで棒・看板・床が表示された。順番待ちの削除（api → worker）は cancelled、位置合わせ（api → worker）は 3,697 点が一致して成功 |
 | 風景モードの照合（組を絞る） | 物の 1 周の動画 2 本（31 枚・40 枚、1 秒に 3 枚・長辺 1600px）で、全部の組と `ScenePairs` と同じ組（前後 8 枚＋16・32 枚離れたもの）を COLMAP 4.2.1 で比べた（手元の Docker、CPU） | どちらも全部の写真の位置が求まった。組 465→227、780→316。照合の時間 74→54 秒、273→221 秒（近い写真どうしの照合に時間の大半がかかるので、30〜40 枚では 2〜3 割しか縮まない。150 枚では全部の組 11,175 に対し約 1,500 組）。点の数は 4%・14% 減った |
 | PostgreSQL 実装 | 契約テストを PostgreSQL 17 に対して実行 | 成功 |
 | Web | `tsc --noEmit`、`vitest run`、`vite build` | 成功（単体テスト 69 件） |
@@ -411,7 +412,7 @@ PVC は ReadWriteOnce（同時に 1 ノードからしかマウントできな�
 | --- | --- | --- |
 | COLMAP の密な復元（MVS）によるメッシュ | CUDA 対応の GPU が無い。単体テストでコマンドの順番と引数だけ確認 | CUDA 入りのイメージを作り、`MESH_MODE=dense` で実行する（[docs/learning/03-mvs.md](docs/learning/03-mvs.md)） |
 | OpenMVS の amd64 での動作とテクスチャの継ぎ目 | 手元（arm64）では 1 周の動画 2 本で動いた。継ぎ目をならす処理（seam leveling）は arm64 のビルドで壊れたので既定で切ってある。本番（amd64）では未確認 | 本番で 1 件作り、メッシュの見た目と処理時間を確かめる。`OPENMVS_SEAM_LEVELING=true` で継ぎ目が直るか試す |
-| 役割の分割（web・api・worker）の本番での動作 | 手元の docker compose では確かめた（下の記録）。本番の Ingress（Cloudflare）の /api の振り分けと、api と worker が同じノードに載るかは未確認 | 配備後に 3 つの Pod が Running か、api と worker が同じノードか、画面と API が両方開くかを見る |
+| 役割の分割（web・api・worker）の本番での動作 | 手元の docker compose では確かめた（上の「確認できたこと」）。本番の Ingress（Cloudflare）の /api の振り分けと、api と worker が同じノードに載るかは未確認 | 配備後に 3 つの Pod が Running か、api と worker が同じノードか、画面と API が両方開くかを見る |
 | GPU での 3DGS 学習 | 同上 | CUDA 版の OpenSplat を入れ、`SPLAT_FORCE_CPU=false` |
 | スマホ実機（Android Chrome）での撮影 | 開発環境から実機に繋いでいない | HTTPS の URL を用意し、実機で撮影から閲覧まで通す |
 | amd64 の実機での所要時間 | amd64 イメージの動作はエミュレーションで確認したが、処理時間は実機と異なる | 配備後に、実際の所要時間を測る |
