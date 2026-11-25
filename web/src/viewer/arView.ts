@@ -5,14 +5,15 @@
 //   placed   1本指で左右になぞると回る、2本指でつまむと大きさが変わる（画面側 ArViewHud.tsx が呼ぶ）
 //
 // 向き・大きさは arModel.ts: 真上を合わせ、底を置いた面に乗せ、最初に撮った側を利用者に向ける。
-// AR で撮ったスキャンは実物大（scene.json の metersPerUnit）。それ以外は半径 15cm の目安の大きさ。
+// 物を囲んで撮ったスキャンは、撮ったカメラの輪の内側だけを残す（背景の膜を取り除く）。
+// AR で撮ったスキャンは実物大（scene.json の metersPerUnit）。それ以外は「カメラが 60cm 先にいた」とした目安の大きさ。
 //
 // 対応: Android の Chrome（ARCore 対応機種）。カメラ画像は使わないので camera-access は頼まない。
 import * as THREE from 'three';
 import { GLTFLoader, type GLTF } from 'three/addons/loaders/GLTFLoader.js';
 import type { SceneInfo } from '../api/types';
 import { createPlacer } from '../capture/arPlacement';
-import { placeModel, sampleVertices } from './arModel';
+import { cropMesh, placeModel, sampleVertices } from './arModel';
 import { unlit } from './materials';
 
 export type ArViewPhase = 'loading' | 'placing' | 'placed';
@@ -55,6 +56,8 @@ export async function startArView(opts: {
   overlay: HTMLElement;
   meshUrl: string;
   info: SceneInfo;
+  /** 風景モードで撮ったスキャン（切り抜かず、全体を模型の大きさにする）。 */
+  scene?: boolean;
   onState: (s: ArViewState) => void;
   onEnded: () => void;
 }): Promise<ArViewController> {
@@ -117,7 +120,8 @@ export async function startArView(opts: {
         const mesh = obj as THREE.Mesh;
         if (mesh.isMesh) mesh.material = unlit(mesh.material);
       });
-      const placement = placeModel(opts.info, sampleVertices(gltf.scene));
+      const placement = placeModel(opts.info, sampleVertices(gltf.scene), opts.scene);
+      if (placement.keepWithin !== null) cropMesh(gltf.scene, new THREE.Vector3(...opts.info.center), placement.keepWithin);
       inner.matrix.copy(placement.matrix);
       inner.add(gltf.scene);
       model = gltf;

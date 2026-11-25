@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
 import type { SceneInfo } from '../api/types';
-import { defaultRadiusMeters, placeModel } from './arModel';
+import { assumedCameraMeters, cropMesh, keepFraction, placeModel, sceneModelRadiusMeters } from './arModel';
 
 // SfM の座標で、真上が -z、中心 (1, 2, 3)、最初のカメラは +x 側（中心から 4 離れた所）。
+// radius（点の 75% が入る半径）は背景に引っ張られて 10 と大きい。
 const info = (extra: Partial<SceneInfo> = {}): SceneInfo => ({
   totalImages: 1,
   registeredImages: 1,
@@ -11,13 +12,15 @@ const info = (extra: Partial<SceneInfo> = {}): SceneInfo => ({
   meanReprojectionError: 0,
   up: [0, 0, -1],
   center: [1, 2, 3],
-  radius: 0.5,
+  radius: 10,
   cameraPositions: [[5, 2, 3]],
   ...extra,
 });
 
 // 中心の真下 0.2（-z 方向が上なので、z が +0.2）に底がある、縦の棒（高さ 0.6）。
 const pole = Array.from({ length: 61 }, (_, i) => new THREE.Vector3(1, 2, 3.2 - i * 0.01));
+// カメラより外の背景（床）。中心から 5 以上離れていて、底より 0.7 下。
+const floor = Array.from({ length: 200 }, (_, i) => new THREE.Vector3(6 + i * 0.01, 2, 3.9));
 
 const apply = (m: THREE.Matrix4, p: [number, number, number]) => new THREE.Vector3(...p).applyMatrix4(m);
 
@@ -39,17 +42,41 @@ describe('placeModel', () => {
     expect(cam.z).toBeCloseTo(2, 6);
   });
 
-  it('大きさが分からなければ、半径が目安の大きさになる', () => {
+  it('大きさが分からなければ、撮ったカメラが 60cm 先にいた大きさにする（背景に引っ張られた radius は使わない）', () => {
     const { matrix, realScale } = placeModel(info(), pole);
     expect(realScale).toBe(false);
-    const cam = apply(matrix, [5, 2, 3]);
-    expect(cam.z).toBeCloseTo((4 * defaultRadiusMeters) / 0.5, 6);
+    expect(apply(matrix, [5, 2, 3]).z).toBeCloseTo(assumedCameraMeters, 6);
   });
 
-  it('遠くの床は底に含めない', () => {
-    const floor = Array.from({ length: 200 }, (_, i) => new THREE.Vector3(1 + 5 + i * 0.01, 2, 3.9));
-    const { matrix } = placeModel(info({ metersPerUnit: 1 }), [...pole, ...floor]);
-    // 床（底より 0.7 下）に引っ張られず、棒の底がほぼ y = 0（頂点 1 つ分 = 1 cm 以内）。
+  it('カメラの輪の内側だけを残す。外の背景は底にも使わない', () => {
+    const { matrix, keepWithin } = placeModel(info({ metersPerUnit: 1 }), [...pole, ...floor]);
+    expect(keepWithin).toBeCloseTo(keepFraction * 4, 6);
     expect(Math.abs(apply(matrix, [1, 2, 3.2]).y)).toBeLessThanOrEqual(0.01 + 1e-9);
+  });
+
+  it('風景モードは切り抜かず、全体を机の上の模型の大きさにする', () => {
+    const { matrix, keepWithin } = placeModel(info(), [...pole, ...floor], true);
+    expect(keepWithin).toBeNull();
+    // 頂点の 90% が入る半径（床の遠い方）が 0.3 m 前後になる。
+    const far = apply(matrix, [7.5, 2, 3.9]);
+    const c = apply(matrix, [1, 2, 3]);
+    expect(Math.hypot(far.x - c.x, far.z - c.z)).toBeLessThanOrEqual(sceneModelRadiusMeters * 1.05);
+  });
+});
+
+describe('cropMesh', () => {
+  it('中心から遠い頂点を含む三角形を消す', () => {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute([0, 0, 0, 1, 0, 0, 0, 1, 0, /* 遠い */ 50, 0, 0, 0, 0, 1], 3),
+    );
+    geometry.setIndex([0, 1, 2, 0, 3, 4, 1, 2, 4]);
+    const root = new THREE.Group();
+    const mesh = new THREE.Mesh(geometry);
+    mesh.position.set(10, 0, 0); // メッシュ自身の変換も考える
+    root.add(mesh);
+    cropMesh(root, new THREE.Vector3(10, 0, 0), 2);
+    expect(Array.from(geometry.index!.array)).toEqual([0, 1, 2, 1, 2, 4]);
   });
 });

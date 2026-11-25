@@ -34,6 +34,7 @@
 import * as THREE from 'three';
 import type { LocalizeResult, SceneInfo } from '../api/types';
 import { minBaselineMeters, solveAlignment, type ArFix } from '../resume/arAlign';
+import { cameraDistance, cropMesh, keepFraction } from '../viewer/arModel';
 import { createPlacer } from './arPlacement';
 import {
   convergePoint,
@@ -215,7 +216,7 @@ export async function startAr(opts: {
   let hasMesh = false;
   let disposeMesh = () => {};
   if (reference?.meshUrl) {
-    void loadOverlayMesh(reference.meshUrl).then((loaded) => {
+    void loadOverlayMesh(reference.meshUrl, reference.info).then((loaded) => {
       if (!loaded) return;
       if (ended) {
         loaded.dispose();
@@ -793,12 +794,16 @@ function patch(radius: number, az0: number, az1: number, el0: number, el1: numbe
 
 /**
  * 前回のメッシュ（GLB）を読み込み、重ねて見せる用の半透明の材質にする（地図の座標のまま）。
+ * 背景の膜が画面を覆わないよう、撮ったカメラの輪の内側だけを残す（viewer/arModel.ts の cropMesh）。
  * 読み込めなければ null（重ねないだけで、撮影は続けられる）。GLTFLoader は続きを撮るときだけ読み込む。
  */
-async function loadOverlayMesh(url: string): Promise<{ object: THREE.Object3D; dispose: () => void } | null> {
+async function loadOverlayMesh(url: string, info: SceneInfo): Promise<{ object: THREE.Object3D; dispose: () => void } | null> {
   try {
     const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
     const gltf = await new GLTFLoader().loadAsync(url);
+    const center = new THREE.Vector3(...info.center);
+    const orbit = cameraDistance(info, center);
+    if (orbit) cropMesh(gltf.scene, center, keepFraction * orbit);
     const disposables: { dispose: () => void }[] = [];
     gltf.scene.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
