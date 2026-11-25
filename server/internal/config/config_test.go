@@ -122,3 +122,41 @@ func TestLoadPipelineStandalone(t *testing.T) {
 		t.Fatal("不正な MESH_MODE でエラーにならない")
 	}
 }
+
+func TestRoles(t *testing.T) {
+	cfg, err := Load(env(minimal(nil)))
+	if err != nil || cfg.Role != RoleAll {
+		t.Fatalf("既定の役割 = %q, %v", cfg.Role, err)
+	}
+	if _, err := Load(env(minimal(map[string]string{"ROLE": "api"}))); err == nil || !strings.Contains(err.Error(), "WORKER_URL") {
+		t.Errorf("ROLE=api で WORKER_URL が無いのに通った: %v", err)
+	}
+	if _, err := Load(env(minimal(map[string]string{"ROLE": "api", "WORKER_URL": "scanner-worker:8081"}))); err == nil {
+		t.Error("スキームの無い WORKER_URL を受け付けた")
+	}
+	cfg, err = Load(env(minimal(map[string]string{"ROLE": "api", "WORKER_URL": "http://scanner-worker:8081"})))
+	if err != nil || cfg.Role != RoleAPI || cfg.WorkerURL != "http://scanner-worker:8081" {
+		t.Errorf("ROLE=api = %+v, %v", cfg, err)
+	}
+	if _, err := Load(env(minimal(map[string]string{"ROLE": "frontend"}))); err == nil {
+		t.Error("知らない役割を受け付けた")
+	}
+}
+
+func TestOpenMVSSettings(t *testing.T) {
+	cfg, err := Load(env(minimal(map[string]string{"OPENMVS_DIR": "/usr/local/bin/OpenMVS"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := cfg.Pipeline
+	if p.OpenMVSDir != "/usr/local/bin/OpenMVS" || p.OpenMVSResolutionLevel != 1 || p.OpenMVSMaxFaces != 150000 ||
+		p.OpenMVSTextureSize != 4096 || p.OpenMVSSeamLeveling {
+		t.Errorf("OpenMVS の既定値 = %+v", p)
+	}
+	if _, err := Load(env(minimal(map[string]string{"MESH_MODE": "openmvs"}))); err == nil || !strings.Contains(err.Error(), "OPENMVS_DIR") {
+		t.Errorf("MESH_MODE=openmvs で OPENMVS_DIR が無いのに通った: %v", err)
+	}
+	if _, err := Load(env(minimal(map[string]string{"OPENMVS_RESOLUTION_LEVEL": "9"}))); err == nil {
+		t.Error("範囲外の OPENMVS_RESOLUTION_LEVEL を受け付けた")
+	}
+}

@@ -112,7 +112,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		},
 		RetentionHours: s.cfg.Jobs.Retention.Hours(),
 		KeepCompleted:  s.cfg.Jobs.KeepCompleted,
-		Pipeline:       s.pipeline,
+		Pipeline:       s.pipelineFor(r.Context()),
 	})
 }
 
@@ -526,7 +526,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 				sr.HasLog = true
 			}
 			if st.Name == scan.StepSplat && st.Status == scan.StepRunning {
-				sr.Progress = splatProgress(ws.LogPath(st.Name), s.pipeline.SplatIterations)
+				sr.Progress = splatProgress(ws.LogPath(st.Name), s.pipelineFor(r.Context()).SplatIterations)
 			}
 		}
 		resp.Steps = append(resp.Steps, sr)
@@ -952,6 +952,9 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGatewayTimeout, "localize_timeout",
 			"時間内に位置を確かめられませんでした。3Dデータを作っている間は遅くなります。少し待ってからお試しください。")
 		return
+	case errors.Is(err, ErrWorkerUnavailable):
+		writeWorkerUnavailable(w)
+		return
 	case err != nil:
 		if r.Context().Err() != nil {
 			return // 利用者が待つのをやめた。応答を受け取る相手が居ない。
@@ -1006,6 +1009,9 @@ func (s *Server) handleMakeSplat(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "スキャンが見つかりません。")
 		return
+	case errors.Is(err, ErrWorkerUnavailable):
+		writeWorkerUnavailable(w)
+		return
 	case err != nil:
 		s.log.Error("3DGS を待ち行列に入れられません", "scan", d.Scan.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "3DGS の作成を受け付けられませんでした。")
@@ -1030,10 +1036,29 @@ func (s *Server) handleDeleteScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "スキャンが見つかりません。")
 		return
 	}
+	if errors.Is(err, ErrWorkerUnavailable) {
+		writeWorkerUnavailable(w)
+		return
+	}
 	if err != nil {
 		s.log.Error("スキャンを削除できません", "scan", id, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "削除できませんでした。")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"result": string(result)})
+}
+
+// writeWorkerUnavailable は、ワーカーに届かないとき（再起動中など）の応答。
+func writeWorkerUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "30")
+	writeError(w, http.StatusServiceUnavailable, "worker_unavailable",
+		"処理サーバーに接続できません（再起動中の可能性があります）。少し待ってからもう一度お試しください。")
+}
+
+// pipelineFor は /api/config などで伝える「このサーバーで何が出来るか」を返す。
+func (s *Server) pipelineFor(ctx context.Context) PipelineInfo {
+	if s.pipelineInfo != nil {
+		return s.pipelineInfo(ctx)
+	}
+	return s.pipeline
 }

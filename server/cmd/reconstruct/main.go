@@ -64,7 +64,8 @@ func run(dir string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("COLMAP %s（GPU対応: %v）\n", caps.ColmapVersion, caps.ColmapGPU)
+	caps.OpenMVS = reconstruction.DetectOpenMVS(cfg.OpenMVSDir)
+	fmt.Printf("COLMAP %s（GPU対応: %v）、OpenMVS: %v\n", caps.ColmapVersion, caps.ColmapGPU, caps.OpenMVS)
 
 	rep := &printReporter{start: time.Now(), steps: map[scan.StepName]scan.Step{}}
 	pipeline := reconstruction.New(cfg, runner, caps, log)

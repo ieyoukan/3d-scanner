@@ -84,6 +84,13 @@ func (r *Root) CleanTemp() error {
 // Dir は scans/ の絶対パスを返す。
 func (r *Root) Dir() string { return r.dir }
 
+// TempDir は一時ディレクトリ（NewTemp の置き場所）を返す。API とワーカーは同じ PVC を同じパスに
+// マウントするので、ここからの相対パスで一時ファイルを受け渡せる（位置合わせの写真など）。
+func (r *Root) TempDir() string { return r.tmp }
+
+// ID はスキャン ID（作業ディレクトリの名前）を返す。
+func (s *Scan) ID() string { return filepath.Base(s.dir) }
+
 // Scan は1スキャン分の作業ディレクトリを表す。
 type Scan struct {
 	dir string

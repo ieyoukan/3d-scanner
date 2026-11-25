@@ -1,0 +1,175 @@
+{{- /*
+worker: 復元ジョブ（COLMAP・OpenMVS）、3DGS（OpenSplat）、位置合わせ、掃除。api からの頼みごとを内部用の HTTP（8081）で受ける。
+レプリカは 1 に固定（values で変えられないようにしてある）:
+  - ワーカーは起動時に「running のまま残ったジョブ」を前回の自分の残骸として回復する。2 つあると互いのジョブを巻き戻す。
+入れ替えは Recreate（古い Pod を止めてから新しい Pod を作る）。処理中のジョブは止まり、次の起動でやり直される。
+画面や API の変更では worker のイメージは変わらないので、入れ替えは worker を直したときだけ起きる。
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "3d-scanner.componentName" (list . "worker") }}
+  labels:
+    {{- include "3d-scanner.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "3d-scanner.componentSelector" (list . "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "3d-scanner.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+        3d-scanner/data-volume: {{ include "3d-scanner.dataClaim" . | quote }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "3d-scanner.image" (list . "worker") | quote }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: internal
+              containerPort: 8081
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "3d-scanner.fullname" . }}
+          env:
+            - name: ROLE
+              value: worker
+            - name: LISTEN_ADDR
+              value: ":8081"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "3d-scanner.database.secretName" . }}
+                  key: {{ include "3d-scanner.database.secretKey" . }}
+            {{- with .Values.config.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # /healthz は DB を見ない（DB の一時的な障害でワーカーまで再起動されると、処理中のジョブが無駄に止まるため）。
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: internal
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: internal
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: internal
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            {{- with .Values.resources.requests }}
+            requests:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            limits:
+              {{- with .Values.resources.limits }}
+              {{- toYaml . | nindent 14 }}
+              {{- end }}
+              {{- if .Values.gpu.enabled }}
+              # GPU はデバイスプラグインが公開する「拡張リソース」として要求する（整数単位、limits に書く）。
+              {{ .Values.gpu.resourceName }}: {{ .Values.gpu.count | quote }}
+              {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "3d-scanner.dataClaim" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      affinity:
+        {{- include "3d-scanner.dataAffinity" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# クラスタの中だけで使う Service（api → worker）。Ingress には出さない。
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "3d-scanner.componentName" (list . "worker") }}
+  labels:
+    {{- include "3d-scanner.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  ports:
+    - name: internal
+      port: 8081
+      targetPort: internal
+      protocol: TCP
+  selector:
+    {{- include "3d-scanner.componentSelector" (list . "worker") | nindent 4 }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# worker の内部用 HTTP（中止・削除・位置合わせ）には、api の Pod からだけ届くようにする。
+# kubelet のヘルスチェックはノードから来るので、ノードの網（values の networkPolicy.nodeCIDRs）も許す。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "3d-scanner.componentName" (list . "worker") }}
+  labels:
+    {{- include "3d-scanner.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "3d-scanner.componentSelector" (list . "worker") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "3d-scanner.componentSelector" (list . "api") | nindent 14 }}
+        {{- range .Values.networkPolicy.nodeCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: internal
+          protocol: TCP
+{{- end }}

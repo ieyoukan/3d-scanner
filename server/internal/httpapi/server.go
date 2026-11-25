@@ -24,6 +24,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -56,12 +57,14 @@ type Server struct {
 	cfg   config.Config
 	store store.Store
 	root  *workspace.Root
-	jobs  *jobs.Service
+	jobs  Jobs
 	// localizer は位置合わせ（VPS）を行う。
 	localizer Localizer
 	pipeline  PipelineInfo
-	log       *slog.Logger
-	now       func() time.Time
+	// pipelineInfo が nil でなければ、/api/config の pipeline はこれから得る（ROLE=api のとき、ワーカーに問い合わせる）。
+	pipelineInfo func(context.Context) PipelineInfo
+	log          *slog.Logger
+	now          func() time.Time
 
 	// uploadSlots は同時に受け付けるアップロードの数を制限する（セマフォ）。
 	// 容量2のチャネルに「席札」を入れられた人だけが進める。席が無ければ 429 で断る。
@@ -69,8 +72,22 @@ type Server struct {
 	uploadSlots chan struct{}
 }
 
+// Jobs は API がジョブ（復元・3DGS）に頼む操作。ROLE=all では同じプロセスの *jobs.Service、
+// ROLE=api ではワーカーの内部 API を呼ぶクライアント（workerapi.Client）。
+type Jobs interface {
+	// Notify はワーカーを起こす（待ち行列に入れた直後。届かなくてもワーカーは定期的に待ち行列を見る）。
+	Notify()
+	// EnqueueSplat は 3DGS の作成を待ち行列に入れる。
+	EnqueueSplat(ctx context.Context, id string) error
+	// Remove はスキャンを中止・削除する（処理中なら外部プロセスを止める）。
+	Remove(ctx context.Context, id string) (jobs.Removal, error)
+}
+
+// ErrWorkerUnavailable は、ワーカーに届かない（再起動中など）ことを表す。画面には 503 で伝える。
+var ErrWorkerUnavailable = errors.New("処理サーバーに接続できません")
+
 // New は Server を作る。
-func New(cfg config.Config, st store.Store, root *workspace.Root, js *jobs.Service, loc Localizer, info PipelineInfo, log *slog.Logger) *Server {
+func New(cfg config.Config, st store.Store, root *workspace.Root, js Jobs, loc Localizer, info PipelineInfo, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -80,6 +97,9 @@ func New(cfg config.Config, st store.Store, root *workspace.Root, js *jobs.Servi
 		uploadSlots: make(chan struct{}, 2),
 	}
 }
+
+// SetPipelineInfoSource は、/api/config の pipeline を毎回 f から得るようにする（ROLE=api 用）。
+func (s *Server) SetPipelineInfoSource(f func(context.Context) PipelineInfo) { s.pipelineInfo = f }
 
 // Handler は全ルートを登録した http.Handler を返す。
 //

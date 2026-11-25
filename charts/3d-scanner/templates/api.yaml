@@ -1,0 +1,137 @@
+{{- /*
+api: 受付・状態・成果物の配信。重い処理はワーカーに頼む（WORKER_URL）。
+作業領域の PVC を worker と共有するので、worker と同じノードに載せる（3d-scanner.dataAffinity）。
+入れ替えは止めずに行う（RollingUpdate）。新しい Pod も同じノードに載るので、ReadWriteOnce でもマウントできる。
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "3d-scanner.componentName" (list . "api") }}
+  labels:
+    {{- include "3d-scanner.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "3d-scanner.componentSelector" (list . "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "3d-scanner.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+        3d-scanner/data-volume: {{ include "3d-scanner.dataClaim" . | quote }}
+      annotations:
+        # ConfigMap の中身が変わったら Pod を作り直す（環境変数は起動時にしか読まれないため）。
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ include "3d-scanner.image" (list . "api") | quote }}
+          imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "3d-scanner.fullname" . }}
+          env:
+            - name: ROLE
+              value: api
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: WORKER_URL
+              value: {{ printf "http://%s:8081" (include "3d-scanner.componentName" (list . "worker")) | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "3d-scanner.database.secretName" . }}
+                  key: {{ include "3d-scanner.database.secretKey" . }}
+            {{- with .Values.config.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "3d-scanner.dataClaim" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      affinity:
+        {{- include "3d-scanner.dataAffinity" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "3d-scanner.componentName" (list . "api") }}
+  labels:
+    {{- include "3d-scanner.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "3d-scanner.componentSelector" (list . "api") | nindent 4 }}

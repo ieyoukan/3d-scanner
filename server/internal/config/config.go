@@ -16,8 +16,26 @@ import (
 	"time"
 )
 
+// Role はこのプロセスの役割。1 つのバイナリを、役割ごとに別の Pod として動かす。
+type Role string
+
+const (
+	// RoleAll: API とワーカーを1つのプロセスで動かす（ローカル開発・docker compose を1コンテナで動かすとき）。
+	RoleAll Role = "all"
+	// RoleAPI: 受付・状態・成果物の配信だけ。重い処理（復元・3DGS・位置合わせ）は WORKER_URL のワーカーに頼む。
+	// 外部 CLI（COLMAP 等）を必要としない。
+	RoleAPI Role = "api"
+	// RoleWorker: 復元ジョブ・3DGS・位置合わせ・掃除を行い、API からの依頼を内部用の HTTP（/internal/...）で受ける。
+	RoleWorker Role = "worker"
+)
+
 // Config はサーバー全体の設定。
 type Config struct {
+	// Role はこのプロセスの役割（ROLE。既定は all）。
+	Role Role
+	// WorkerURL は API がワーカーに依頼するときの宛先（WORKER_URL。Role が api のとき必須）。
+	// クラスタの中だけで届く内部用の URL（http://<ワーカーの Service>:8081）。
+	WorkerURL  string
 	ListenAddr string
 	// DatabaseURL は PostgreSQL の接続文字列（postgres://user:pass@host:5432/db）。
 	DatabaseURL string
@@ -100,6 +118,9 @@ const (
 	MeshModeDense MeshMode = "dense"
 	// MeshModeSparse: 疎な点群から delaunay_mesher で簡易メッシュ（CPU で動く。粗い）。
 	MeshModeSparse MeshMode = "sparse"
+	// MeshModeOpenMVS: OpenMVS で 密な点群 → メッシュ → テクスチャ（CPU で動く。数分かかるが、
+	// 細い物や模様の少ない面も出る）。auto では OpenMVS があればこれを使う。
+	MeshModeOpenMVS MeshMode = "openmvs"
 )
 
 // Pipeline は外部CLIと復元パラメータの設定。
@@ -116,6 +137,18 @@ type Pipeline struct {
 	EnableMesh  bool
 	EnableSplat bool
 	MeshMode    MeshMode
+
+	// OpenMVSDir は OpenMVS の実行ファイル（DensifyPointCloud 等）のあるディレクトリ。空なら OpenMVS を使わない。
+	OpenMVSDir string
+	// OpenMVSResolutionLevel は密な復元で画像を何回半分にするか（1 なら縦横半分。0 は等倍で数倍遅い）。
+	OpenMVSResolutionLevel int
+	// OpenMVSMaxFaces はメッシュの面の数の上限（スマホで表示できる大きさにする）。
+	OpenMVSMaxFaces int
+	// OpenMVSTextureSize はテクスチャ画像の 1 辺の上限（画素）。超えると複数枚に分ける。
+	OpenMVSTextureSize int
+	// OpenMVSSeamLeveling が true なら、テクスチャの継ぎ目の明るさをならす（global / local seam leveling）。
+	// 評価（arm64 でのビルド）で、ならした部分が黒や色の縁取りに壊れたので、既定は false。
+	OpenMVSSeamLeveling bool
 
 	// ColmapUseGPU は SIFT の抽出・マッチングに GPU を使うか。
 	// サーバー（ディスプレイ無し）では OpenGL 版が動かないので、CUDA が無ければ false にする。
@@ -150,6 +183,8 @@ func Load(getenv func(string) string) (Config, error) {
 	r := &reader{getenv: getenv}
 
 	cfg := Config{
+		Role:       Role(r.str("ROLE", string(RoleAll))),
+		WorkerURL:  r.str("WORKER_URL", ""),
 		ListenAddr: r.str("LISTEN_ADDR", ":8080"),
 		DataDir:    r.str("DATA_DIR", "/data"),
 		WebDir:     r.str("WEB_DIR", ""),
@@ -190,25 +225,30 @@ func Load(getenv func(string) string) (Config, error) {
 // readPipeline は復元パイプラインの設定を読む。
 func readPipeline(r *reader) Pipeline {
 	return Pipeline{
-		RequireTools:       r.boolean("REQUIRE_TOOLS", true),
-		ColmapBin:          r.str("COLMAP_BIN", "colmap"),
-		OpenSplatBin:       r.str("OPENSPLAT_BIN", "opensplat"),
-		GltfpackBin:        r.str("GLTFPACK_BIN", "gltfpack"),
-		SplatTransformBin:  r.str("SPLAT_TRANSFORM_BIN", "splat-transform"),
-		EnableMesh:         r.boolean("ENABLE_MESH", true),
-		EnableSplat:        r.boolean("ENABLE_SPLAT", true),
-		MeshMode:           MeshMode(r.str("MESH_MODE", string(MeshModeAuto))),
-		ColmapUseGPU:       r.boolean("COLMAP_USE_GPU", false),
-		ColmapMaxImageSize: r.integer("COLMAP_MAX_IMAGE_SIZE", 1600),
-		NumThreads:         r.integer("NUM_THREADS", 0),
-		SplatIterations:    r.integer("SPLAT_ITERATIONS", 1000),
-		SplatDownscale:     r.float("SPLAT_DOWNSCALE", 2),
-		SplatForceCPU:      r.boolean("SPLAT_FORCE_CPU", true),
-		SfMTimeout:         r.duration("SFM_TIMEOUT", 1*time.Hour),
-		MVSTimeout:         r.duration("MVS_TIMEOUT", 2*time.Hour),
-		MeshTimeout:        r.duration("MESH_TIMEOUT", 1*time.Hour),
-		SplatTimeout:       r.duration("SPLAT_TIMEOUT", 6*time.Hour),
-		SOGTimeout:         r.duration("SOG_TIMEOUT", 30*time.Minute),
+		RequireTools:           r.boolean("REQUIRE_TOOLS", true),
+		ColmapBin:              r.str("COLMAP_BIN", "colmap"),
+		OpenSplatBin:           r.str("OPENSPLAT_BIN", "opensplat"),
+		GltfpackBin:            r.str("GLTFPACK_BIN", "gltfpack"),
+		SplatTransformBin:      r.str("SPLAT_TRANSFORM_BIN", "splat-transform"),
+		EnableMesh:             r.boolean("ENABLE_MESH", true),
+		EnableSplat:            r.boolean("ENABLE_SPLAT", true),
+		MeshMode:               MeshMode(r.str("MESH_MODE", string(MeshModeAuto))),
+		OpenMVSDir:             r.str("OPENMVS_DIR", ""),
+		OpenMVSResolutionLevel: r.integer("OPENMVS_RESOLUTION_LEVEL", 1),
+		OpenMVSMaxFaces:        r.integer("OPENMVS_MAX_FACES", 150000),
+		OpenMVSTextureSize:     r.integer("OPENMVS_TEXTURE_SIZE", 4096),
+		OpenMVSSeamLeveling:    r.boolean("OPENMVS_SEAM_LEVELING", false),
+		ColmapUseGPU:           r.boolean("COLMAP_USE_GPU", false),
+		ColmapMaxImageSize:     r.integer("COLMAP_MAX_IMAGE_SIZE", 1600),
+		NumThreads:             r.integer("NUM_THREADS", 0),
+		SplatIterations:        r.integer("SPLAT_ITERATIONS", 1000),
+		SplatDownscale:         r.float("SPLAT_DOWNSCALE", 2),
+		SplatForceCPU:          r.boolean("SPLAT_FORCE_CPU", true),
+		SfMTimeout:             r.duration("SFM_TIMEOUT", 1*time.Hour),
+		MVSTimeout:             r.duration("MVS_TIMEOUT", 2*time.Hour),
+		MeshTimeout:            r.duration("MESH_TIMEOUT", 1*time.Hour),
+		SplatTimeout:           r.duration("SPLAT_TIMEOUT", 6*time.Hour),
+		SOGTimeout:             r.duration("SOG_TIMEOUT", 30*time.Minute),
 	}
 }
 
@@ -289,6 +329,15 @@ func (c Config) validate() []string {
 	if c.Jobs.PollInterval <= 0 || c.Jobs.JanitorInterval <= 0 {
 		add("POLL_INTERVAL / JANITOR_INTERVAL は正の値にしてください")
 	}
+	switch c.Role {
+	case RoleAll, RoleWorker:
+	case RoleAPI:
+		if u, err := url.Parse(c.WorkerURL); c.WorkerURL == "" || err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			add("ROLE=api には WORKER_URL（例: http://scanner-worker:8081）が必要です")
+		}
+	default:
+		add("ROLE は all / api / worker のいずれかにしてください（現在: %q）", c.Role)
+	}
 	return append(errs, c.Pipeline.validate()...)
 }
 
@@ -298,9 +347,21 @@ func (p Pipeline) validate() []string {
 	add := func(format string, args ...any) { errs = append(errs, fmt.Sprintf(format, args...)) }
 
 	switch p.MeshMode {
-	case MeshModeAuto, MeshModeDense, MeshModeSparse:
+	case MeshModeAuto, MeshModeDense, MeshModeSparse, MeshModeOpenMVS:
 	default:
-		add("MESH_MODE は auto / dense / sparse のいずれかにしてください（現在: %q）", p.MeshMode)
+		add("MESH_MODE は auto / openmvs / dense / sparse のいずれかにしてください（現在: %q）", p.MeshMode)
+	}
+	if p.MeshMode == MeshModeOpenMVS && p.OpenMVSDir == "" {
+		add("MESH_MODE=openmvs には OPENMVS_DIR（OpenMVS の実行ファイルのあるディレクトリ）が必要です")
+	}
+	if p.OpenMVSResolutionLevel < 0 || p.OpenMVSResolutionLevel > 4 {
+		add("OPENMVS_RESOLUTION_LEVEL は 0〜4 にしてください")
+	}
+	if p.OpenMVSMaxFaces < 1000 {
+		add("OPENMVS_MAX_FACES が小さすぎます")
+	}
+	if p.OpenMVSTextureSize < 512 {
+		add("OPENMVS_TEXTURE_SIZE が小さすぎます")
 	}
 	if p.SplatIterations < 1 {
 		add("SPLAT_ITERATIONS は1以上にしてください")

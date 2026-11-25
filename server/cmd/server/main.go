@@ -1,15 +1,14 @@
-// scanner-server は 3D Scanner のサーバー本体。
+// scanner-server は 3D Scanner のサーバー本体。1 つのバイナリを、役割（ROLE）ごとに別の Pod として動かす:
 //
-// 1つのプロセスの中で3つの役割が動く:
+//	api     写真の受付、状態の問い合わせ、成果物の配信（外部 CLI は要らない。distroless の小さなイメージ）
+//	worker  待ち行列から1件ずつ取り出して COLMAP / OpenMVS / OpenSplat 等を実行、3DGS、位置合わせ、掃除。
+//	        API からの頼みごと（中止・3DGS・位置合わせ）は内部用の HTTP（workerapi）で受ける
+//	all     api と worker を1つのプロセスで動かす（ローカル開発用。Web の配信も WEB_DIR があれば行う）
 //
-//	HTTP API   写真の受付、状態の問い合わせ、成果物の配信、Web（SPA）の配信
-//	ワーカー   待ち行列から1件ずつ取り出して COLMAP / OpenSplat 等を実行
-//	掃除係     保存期限を過ぎたスキャンの削除
-//
-// なぜ API とワーカーを同じプロセスにするのか:
-// どちらも同じ作業ディレクトリ（PVC）を読み書きする。配備先の PVC は ReadWriteOnce、
-// つまり「同時に1つのノードからしかマウントできない」ので、API とワーカーを別々の Pod に
-// すると同じノードに載る保証が要る。MVP では1 Pod・1プロセスにまとめて、この問題自体を避ける。
+// 分けた理由: 1 つの Pod にまとめていたころは、画面や API を少し直してデプロイするだけで処理中の 3D 生成が
+// 止められていた。分ければ api は止めずに入れ替えられ、重い worker は滅多に入れ替えずに済む。
+// api と worker は同じ PVC（写真と成果物）を読み書きする。PVC は ReadWriteOnce（同時に1つのノードからしか
+// マウントできない）なので、Helm チャートで同じノードに載せる（podAffinity）。
 package main
 
 import (
@@ -31,6 +30,7 @@ import (
 	"github.com/ieyoukan/3d-scanner/server/internal/reconstruction"
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
 	"github.com/ieyoukan/3d-scanner/server/internal/vps"
+	"github.com/ieyoukan/3d-scanner/server/internal/workerapi"
 	"github.com/ieyoukan/3d-scanner/server/internal/workspace"
 )
 
@@ -78,7 +78,25 @@ func run(log *slog.Logger) error {
 		log.Info("マイグレーションを適用しました", "files", applied)
 	}
 
-	// 外部CLIの能力を調べる（COLMAP が GPU 対応かどうかで、メッシュの作り方が変わる）。
+	log.Info("役割", "role", cfg.Role)
+	if cfg.Role == config.RoleAPI {
+		return runAPI(ctx, cfg, root, pg, log)
+	}
+	return runWorker(ctx, stop, cfg, root, pg, log)
+}
+
+// runAPI は ROLE=api の本体。重い処理はワーカーに頼む（workerapi.Client）。
+func runAPI(ctx context.Context, cfg config.Config, root *workspace.Root, pg *store.Postgres, log *slog.Logger) error {
+	fallback := pipelineInfo(cfg, reconstruction.Capabilities{}, nil)
+	worker := workerapi.NewClient(cfg.WorkerURL, root, fallback, log)
+	api := httpapi.New(cfg, pg, root, worker, worker, fallback, log)
+	api.SetPipelineInfoSource(worker.PipelineInfo)
+	return serve(ctx, httpapi.NewHTTPServer(cfg.ListenAddr, api.Handler()), nil, log)
+}
+
+// runWorker は ROLE=worker と ROLE=all の本体。
+func runWorker(ctx context.Context, stop context.CancelFunc, cfg config.Config, root *workspace.Root, pg *store.Postgres, log *slog.Logger) error {
+	// 外部CLIの能力を調べる（COLMAP が GPU 対応か・OpenMVS があるかで、メッシュの作り方が変わる）。
 	runner := cmdrun.NewExec()
 	caps, err := reconstruction.DetectCapabilities(ctx, runner, cfg.Pipeline.ColmapBin)
 	if err != nil {
@@ -87,9 +105,13 @@ func run(log *slog.Logger) error {
 		}
 		log.Warn("COLMAP を確認できません。復元ジョブは SfM で失敗します", "error", err.Error())
 	}
+	caps.OpenMVS = reconstruction.DetectOpenMVS(cfg.Pipeline.OpenMVSDir)
+	if cfg.Pipeline.MeshMode == config.MeshModeOpenMVS && !caps.OpenMVS {
+		return fmt.Errorf("MESH_MODE=openmvs ですが、OPENMVS_DIR（%q）に OpenMVS の実行ファイルがそろっていません", cfg.Pipeline.OpenMVSDir)
+	}
 	pipeline := reconstruction.New(cfg.Pipeline, runner, caps, log)
 	info := pipelineInfo(cfg, caps, pipeline)
-	log.Info("復元パイプラインの構成", "colmap", caps.ColmapVersion, "colmapGPU", caps.ColmapGPU,
+	log.Info("復元パイプラインの構成", "colmap", caps.ColmapVersion, "colmapGPU", caps.ColmapGPU, "openmvs", caps.OpenMVS,
 		"meshMode", info.MeshMode, "splatDevice", info.SplatDevice, "splatIterations", info.SplatIterations)
 
 	svc := jobs.New(pg, root, pipeline, cfg.Jobs, log)
@@ -110,38 +132,49 @@ func run(log *slog.Logger) error {
 	}
 	localizer := vps.New(cfg.Pipeline, runner, root, log)
 
-	api := httpapi.New(cfg, pg, root, svc, localizer, info, log)
-	srv := httpapi.NewHTTPServer(cfg.ListenAddr, api.Handler())
+	var handler http.Handler
+	if cfg.Role == config.RoleWorker {
+		// API の Pod からの頼みごとだけを受ける（クラスタの外には出さない）。
+		handler = workerapi.NewServer(svc, localizer, root, info, pg.Ping, log).Handler()
+	} else {
+		handler = httpapi.New(cfg, pg, root, svc, localizer, info, log).Handler()
+	}
+	err = serve(ctx, httpapi.NewHTTPServer(cfg.ListenAddr, handler), func() {
+		stop()
+		wg.Wait()
+	}, log)
+	// 後片付け: ctx の取り消しで外部プロセスに SIGTERM が送られている。終わるのを待つ。
+	// 実行中だったジョブは DB に running のまま残り、次の起動時にやり直される。
+	wg.Wait()
+	return err
+}
+
+// serve は HTTP サーバーを動かし、停止の合図（ctx）で後片付けをする。
+// サーバーが異常終了したときは onFail を呼んでから（ワーカーを止めるため）エラーを返す。
+func serve(ctx context.Context, srv *http.Server, onFail func(), log *slog.Logger) error {
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Info("HTTP サーバーを開始", "addr", cfg.ListenAddr, "web", cfg.WebDir != "")
+		log.Info("HTTP サーバーを開始", "addr", srv.Addr)
 		// ListenAndServe は Shutdown で止めると ErrServerClosed を返す。これは正常な終了。
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
 	}()
-
-	// 停止の合図か、サーバーの異常終了を待つ。
 	select {
 	case <-ctx.Done():
 		log.Info("停止の合図を受け取りました。後片付けを始めます")
 	case err := <-serveErr:
-		stop()
-		wg.Wait()
+		if onFail != nil {
+			onFail()
+		}
 		return fmt.Errorf("HTTP サーバーが停止しました: %w", err)
 	}
-
-	// 後片付け（graceful shutdown）の順番:
-	//  1. HTTP: 新しい接続を断り、処理中のリクエストが終わるのを待つ。
-	//  2. ワーカー: ctx の取り消しで外部プロセスに SIGTERM が送られている。終わるのを待つ。
-	//     実行中だったジョブは DB に running のまま残り、次の起動時にやり直される。
-	//  3. DB: 最後に閉じる（defer）。ワーカーより先に閉じると、後始末の書き込みが失敗する。
+	// 新しい接続を断り、処理中のリクエストが終わるのを待つ。DB は呼び出し側の defer で最後に閉じる。
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("HTTP サーバーを時間内に止められませんでした", "error", err.Error())
 	}
-	wg.Wait()
 	log.Info("停止しました")
 	return nil
 }
@@ -171,7 +204,7 @@ func connectDatabase(ctx context.Context, url string, log *slog.Logger) (*store.
 	}
 }
 
-// pipelineInfo は画面に伝える構成情報をまとめる。
+// pipelineInfo は画面に伝える構成情報をまとめる（p が nil なら設定から分かる範囲で）。
 func pipelineInfo(cfg config.Config, caps reconstruction.Capabilities, p *reconstruction.Pipeline) httpapi.PipelineInfo {
 	info := httpapi.PipelineInfo{
 		MeshEnabled:     cfg.Pipeline.EnableMesh,
@@ -184,8 +217,12 @@ func pipelineInfo(cfg config.Config, caps reconstruction.Capabilities, p *recons
 		SplatDeferred:   cfg.Pipeline.EnableSplat && cfg.Jobs.DeferSplat,
 		SplatManual:     cfg.Pipeline.EnableSplat && !cfg.Jobs.SplatAuto,
 	}
-	if p.DenseMesh() {
-		info.MeshMode = "dense"
+	switch {
+	case p != nil:
+		info.MeshMode = string(p.MeshKind())
+	case cfg.Pipeline.MeshMode != config.MeshModeAuto:
+		// ワーカーに届かないとき（ROLE=api の控え）は、設定から分かる範囲で答える。
+		info.MeshMode = string(cfg.Pipeline.MeshMode)
 	}
 	if cfg.Pipeline.SplatForceCPU {
 		info.SplatDevice = "cpu"

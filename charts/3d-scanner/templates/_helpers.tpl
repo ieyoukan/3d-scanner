@@ -22,13 +22,54 @@ app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
 {{- end -}}
 
 {{/*
-Service が転送先の Pod を選ぶためのラベル。
+Service が転送先の Pod を選ぶためのラベル（役割ごと）。使い方: include "3d-scanner.componentSelector" (list . "api")
 ここを後から変えると Deployment の selector（変更不可の項目）と食い違うので、最小限にしておく。
 */}}
-{{- define "3d-scanner.selectorLabels" -}}
+{{- define "3d-scanner.componentSelector" -}}
+{{- $root := index . 0 -}}
 app.kubernetes.io/name: 3d-scanner
-app.kubernetes.io/instance: {{ .Release.Name | quote }}
-app.kubernetes.io/component: app
+app.kubernetes.io/instance: {{ $root.Release.Name | quote }}
+app.kubernetes.io/component: {{ index . 1 }}
+{{- end -}}
+
+{{/* 役割ごとのリソース名（scanner-web / scanner-api / scanner-worker）。 */}}
+{{- define "3d-scanner.componentName" -}}
+{{- printf "%s-%s" (include "3d-scanner.fullname" (index . 0)) (index . 1) -}}
+{{- end -}}
+
+{{/*
+役割ごとのイメージ。タグが無ければ描画を止める（存在しないタグで Pod を作らず、今動いているものをそのまま残すため）。
+使い方: include "3d-scanner.image" (list . "worker")
+*/}}
+{{- define "3d-scanner.image" -}}
+{{- $root := index . 0 -}}
+{{- $name := index . 1 -}}
+{{- $img := index $root.Values $name "image" -}}
+{{- printf "%s:%s" $img.repository (required (printf "%s.image.tag が未設定です（CI が公開する :sha-<コミット> を指定してください）" $name) $img.tag) -}}
+{{- end -}}
+
+{{/* 作業領域（PVC）の名前。 */}}
+{{- define "3d-scanner.dataClaim" -}}
+{{- .Values.persistence.existingClaim | default (printf "%s-data" (include "3d-scanner.fullname" .)) -}}
+{{- end -}}
+
+{{/*
+api と worker を同じノードに載せる。作業領域の PVC は ReadWriteOnce（同時に1ノードからしかマウントできない）ので、
+同じ PVC を使う Pod は同じノードに居る必要がある。両方にこのラベルを付け、互いに引き寄せる（podAffinity）。
+最初の 1 つ目は相手が居なくても載せられる（自分自身がラベルに一致するため。Kubernetes の決まり）。
+values の affinity.nodeAffinity（例: control-plane を避ける）もここで合わせて付ける。
+*/}}
+{{- define "3d-scanner.dataAffinity" -}}
+{{- with .Values.affinity.nodeAffinity }}
+nodeAffinity:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+podAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchLabels:
+          3d-scanner/data-volume: {{ include "3d-scanner.dataClaim" . | quote }}
+      topologyKey: kubernetes.io/hostname
 {{- end -}}
 
 {{- define "3d-scanner.postgresql.fullname" -}}
