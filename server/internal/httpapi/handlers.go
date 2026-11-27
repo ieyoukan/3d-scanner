@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -902,6 +904,9 @@ type cameraResponse struct {
 // handleLocalize は写真1枚を受け取り、スキャンの地図のどこから撮ったものかを返す
 // （POST /api/scans/{id}/localize。multipart/form-data の項目 "image" に写真1枚）。
 //
+// 手がかり ?near=x,y,z&facing=x,y,z（地図の座標系の、前回分かったカメラの位置と、いまのレンズの向き）を
+// 付けると、その近くの地図の写真とだけ突き合わせる（数倍速いが、手がかりが外れていると見つからない）。
+//
 // 処理には10〜数十秒かかる（COLMAP で特徴抽出・マッチング・登録を行う）。202 で受けて後から
 // 問い合わせる形にしないのは、結果を残す必要がなく、1枚ぶんなら前段の時間制限（約100秒）に収まるため。
 // 制限時間（vps.Localizer.Timeout）を超えたら 504 で打ち切る。
@@ -916,6 +921,11 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 	}
 	if mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType != "multipart/form-data" {
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "multipart/form-data で送信してください。")
+		return
+	}
+	near, ok := parseNear(r.URL.Query())
+	if !ok {
+		writeError(w, http.StatusBadRequest, "bad_hint", "位置合わせの手がかり（near・facing）の形式が正しくありません。")
 		return
 	}
 	tmp, err := s.root.NewTemp("query-")
@@ -953,7 +963,7 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	out, err := s.localizer.Localize(r.Context(), ws, vps.Query{
-		Path: filepath.Join(tmp, frame.FileName), Width: frame.Width, Height: frame.Height,
+		Path: filepath.Join(tmp, frame.FileName), Width: frame.Width, Height: frame.Height, Near: near,
 	})
 	elapsed := time.Since(start)
 	switch {
@@ -991,8 +1001,40 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 		resp.Message = "保存した3Dデータと一致する景色が見つかりませんでした。前回撮った部分が写るように向けて、もう一度お試しください。"
 	}
 	s.log.Info("位置合わせ", "scan", d.Scan.ID, "localized", out.Localized, "matches", out.Matches,
-		"compared", out.ComparedImages, "duration", elapsed.Round(time.Millisecond))
+		"compared", out.ComparedImages, "near", near != nil, "duration", elapsed.Round(time.Millisecond))
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// parseNear は位置合わせの手がかり（?near=x,y,z&facing=x,y,z）を読む。どちらも無ければ nil。
+// 片方だけ・数でない・向きの長さが 0 なら ok=false。
+func parseNear(q url.Values) (near *vps.Near, ok bool) {
+	ns, fs := q.Get("near"), q.Get("facing")
+	if ns == "" && fs == "" {
+		return nil, true
+	}
+	p, okP := parseVec3(ns)
+	f, okF := parseVec3(fs)
+	if !okP || !okF || f == [3]float64{} {
+		return nil, false
+	}
+	return &vps.Near{Position: p, Forward: f}, true
+}
+
+// parseVec3 は "x,y,z" を読む（有限の数 3 つ）。
+func parseVec3(s string) ([3]float64, bool) {
+	var v [3]float64
+	parts := strings.Split(s, ",")
+	if len(parts) != 3 {
+		return v, false
+	}
+	for i, part := range parts {
+		x, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil || math.IsNaN(x) || math.IsInf(x, 0) {
+			return v, false
+		}
+		v[i] = x
+	}
+	return v, true
 }
 
 // ---------------------------------------------------------------------------

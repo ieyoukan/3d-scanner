@@ -44,6 +44,13 @@ type localizeRequest struct {
 	Path   string `json:"path"`
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
+	// Near は手がかり（無ければ地図全体と突き合わせる）。
+	Near *nearHint `json:"near,omitempty"`
+}
+
+type nearHint struct {
+	Position [3]float64 `json:"position"`
+	Forward  [3]float64 `json:"forward"`
 }
 
 type localizeResult struct {
@@ -159,9 +166,11 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 		writeCode(w, http.StatusBadRequest, "bad_path")
 		return
 	}
-	out, err := s.localizer.Localize(r.Context(), ws, vps.Query{
-		Path: filepath.Join(s.root.TempDir(), rel), Width: req.Width, Height: req.Height,
-	})
+	q := vps.Query{Path: filepath.Join(s.root.TempDir(), rel), Width: req.Width, Height: req.Height}
+	if n := req.Near; n != nil {
+		q.Near = &vps.Near{Position: n.Position, Forward: n.Forward}
+	}
+	out, err := s.localizer.Localize(r.Context(), ws, q)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -270,9 +279,12 @@ func (c *Client) Localize(ctx context.Context, m *workspace.Scan, q vps.Query) (
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return vps.Result{}, fmt.Errorf("位置合わせの写真が一時ディレクトリの外にあります: %s", q.Path)
 	}
+	req := localizeRequest{Path: rel, Width: q.Width, Height: q.Height}
+	if n := q.Near; n != nil {
+		req.Near = &nearHint{Position: n.Position, Forward: n.Forward}
+	}
 	var out localizeResult
-	if err := c.do(ctx, http.MethodPost, "/internal/scans/"+m.ID()+"/localize",
-		localizeRequest{Path: rel, Width: q.Width, Height: q.Height}, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/internal/scans/"+m.ID()+"/localize", req, &out); err != nil {
 		return vps.Result{}, err
 	}
 	return vps.Result{

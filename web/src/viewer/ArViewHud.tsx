@@ -2,7 +2,8 @@
 //
 //   上      閉じる。重ねた後は右に「透かす」
 //   真ん中  照合中: 経過秒数と目安の輪（メーター）。見つからなかったとき: 理由とやり直し方
-//   下      大きな「重ねる」ボタン（重ねた後は「重ね直す」）。重ねた後は一致した特徴点の数
+//   下      大きな「重ねる」ボタン（重ねた後は「重ね直す」）。重ねた後は、合わせた状態（一致した特徴点の数・
+//           何秒前に合わせたか・裏で合わせ直している最中か。続けて合わせ直せていなければその旨）
 import { useEffect, useRef } from 'react';
 import type { ArViewState } from './arView';
 
@@ -59,9 +60,7 @@ export function ArViewHud({ state, onClose, onAlign, onSeeThrough }: Props) {
       </div>
 
       <div className="pad-safe-b absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 pb-8">
-        {phase === 'overlay' && state?.matches != null && (
-          <span className="tabular rounded-full bg-black/60 px-3 py-1 text-xs">特徴点 {state.matches} 個で一致</span>
-        )}
+        {phase === 'overlay' && state && <FixStatus state={state} />}
         {phase !== 'loading' && !state?.error && (
           <button
             type="button"
@@ -114,8 +113,31 @@ function CheckMeter({ seconds, expected }: { seconds: number; expected: number }
           <span className="mt-1 text-xs opacity-80">/ {expected} 秒</span>
         </span>
       </div>
-      <p className="rounded-full bg-black/50 px-3 py-1 text-sm font-semibold">照合中・そのまま待つ</p>
+      <p className="rounded-full bg-black/50 px-3 py-1 text-sm font-semibold">照合中・その場で待つ（向きは変えてよい）</p>
     </div>
+  );
+}
+
+/** 重ねた後の状態。裏で合わせ直している間は小さな回転の印を付ける。 */
+function FixStatus({ state }: { state: ArViewState }) {
+  // 2 回続けて合わせ直せなければ、ずれが溜まっていく。撮ったものに向ければ直ることを伝える。
+  const stuck = state.realignMisses >= 2;
+  const since = state.sinceFixSeconds;
+  return (
+    <span
+      role="status"
+      className={`tabular flex items-center gap-1.5 rounded-full bg-black/60 px-3 py-1 text-xs ${stuck ? 'text-amber' : ''}`}
+    >
+      {state.realigning && (
+        <span
+          aria-label="合わせ直し中"
+          className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-current border-t-transparent"
+        />
+      )}
+      {stuck
+        ? '合わせ直せていません。撮ったものに向けてください'
+        : `特徴点 ${state.matches ?? 0} 個で一致${since != null ? `・${Math.floor(since)} 秒前` : ''}`}
+    </span>
   );
 }
 

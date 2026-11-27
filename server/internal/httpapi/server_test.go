@@ -845,6 +845,22 @@ func TestLocalize(t *testing.T) {
 	if _, err := os.Stat(loc.got.Path); !os.IsNotExist(err) {
 		t.Fatalf("写真が残っている: %v", err)
 	}
+	if loc.got.Near != nil {
+		t.Fatalf("手がかりを付けていないのに渡した: %+v", loc.got.Near)
+	}
+
+	// 手がかり（前回の位置といまの向き）を付けると、そのまま位置合わせに渡る。
+	body, ct = localizeBody(t, 1)
+	if rec := e.do("POST", "/api/scans/"+id+"/localize?near=1.5,-2,0.25&facing=0,0,1", body, ct); rec.Code != 200 {
+		t.Fatalf("手がかり付きの localize = %d %s", rec.Code, rec.Body.String())
+	}
+	if n := loc.got.Near; n == nil || n.Position != [3]float64{1.5, -2, 0.25} || n.Forward != [3]float64{0, 0, 1} {
+		t.Fatalf("渡った手がかり = %+v", n)
+	}
+	for _, bad := range []string{"near=1,2,3", "near=1,2&facing=0,0,1", "near=1,2,x&facing=0,0,1", "near=1,2,3&facing=0,0,0", "near=NaN,0,0&facing=0,0,1"} {
+		body, ct = localizeBody(t, 1)
+		wantError(t, e.do("POST", "/api/scans/"+id+"/localize?"+bad, body, ct), http.StatusBadRequest, "bad_hint")
+	}
 
 	loc.result = vps.Result{Localized: false, ComparedImages: 3, MapImages: 3}
 	body, ct = localizeBody(t, 1)

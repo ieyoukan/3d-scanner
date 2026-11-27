@@ -216,3 +216,82 @@ func TestSamplePairsSpreadsOverTheMap(t *testing.T) {
 		t.Fatal("上限より少なければ全部使う")
 	}
 }
+
+func TestNearestPairsPrefersSameDirectionNearby(t *testing.T) {
+	// x 軸に沿って 0〜9 に並んだカメラ。偶数は +Z、奇数は -Z を向く。ID は x+1。
+	var images []reconstruction.ImagePose
+	for x := 9; x >= 0; x-- {
+		fwd := [3]float64{0, 0, 1}
+		if x%2 == 1 {
+			fwd = [3]float64{0, 0, -1}
+		}
+		images = append(images, reconstruction.ImagePose{ID: x + 1, Center: [3]float64{float64(x), 0, 0}, Forward: fwd})
+	}
+	ids := func(got []reconstruction.ImagePose) string {
+		var out []int
+		for _, g := range got {
+			out = append(out, g.ID)
+		}
+		return fmt.Sprint(out)
+	}
+	// x=4.2 から +Z を向いている: すぐ隣でも逆を向いた写真（x=3, 5）より、同じ向きの x=2, 4, 6 を選ぶ。
+	if got := ids(nearestPairs(images, Near{Position: [3]float64{4.2, 0, 0}, Forward: [3]float64{0, 0, 3}}, 3)); got != "[3 5 7]" {
+		t.Fatalf("選んだ ID = %s", got)
+	}
+	// 向きが分からなければ、近い順。
+	if got := ids(nearestPairs(images, Near{Position: [3]float64{4.2, 0, 0}}, 3)); got != "[4 5 6]" {
+		t.Fatalf("向き無しで選んだ ID = %s", got)
+	}
+	if len(nearestPairs(images[:2], Near{}, 3)) != 2 {
+		t.Fatal("上限より少なければ全部使う")
+	}
+}
+
+func TestLocalizeNearComparesOnlyNearbyImages(t *testing.T) {
+	root, ws, q := newMap(t)
+	run := &fakeColmap{registered: true}
+	l := newLocalizer(run, root)
+	l.NearPairs = 1
+	// 地図の 3 枚は (0,0,0)・(1,0,0)・(2,0,0) にあり、どれも +Z を向く。
+	q.Near = &Near{Position: [3]float64{1.9, 0, 0}, Forward: [3]float64{0, 0, 1}}
+	res, err := l.Localize(context.Background(), ws, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.pairs != "vps_query.jpg frame_0003.jpg\n" || res.ComparedImages != 1 || res.MapImages != 3 || !res.Localized {
+		t.Fatalf("組の一覧 = %q / 結果 = %+v", run.pairs, res)
+	}
+}
+
+func TestLocalizeReusesTheMapUntilItChanges(t *testing.T) {
+	root, ws, q := newMap(t)
+	run := &fakeColmap{registered: true}
+	l := newLocalizer(run, root)
+	mapReads := func() int {
+		n := 0
+		for _, c := range run.calls {
+			if c[0] == "model_converter" && strings.Contains(strings.Join(c, " "), ws.ModelDir()) {
+				n++
+			}
+		}
+		return n
+	}
+	again := func() {
+		t.Helper()
+		os.WriteFile(q.Path, []byte("jpeg"), 0o640) // 写真は位置合わせのたびに移されるので置き直す
+		if res, err := l.Localize(context.Background(), ws, q); err != nil || !res.Localized || res.MapImages != 3 {
+			t.Fatalf("Localize = %+v, %v", res, err)
+		}
+	}
+	again()
+	again()
+	if n := mapReads(); n != 1 {
+		t.Fatalf("同じ地図を %d 回変換した", n)
+	}
+	// 地図が変わった（続きを撮って作り直した等）ら読み直す。
+	os.WriteFile(filepath.Join(ws.ModelDir(), "images.bin"), []byte("new map"), 0o640)
+	again()
+	if n := mapReads(); n != 2 {
+		t.Fatalf("地図が変わったのに読み直さなかった（変換 %d 回）", n)
+	}
+}

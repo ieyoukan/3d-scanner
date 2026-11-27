@@ -10,6 +10,7 @@ import type {
   ApiErrorDetail,
   CreateScanResult,
   GalleryPage,
+  LocalizeHint,
   LocalizeResult,
   Scan,
   SceneInfo,
@@ -112,12 +113,19 @@ export async function renameScan(id: string, title: string): Promise<string> {
 /**
  * 写真1枚を、スキャンの地図に位置合わせする（VPS）。地図のどこから、どちらを向いて撮ったかが返る。
  * サーバーで COLMAP を動かすので、10〜数十秒かかる。
+ * 手がかり near（前回分かった位置といまの向き）を付けると、その近くの地図の写真とだけ照合する（数倍速い）。
  */
-export async function localizeFrame(scanId: string, image: Blob, signal?: AbortSignal): Promise<LocalizeResult> {
+export async function localizeFrame(
+  scanId: string,
+  image: Blob,
+  signal?: AbortSignal,
+  near?: LocalizeHint,
+): Promise<LocalizeResult> {
   const form = new FormData();
   form.append('image', image, image.type === 'image/png' ? 'query.png' : 'query.jpg');
+  const query = near ? `?${new URLSearchParams({ near: near.position.join(','), facing: near.forward.join(',') })}` : '';
   const res = await ensureOk(
-    await fetch(`/api/scans/${encodeURIComponent(scanId)}/localize`, { method: 'POST', body: form, signal }),
+    await fetch(`/api/scans/${encodeURIComponent(scanId)}/localize${query}`, { method: 'POST', body: form, signal }),
   );
   return (await res.json()) as LocalizeResult;
 }

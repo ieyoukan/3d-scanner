@@ -1,6 +1,16 @@
 import * as THREE from 'three';
 import { describe, expect, it } from 'vitest';
-import { snapshotAlignment, solveAlignment, type ArFix, type Vec3 } from './arAlign';
+import {
+  blendPose,
+  mapForward,
+  poseMatrix,
+  poseTurnDegrees,
+  snapshotAlignment,
+  snapshotPose,
+  solveAlignment,
+  type ArFix,
+  type Vec3,
+} from './arAlign';
 
 // 地図の座標: 真上が -z、1 が 0.25 m。AR の座標は、地図を「真上を +y に直し、鉛直軸で 40° 回し、
 // 0.25 倍して (1, 0.5, -2) ずらした」もの。
@@ -87,5 +97,47 @@ describe('snapshotAlignment', () => {
       const b = new THREE.Vector3(...p).applyMatrix4(m2).sub(arPos).normalize();
       expect(a.angleTo(b)).toBeLessThan(1e-6);
     }
+  });
+});
+
+describe('snapshotPose と合わせ直し', () => {
+  // 地図でのカメラ（位置 c、向き camRot）と、同じ瞬間の AR のカメラの向き。
+  const c: Vec3 = [4, 1, -2];
+  const camRot = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.3, -1.1, 0.2));
+  const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(camRot);
+  const down = new THREE.Vector3(0, 1, 0).applyQuaternion(camRot);
+  const map = { position: c, forward: [fwd.x, fwd.y, fwd.z] as Vec3, down: [down.x, down.y, down.z] as Vec3 };
+  const arQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.1, 0.7, -0.05));
+  const ar = [arQ.x, arQ.y, arQ.z, arQ.w] as const;
+
+  it('地図でのカメラの位置が、AR のカメラの位置（省略すると原点）に来る', () => {
+    const pose = snapshotPose(map, ar);
+    expect(new THREE.Vector3(...c).applyMatrix4(poseMatrix(pose, 0.3)).length()).toBeLessThan(1e-9);
+    const at = new THREE.Vector3(...c).applyMatrix4(poseMatrix(pose, 0.3, [1, 2, 3]));
+    expect(at.distanceTo(new THREE.Vector3(1, 2, 3))).toBeLessThan(1e-9);
+  });
+
+  it('その瞬間の AR の向きを地図に直すと、位置合わせで分かったレンズの向きになる（手がかり）', () => {
+    const pose = snapshotPose(map, ar);
+    const f = new THREE.Vector3(...mapForward(pose, ar));
+    expect(f.angleTo(fwd)).toBeLessThan(1e-6);
+    // 首を右に 30° 振ると、地図でのレンズの向きも 30° 変わる。
+    const turned = arQ.clone().multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 6));
+    const g = new THREE.Vector3(...mapForward(pose, [turned.x, turned.y, turned.z, turned.w]));
+    expect(THREE.MathUtils.radToDeg(g.angleTo(fwd))).toBeCloseTo(30, 6);
+  });
+
+  it('合わせ直すときは、回転とカメラの位置を少しずつ変える', () => {
+    const a = snapshotPose(map, ar);
+    // ジャイロが 6° ずれた後の位置合わせ（地図でのカメラも少し動いた）。
+    const drift = arQ.clone().multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), THREE.MathUtils.degToRad(6)));
+    const b = snapshotPose({ ...map, position: [4.2, 1, -2] }, [drift.x, drift.y, drift.z, drift.w]);
+    expect(poseTurnDegrees(a, b)).toBeCloseTo(6, 6);
+    const half = blendPose(a, b, 0.5);
+    expect(poseTurnDegrees(a, half)).toBeCloseTo(3, 6);
+    expect(half.camera.x).toBeCloseTo(4.1, 9);
+    expect(poseTurnDegrees(blendPose(a, b, 1), b)).toBeLessThan(1e-6);
+    // 元の重ね方は変えない。
+    expect(a.camera.x).toBe(4);
   });
 });

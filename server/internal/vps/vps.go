@@ -12,7 +12,7 @@
 // 手順（すべて COLMAP の CLI。地図そのものは書き換えず、一時ディレクトリで作業する）:
 //
 //	(1) 特徴抽出    写真の SIFT 特徴点を、地図の DB の複製に足す
-//	(2) マッチング  地図の写真（最大 MaxPairs 枚）と特徴点を突き合わせる
+//	(2) マッチング  地図の写真（最大 MaxPairs 枚。手がかりがあれば近い NearPairs 枚）と特徴点を突き合わせる
 //	                → 「写真の2D点 ↔ 地図の写真の2D点 ↔ その点の3D座標」という対応ができる
 //	(3) 登録        2D-3D の対応から、カメラの位置と向きを解く（PnP を RANSAC で頑健に解く）。
 //	                image_registrator が、SfM で写真を1枚ずつ足すときと同じ手順で1枚だけ追加する
@@ -20,6 +20,12 @@
 //
 // 対応が足りない（別の場所の写真、照明や配置が大きく違う、ぶれている）と (3) で登録されない。
 // そのときは「位置が分からなかった」と答える（エラーではない）。
+//
+// かかる時間のほとんどは (2)。本番（CPU 4 スレッド、地図 66 枚）で測ると、組の数によらない約 5 秒に、
+// 1 組あたり約 0.5 秒が足される（4 組 7 秒、13 組 14 秒、60 組 36 秒）。写真の特徴点を減らしても、
+// 総当たりの照合（SiftMatching.cpu_brute_force_matcher）にしても速くならなかった。速くするには組を減らす。
+// 「AR で見る」で重ねた後の合わせ直しでは、前回分かった位置と今の向きが手がかりになるので、
+// その近くの写真だけと突き合わせる（Query.Near）。
 package vps
 
 import (
@@ -27,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -56,6 +63,15 @@ type Query struct {
 	Path string
 	// Width と Height は写真の寸法。地図のカメラと同じなら、そのカメラの焦点距離などを使い回す。
 	Width, Height int
+	// Near があれば、その近くから同じような向きで撮った地図の写真（NearPairs 枚）とだけ突き合わせる。
+	// 無ければ地図全体から MaxPairs 枚。
+	Near *Near
+}
+
+// Near は位置合わせの手がかり。地図の座標系で、前回分かったカメラの位置と、いまのレンズの向き。
+type Near struct {
+	Position [3]float64
+	Forward  [3]float64
 }
 
 // Result は位置合わせの結果。
@@ -91,6 +107,21 @@ type Localizer struct {
 	Timeout time.Duration
 	// MaxPairs は突き合わせる地図の写真の上限。多いほど見つかりやすいが遅くなる。
 	MaxPairs int
+	// NearPairs は手がかり（Query.Near）があるときに突き合わせる枚数。
+	NearPairs int
+
+	// cached は前回読んだ地図の中身（写真の一覧とカメラ）。同じ地図なら変換（約 1 秒）を省く。
+	// slot を持っている間にだけ触るので、ロックは要らない。
+	cached *mapContents
+}
+
+// mapContents は地図（sparse/0）から読んだ写真の一覧とカメラ。dir の images.bin が変わったら読み直す。
+type mapContents struct {
+	dir     string
+	mod     time.Time
+	size    int64
+	images  []reconstruction.ImagePose
+	cameras []reconstruction.Camera
 }
 
 // New は Localizer を作る。cfg からは COLMAP の場所と特徴抽出の設定を使う（復元と同じ設定にする）。
@@ -100,9 +131,10 @@ func New(cfg config.Pipeline, run cmdrun.Runner, root *workspace.Root, log *slog
 	}
 	return &Localizer{
 		cfg: cfg, run: run, root: root, log: log,
-		slot:     make(chan struct{}, 1),
-		Timeout:  80 * time.Second,
-		MaxPairs: 60,
+		slot:      make(chan struct{}, 1),
+		Timeout:   80 * time.Second,
+		MaxPairs:  60,
+		NearPairs: 6,
 	}
 }
 
@@ -141,22 +173,10 @@ func (l *Localizer) localize(ctx context.Context, dir string, m *workspace.Scan,
 	var res Result
 	logPath := filepath.Join(dir, "localize.log")
 
-	// 地図の中身（写真の一覧とカメラ）を読む。バイナリ形式をテキストに変換してから読む。
-	mapTxt := filepath.Join(dir, "map")
-	if err := os.MkdirAll(mapTxt, 0o750); err != nil {
-		return res, err
-	}
-	if err := l.colmap(ctx, logPath, "model_converter",
-		"--input_path", m.ModelDir(), "--output_path", mapTxt, "--output_type", "TXT"); err != nil {
-		return res, err
-	}
-	mapImages, err := reconstruction.ReadImagePoses(filepath.Join(mapTxt, "images.txt"), false)
+	// 地図の中身（写真の一覧とカメラ）を読む。
+	mapImages, cameras, err := l.readMap(ctx, dir, logPath, m)
 	if err != nil {
-		return res, fmt.Errorf("地図の写真を読めません: %w", err)
-	}
-	cameras, err := reconstruction.ReadCameras(filepath.Join(mapTxt, "cameras.txt"))
-	if err != nil {
-		return res, fmt.Errorf("地図のカメラを読めません: %w", err)
+		return res, err
 	}
 	res.MapImages = len(mapImages)
 	if len(mapImages) == 0 {
@@ -196,8 +216,12 @@ func (l *Localizer) localize(ctx context.Context, dir string, m *workspace.Scan,
 		return res, err
 	}
 
-	// (2) マッチング。突き合わせる地図の写真は、地図全体から等間隔に選ぶ（撮影範囲の全体を見る）。
+	// (2) マッチング。突き合わせる地図の写真は、手がかりがあればその近くから、無ければ地図全体から等間隔に選ぶ
+	//   （撮影範囲の全体を見る）。
 	compared := samplePairs(mapImages, l.MaxPairs)
+	if q.Near != nil {
+		compared = nearestPairs(mapImages, *q.Near, l.NearPairs)
+	}
 	res.ComparedImages = len(compared)
 	var pairs strings.Builder
 	for _, img := range compared {
@@ -259,6 +283,35 @@ func (l *Localizer) localize(ctx context.Context, dir string, m *workspace.Scan,
 	return res, nil
 }
 
+// readMap は地図の写真の一覧とカメラを返す。地図はバイナリ形式なので、テキストに変換してから読む。
+// 前回と同じ地図（images.bin の更新時刻と大きさが同じ）なら、前回読んだものを使う。
+func (l *Localizer) readMap(ctx context.Context, dir, logPath string, m *workspace.Scan) ([]reconstruction.ImagePose, []reconstruction.Camera, error) {
+	fi, statErr := os.Stat(filepath.Join(m.ModelDir(), "images.bin"))
+	if c := l.cached; c != nil && statErr == nil && c.dir == m.ModelDir() && c.mod.Equal(fi.ModTime()) && c.size == fi.Size() {
+		return c.images, c.cameras, nil
+	}
+	mapTxt := filepath.Join(dir, "map")
+	if err := os.MkdirAll(mapTxt, 0o750); err != nil {
+		return nil, nil, err
+	}
+	if err := l.colmap(ctx, logPath, "model_converter",
+		"--input_path", m.ModelDir(), "--output_path", mapTxt, "--output_type", "TXT"); err != nil {
+		return nil, nil, err
+	}
+	images, err := reconstruction.ReadImagePoses(filepath.Join(mapTxt, "images.txt"), false)
+	if err != nil {
+		return nil, nil, fmt.Errorf("地図の写真を読めません: %w", err)
+	}
+	cameras, err := reconstruction.ReadCameras(filepath.Join(mapTxt, "cameras.txt"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("地図のカメラを読めません: %w", err)
+	}
+	if statErr == nil {
+		l.cached = &mapContents{dir: m.ModelDir(), mod: fi.ModTime(), size: fi.Size(), images: images, cameras: cameras}
+	}
+	return images, cameras, nil
+}
+
 // sameSizeCamera は寸法が同じ地図のカメラの ID を返す。
 func sameSizeCamera(cameras []reconstruction.Camera, w, h int) (int, bool) {
 	for _, c := range cameras {
@@ -282,6 +335,60 @@ func samplePairs(images []reconstruction.ImagePose, n int) []reconstruction.Imag
 		out = append(out, sorted[i*len(sorted)/n])
 	}
 	return out
+}
+
+// nearestPairs は地図の写真から、手がかりの位置の近くで、手がかりの向きに近い向きで撮ったものを n 枚選ぶ（ID の順に返す）。
+//
+// 近さ = 向きの違い（ラジアン）＋ 距離 ÷ 手がかりから地図の写真までの距離の中央値。
+// 向きの違いを重く見るのは、その場で見回す使い方では、同じ物が写っているかを向きがほぼ決めるため
+// （部屋の反対側から同じ向きに撮った写真には、別の物が写っている。それは距離の項で遠ざける）。
+func nearestPairs(images []reconstruction.ImagePose, near Near, n int) []reconstruction.ImagePose {
+	if n <= 0 || len(images) <= n {
+		return samplePairs(images, 0)
+	}
+	dists := make([]float64, len(images))
+	for i, img := range images {
+		dists[i] = norm(sub(img.Center, near.Position))
+	}
+	sorted := append([]float64(nil), dists...)
+	sort.Float64s(sorted)
+	spread := sorted[len(sorted)/2]
+	if spread <= 0 {
+		spread = 1
+	}
+	fwd, hasFwd := unit(near.Forward)
+	type scored struct {
+		img   reconstruction.ImagePose
+		score float64
+	}
+	all := make([]scored, len(images))
+	for i, img := range images {
+		s := dists[i] / spread
+		if f, ok := unit(img.Forward); ok && hasFwd {
+			s += math.Acos(math.Max(-1, math.Min(1, dot(f, fwd))))
+		}
+		all[i] = scored{img, s}
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].score < all[j].score })
+	out := make([]reconstruction.ImagePose, 0, n)
+	for _, s := range all[:n] {
+		out = append(out, s.img)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func sub(a, b [3]float64) [3]float64 { return [3]float64{a[0] - b[0], a[1] - b[1], a[2] - b[2]} }
+func dot(a, b [3]float64) float64    { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
+func norm(a [3]float64) float64      { return math.Sqrt(dot(a, a)) }
+
+// unit は長さ 1 にしたベクトルを返す。長さが 0（向きが無い）なら false。
+func unit(a [3]float64) ([3]float64, bool) {
+	l := norm(a)
+	if l == 0 || math.IsNaN(l) || math.IsInf(l, 0) {
+		return a, false
+	}
+	return [3]float64{a[0] / l, a[1] / l, a[2] / l}, true
 }
 
 func (l *Localizer) colmap(ctx context.Context, logPath string, args ...string) error {
