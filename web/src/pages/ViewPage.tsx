@@ -7,7 +7,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { fetchSceneInfo, localizeFrame, renameScan, requestSplat } from '../api/client';
-import type { LocalizeResult, Scan, SceneInfo, ServerConfig } from '../api/types';
+import type { LocalizeHint, LocalizeResult, Scan, SceneInfo, ServerConfig } from '../api/types';
 import { arSupported } from '../capture/arSupport';
 import { formatBytes } from '../capture/validation';
 import { displayTitle } from '../gallery/gallery';
@@ -100,7 +100,7 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
           url: active.url,
           info,
           scene: scan.captureMode === 'scene',
-          localize: (image: Blob, signal: AbortSignal) => localizeFrame(scan.id, image, signal),
+          localize: (image: Blob, signal: AbortSignal, near?: LocalizeHint) => localizeFrame(scan.id, image, signal, near),
         }
       : null;
 
@@ -430,7 +430,7 @@ function useArView() {
     url: string;
     info: SceneInfo;
     scene: boolean;
-    localize: (image: Blob, signal: AbortSignal) => Promise<LocalizeResult>;
+    localize: (image: Blob, signal: AbortSignal, near?: LocalizeHint) => Promise<LocalizeResult>;
   }) => {
     const overlay = root.current;
     if (!overlay || active) return;

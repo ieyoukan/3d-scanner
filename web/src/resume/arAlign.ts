@@ -114,9 +114,28 @@ function mean(points: readonly THREE.Vector3[]): THREE.Vector3 {
  */
 export function snapshotAlignment(
   map: { position: Vec3; forward: Vec3; down: Vec3 },
-  ar: { position: Vec3; orientation: readonly [number, number, number, number] },
+  ar: { position: Vec3; orientation: Quat },
   scale: number,
 ): THREE.Matrix4 {
+  return poseMatrix(snapshotPose(map, ar.orientation), scale, ar.position);
+}
+
+/** 四元数（x, y, z, w）。 */
+export type Quat = readonly [number, number, number, number];
+
+/**
+ * 写真 1 枚の位置合わせで決まる重ね方のうち、AR の位置に依らない部分。
+ * 「地図を、地図でのカメラの位置 camera を中心に rotation だけ回し、そこを AR のカメラの位置に置く」。
+ */
+export interface SnapshotPose {
+  /** 地図 → AR の回転。 */
+  rotation: THREE.Quaternion;
+  /** 地図でのカメラの位置。 */
+  camera: THREE.Vector3;
+}
+
+/** 位置合わせの結果（地図でのカメラ）と、同じ瞬間の AR のカメラの向きから、重ね方を求める（snapshotAlignment の説明を参照）。 */
+export function snapshotPose(map: { position: Vec3; forward: Vec3; down: Vec3 }, arOrientation: Quat): SnapshotPose {
   // 地図でのカメラの軸（COLMAP の約束: x 右・y 下・z 前）。右 = 下 × 前。
   const fwd = new THREE.Vector3(...map.forward).normalize();
   const down = new THREE.Vector3(...map.down).normalize();
@@ -126,11 +145,49 @@ export function snapshotAlignment(
   const camToMap = new THREE.Matrix4().makeBasis(right, down, fwd);
   // AR のカメラの軸を COLMAP の約束に直す（y と z の向きが逆）。
   const flip = new THREE.Matrix4().makeScale(1, -1, -1);
-  const arCam = new THREE.Matrix4().makeRotationFromQuaternion(new THREE.Quaternion(...ar.orientation));
+  const arCam = new THREE.Matrix4().makeRotationFromQuaternion(new THREE.Quaternion(...arOrientation));
   // R = (AR のカメラ → AR) · (COLMAP の軸 → XR の軸) · (地図 → カメラ)
   const rotation = arCam.multiply(flip).multiply(camToMap.transpose());
-  const q = new THREE.Quaternion().setFromRotationMatrix(rotation);
-  const c = new THREE.Vector3(...map.position).applyQuaternion(q).multiplyScalar(scale);
-  const t = new THREE.Vector3(...ar.position).sub(c);
-  return new THREE.Matrix4().compose(t, q, new THREE.Vector3(scale, scale, scale));
+  return {
+    rotation: new THREE.Quaternion().setFromRotationMatrix(rotation),
+    camera: new THREE.Vector3(...map.position),
+  };
+}
+
+/**
+ * 重ね方を、地図の座標 → AR の座標の変換にする。地図でのカメラの位置が、AR の arPosition（省略すると原点）に来る。
+ * 「AR で見る」は AR の位置を使わないので、原点に置いた変換を、毎フレーム AR のカメラの位置へ動かして使う。
+ */
+export function poseMatrix(pose: SnapshotPose, scale: number, arPosition: Vec3 = [0, 0, 0], out = new THREE.Matrix4()): THREE.Matrix4 {
+  const c = pose.camera.clone().applyQuaternion(pose.rotation).multiplyScalar(scale);
+  const t = new THREE.Vector3(...arPosition).sub(c);
+  return out.compose(t, pose.rotation, new THREE.Vector3(scale, scale, scale));
+}
+
+/**
+ * 2 つの重ね方の途中（k = 0 で a、1 で b）。回転は球面補間、カメラの位置は直線補間。
+ * カメラの位置を中心に回るので、合わせ直したときの動きが「その場で首を振った」ように見える。
+ */
+export function blendPose(a: SnapshotPose, b: SnapshotPose, k: number): SnapshotPose {
+  return {
+    rotation: a.rotation.clone().slerp(b.rotation, k),
+    camera: a.camera.clone().lerp(b.camera, k),
+  };
+}
+
+/** 2 つの重ね方の回転の違い（度）。 */
+export function poseTurnDegrees(a: SnapshotPose, b: SnapshotPose): number {
+  return THREE.MathUtils.radToDeg(a.rotation.angleTo(b.rotation));
+}
+
+/**
+ * いまの AR のカメラのレンズの向きを、地図の向きに直す（位置合わせの手がかりにする）。
+ * 重ね方の回転は地図 → AR なので、その逆で戻す。AR のカメラは -z が前。
+ */
+export function mapForward(pose: SnapshotPose, arOrientation: Quat): Vec3 {
+  const f = new THREE.Vector3(0, 0, -1)
+    .applyQuaternion(new THREE.Quaternion(...arOrientation))
+    .applyQuaternion(pose.rotation.clone().invert())
+    .normalize();
+  return [f.x, f.y, f.z];
 }

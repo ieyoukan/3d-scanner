@@ -235,6 +235,8 @@ curl -X PATCH "$BASE/api/scans/$ID" -H 'Content-Type: application/json' -d '{"ti
 # 位置合わせ（VPS）: 写真 1 枚が、完成したスキャンの地図のどこから撮ったものか
 curl -X POST "$BASE/api/scans/$ID/localize" -F image=@now.jpg
 # → {"localized":true,"position":[7.62,0.47,1.31],"forward":[-0.22,-0.02,0.97],"matches":1492,...}
+# 前回分かった位置といまの向きを手がかりにすると、その近くの地図の写真 6 枚とだけ照合する（数倍速い）
+curl -X POST "$BASE/api/scans/$ID/localize?near=7.62,0.47,1.31&facing=-0.22,-0.02,0.97" -F image=@now.jpg
 
 # 3DGS を作り直す（待ち行列に入れる。前の 3DGS は出来上がるまで見られる）
 curl -X POST "$BASE/api/scans/$ID/splat"

@@ -199,6 +199,12 @@ export interface SceneInfo {
   metersPerUnit?: number;
 }
 
+/** 位置合わせの手がかり（地図の座標系）。前回分かったカメラの位置と、いまのレンズの向き。 */
+export interface LocalizeHint {
+  position: readonly [number, number, number];
+  forward: readonly [number, number, number];
+}
+
 /** 位置合わせ（VPS）の結果（POST /api/scans/:id/localize）。座標は地図（scene.json と同じ）の座標系。 */
 export interface LocalizeResult {
   localized: boolean;

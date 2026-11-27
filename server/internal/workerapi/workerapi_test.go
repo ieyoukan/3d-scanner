@@ -36,11 +36,13 @@ func (f *fakeJobs) Remove(_ context.Context, id string) (jobs.Removal, error) {
 
 type fakeLocalizer struct {
 	gotPath string
+	gotNear *vps.Near
 	err     error
 }
 
 func (f *fakeLocalizer) Localize(_ context.Context, m *workspace.Scan, q vps.Query) (vps.Result, error) {
 	f.gotPath = q.Path
+	f.gotNear = q.Near
 	if f.err != nil {
 		return vps.Result{}, f.err
 	}
@@ -90,8 +92,17 @@ func TestClientServerRoundTrip(t *testing.T) {
 	if out.Camera == nil || out.Camera.Fx != 1200 || out.Camera.Height != 1600 {
 		t.Errorf("画角が伝わっていない: %+v", out.Camera)
 	}
-	if fl.gotPath != photo {
-		t.Errorf("ワーカーが受け取ったパス = %q, want %q", fl.gotPath, photo)
+	if fl.gotPath != photo || fl.gotNear != nil {
+		t.Errorf("ワーカーが受け取ったパス = %q（手がかり %+v）, want %q", fl.gotPath, fl.gotNear, photo)
+	}
+	// 手がかりもワーカーに伝わる。
+	os.WriteFile(photo, []byte("jpeg"), 0o640)
+	near := &vps.Near{Position: [3]float64{1, 2, 3}, Forward: [3]float64{0, 0, -1}}
+	if _, err := c.Localize(ctx, ws, vps.Query{Path: photo, Width: 10, Height: 20, Near: near}); err != nil {
+		t.Errorf("Localize（手がかり付き）= %v", err)
+	}
+	if fl.gotNear == nil || *fl.gotNear != *near {
+		t.Errorf("ワーカーが受け取った手がかり = %+v, want %+v", fl.gotNear, near)
 	}
 	fl.err = vps.ErrBusy
 	if _, err := c.Localize(ctx, ws, vps.Query{Path: photo}); !errors.Is(err, vps.ErrBusy) {
