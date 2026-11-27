@@ -202,8 +202,18 @@ func TestReadCameras(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cams) != 2 || cams[0] != (Camera{ID: 1, Model: "SIMPLE_RADIAL", Width: 1920, Height: 1440}) || cams[1].ID != 2 {
+	if len(cams) != 2 || cams[0].ID != 1 || cams[0].Model != "SIMPLE_RADIAL" || cams[0].Width != 1920 || cams[0].Height != 1440 || cams[1].ID != 2 {
 		t.Fatalf("cams = %+v", cams)
+	}
+	// 焦点距離と主点: SIMPLE_RADIAL は f, cx, cy、PINHOLE は fx, fy, cx, cy。
+	if in, ok := cams[0].Intrinsics(); !ok || in != (Intrinsics{Width: 1920, Height: 1440, Fx: 1500, Fy: 1500, Cx: 960, Cy: 720}) {
+		t.Errorf("SIMPLE_RADIAL の画角 = %+v, %v", in, ok)
+	}
+	if in, ok := cams[1].Intrinsics(); !ok || in.Fx != 500 || in.Cy != 240 {
+		t.Errorf("PINHOLE の画角 = %+v, %v", in, ok)
+	}
+	if _, ok := (Camera{Model: "UNKNOWN"}).Intrinsics(); ok {
+		t.Error("知らないモデルの画角を返した")
 	}
 	os.WriteFile(path, []byte("1 SIMPLE_RADIAL x 1440\n"), 0o640)
 	if _, err := ReadCameras(path); err == nil {

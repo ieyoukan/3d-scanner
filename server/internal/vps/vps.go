@@ -62,9 +62,14 @@ type Query struct {
 type Result struct {
 	// Localized は位置が分かったか。false なら他の項目は意味を持たない。
 	Localized bool
-	// Position はカメラの位置、Forward はレンズの向き（単位ベクトル）。どちらも地図の座標系。
+	// Position はカメラの位置、Forward はレンズの向き、Down は画像の下方向（どちらも単位ベクトル）。地図の座標系。
+	// Forward と Down でカメラの向きが完全に決まる（右は Down × Forward）。
 	Position [3]float64
 	Forward  [3]float64
+	Down     [3]float64
+	// Camera はその写真のカメラの焦点距離と主点（画素）。地図のカメラを使い回したときはその値、新しいカメラなら推定した値。
+	// 画面は、この画角でメッシュを描けば写真にぴったり重なる。取れなければ nil。
+	Camera *reconstruction.Intrinsics
 	// Matches は、写真の特徴点のうち地図の3D点に対応づいた数。多いほど確か。
 	Matches int
 	// ComparedImages は特徴点を突き合わせた地図の写真の枚数。
@@ -237,10 +242,18 @@ func (l *Localizer) localize(ctx context.Context, dir string, m *workspace.Scan,
 	if err != nil {
 		return res, fmt.Errorf("位置合わせの結果を読めません: %w", err)
 	}
+	outCameras, _ := reconstruction.ReadCameras(filepath.Join(outTxt, "cameras.txt"))
 	for _, p := range poses {
 		if p.Name == name {
 			res.Localized = true
-			res.Position, res.Forward, res.Matches = p.Center, p.Forward, p.Observations
+			res.Position, res.Forward, res.Down, res.Matches = p.Center, p.Forward, p.Down, p.Observations
+			for _, c := range outCameras {
+				if c.ID == p.CameraID {
+					if in, ok := c.Intrinsics(); ok {
+						res.Camera = &in
+					}
+				}
+			}
 		}
 	}
 	return res, nil

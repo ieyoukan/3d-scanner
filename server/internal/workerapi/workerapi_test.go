@@ -10,6 +10,7 @@ import (
 
 	"github.com/ieyoukan/3d-scanner/server/internal/httpapi"
 	"github.com/ieyoukan/3d-scanner/server/internal/jobs"
+	"github.com/ieyoukan/3d-scanner/server/internal/reconstruction"
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
 	"github.com/ieyoukan/3d-scanner/server/internal/vps"
 	"github.com/ieyoukan/3d-scanner/server/internal/workspace"
@@ -43,7 +44,8 @@ func (f *fakeLocalizer) Localize(_ context.Context, m *workspace.Scan, q vps.Que
 	if f.err != nil {
 		return vps.Result{}, f.err
 	}
-	return vps.Result{Localized: true, Position: [3]float64{1, 2, 3}, Forward: [3]float64{0, 0, 1}, Matches: 42, MapImages: 9}, nil
+	return vps.Result{Localized: true, Position: [3]float64{1, 2, 3}, Forward: [3]float64{0, 0, 1}, Down: [3]float64{0, 1, 0},
+		Camera: &reconstruction.Intrinsics{Width: 720, Height: 1600, Fx: 1200, Fy: 1200, Cx: 360, Cy: 800}, Matches: 42, MapImages: 9}, nil
 }
 
 // pair は、同じ PVC を共有する API（クライアント）とワーカー（サーバー）を作る。
@@ -82,8 +84,11 @@ func TestClientServerRoundTrip(t *testing.T) {
 	os.WriteFile(photo, []byte("jpeg"), 0o640)
 	ws, _ := root.Scan(scanID)
 	out, err := c.Localize(ctx, ws, vps.Query{Path: photo, Width: 10, Height: 20})
-	if err != nil || !out.Localized || out.Matches != 42 || out.Position != [3]float64{1, 2, 3} {
+	if err != nil || !out.Localized || out.Matches != 42 || out.Position != [3]float64{1, 2, 3} || out.Down != [3]float64{0, 1, 0} {
 		t.Errorf("Localize = %+v, %v", out, err)
+	}
+	if out.Camera == nil || out.Camera.Fx != 1200 || out.Camera.Height != 1600 {
+		t.Errorf("画角が伝わっていない: %+v", out.Camera)
 	}
 	if fl.gotPath != photo {
 		t.Errorf("ワーカーが受け取ったパス = %q, want %q", fl.gotPath, photo)

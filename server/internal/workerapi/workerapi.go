@@ -32,6 +32,7 @@ import (
 
 	"github.com/ieyoukan/3d-scanner/server/internal/httpapi"
 	"github.com/ieyoukan/3d-scanner/server/internal/jobs"
+	"github.com/ieyoukan/3d-scanner/server/internal/reconstruction"
 	"github.com/ieyoukan/3d-scanner/server/internal/scan"
 	"github.com/ieyoukan/3d-scanner/server/internal/store"
 	"github.com/ieyoukan/3d-scanner/server/internal/vps"
@@ -46,12 +47,14 @@ type localizeRequest struct {
 }
 
 type localizeResult struct {
-	Localized      bool       `json:"localized"`
-	Position       [3]float64 `json:"position"`
-	Forward        [3]float64 `json:"forward"`
-	Matches        int        `json:"matches"`
-	ComparedImages int        `json:"comparedImages"`
-	MapImages      int        `json:"mapImages"`
+	Localized      bool                       `json:"localized"`
+	Position       [3]float64                 `json:"position"`
+	Forward        [3]float64                 `json:"forward"`
+	Down           [3]float64                 `json:"down"`
+	Camera         *reconstruction.Intrinsics `json:"camera,omitempty"`
+	Matches        int                        `json:"matches"`
+	ComparedImages int                        `json:"comparedImages"`
+	MapImages      int                        `json:"mapImages"`
 }
 
 type errorBody struct {
@@ -164,7 +167,8 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, localizeResult{
-		Localized: out.Localized, Position: out.Position, Forward: out.Forward, Matches: out.Matches,
+		Localized: out.Localized, Position: out.Position, Forward: out.Forward, Down: out.Down, Camera: out.Camera,
+		Matches:        out.Matches,
 		ComparedImages: out.ComparedImages, MapImages: out.MapImages,
 	})
 }
@@ -272,7 +276,8 @@ func (c *Client) Localize(ctx context.Context, m *workspace.Scan, q vps.Query) (
 		return vps.Result{}, err
 	}
 	return vps.Result{
-		Localized: out.Localized, Position: out.Position, Forward: out.Forward, Matches: out.Matches,
+		Localized: out.Localized, Position: out.Position, Forward: out.Forward, Down: out.Down, Camera: out.Camera,
+		Matches:        out.Matches,
 		ComparedImages: out.ComparedImages, MapImages: out.MapImages,
 	}, nil
 }

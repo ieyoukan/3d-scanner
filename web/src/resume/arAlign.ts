@@ -96,3 +96,41 @@ function mean(points: readonly THREE.Vector3[]): THREE.Vector3 {
   for (const p of points) m.add(p);
   return m.multiplyScalar(1 / points.length);
 }
+
+/**
+ * 写真 1 枚の位置合わせから、地図の座標 → AR の座標の変換を作る（「AR で見る」の実物に重ねる）。
+ *
+ * solveAlignment と違い、AR の「位置」を使わない。AR の位置（移動）は端末や場所によって大きく狂う
+ * （実機の記録で、40 秒の撮影で 18m 以上飛んでいた）が、向き（回転）は正確だった（写真から求めた向きと 1.5° 以内）。
+ * そこで、写真を撮った瞬間の AR のカメラの向きと、位置合わせで分かった地図でのカメラの向き（forward と down）を
+ * そろえて回転を決め、カメラの位置どうしを重ねる。こうすると、その瞬間のカメラから見た地図は写真とぴったり重なる。
+ * その場で見回す分には、AR の向きだけで正しく追える（位置の狂いは「重ねた瞬間のカメラの位置」に固定して無視する）。
+ *
+ * 縮尺 scale（地図の 1 が何メートルか）は、カメラの位置から見る限り見た目に影響しない（全体を同じ倍率で
+ * 大きくしても、カメラの位置を中心にすれば同じに見える）。実物大が分かっていればそれ、無ければ見やすい値を渡す。
+ *
+ * @param map   地図でのカメラの位置・レンズの向き・画像の下方向
+ * @param ar    同じ瞬間の AR のカメラの位置と向き（四元数 x, y, z, w。WebXR の約束: x 右・y 上・-z が前）
+ */
+export function snapshotAlignment(
+  map: { position: Vec3; forward: Vec3; down: Vec3 },
+  ar: { position: Vec3; orientation: readonly [number, number, number, number] },
+  scale: number,
+): THREE.Matrix4 {
+  // 地図でのカメラの軸（COLMAP の約束: x 右・y 下・z 前）。右 = 下 × 前。
+  const fwd = new THREE.Vector3(...map.forward).normalize();
+  const down = new THREE.Vector3(...map.down).normalize();
+  const right = new THREE.Vector3().crossVectors(down, fwd).normalize();
+  // 下と前が少しずれていても直交するよう、下を作り直す。
+  down.crossVectors(fwd, right).normalize();
+  const camToMap = new THREE.Matrix4().makeBasis(right, down, fwd);
+  // AR のカメラの軸を COLMAP の約束に直す（y と z の向きが逆）。
+  const flip = new THREE.Matrix4().makeScale(1, -1, -1);
+  const arCam = new THREE.Matrix4().makeRotationFromQuaternion(new THREE.Quaternion(...ar.orientation));
+  // R = (AR のカメラ → AR) · (COLMAP の軸 → XR の軸) · (地図 → カメラ)
+  const rotation = arCam.multiply(flip).multiply(camToMap.transpose());
+  const q = new THREE.Quaternion().setFromRotationMatrix(rotation);
+  const c = new THREE.Vector3(...map.position).applyQuaternion(q).multiplyScalar(scale);
+  const t = new THREE.Vector3(...ar.position).sub(c);
+  return new THREE.Matrix4().compose(t, q, new THREE.Vector3(scale, scale, scale));
+}
