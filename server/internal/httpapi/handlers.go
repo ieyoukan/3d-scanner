@@ -874,9 +874,12 @@ type Localizer interface {
 // scene.json やダウンロードしたファイルと同じ座標系なので、画面はそのまま重ねて描ける。
 type localizeResponse struct {
 	Localized bool `json:"localized"`
-	// Position はカメラの位置、Forward はレンズの向き（単位ベクトル）。位置が分からなければ省略。
+	// Position はカメラの位置、Forward はレンズの向き、Down は画像の下方向（単位ベクトル）。位置が分からなければ省略。
 	Position *[3]float64 `json:"position,omitempty"`
 	Forward  *[3]float64 `json:"forward,omitempty"`
+	Down     *[3]float64 `json:"down,omitempty"`
+	// Camera はその写真のカメラの画角（焦点距離と主点、画素）。この画角でメッシュを描けば写真に重なる。
+	Camera *cameraResponse `json:"camera,omitempty"`
 	// Matches は写真の特徴点のうち地図の3D点に対応づいた数（多いほど確か）。
 	Matches        int   `json:"matches"`
 	ComparedImages int   `json:"comparedImages"`
@@ -884,6 +887,16 @@ type localizeResponse struct {
 	DurationMs     int64 `json:"durationMs"`
 	// Message はそのまま画面に出せる説明。
 	Message string `json:"message"`
+}
+
+// cameraResponse はカメラの画角。
+type cameraResponse struct {
+	Width  int     `json:"width"`
+	Height int     `json:"height"`
+	Fx     float64 `json:"fx"`
+	Fy     float64 `json:"fy"`
+	Cx     float64 `json:"cx"`
+	Cy     float64 `json:"cy"`
 }
 
 // handleLocalize は写真1枚を受け取り、スキャンの地図のどこから撮ったものかを返す
@@ -969,7 +982,10 @@ func (s *Server) handleLocalize(w http.ResponseWriter, r *http.Request) {
 		MapImages: out.MapImages, DurationMs: elapsed.Milliseconds(),
 	}
 	if out.Localized {
-		resp.Position, resp.Forward = &out.Position, &out.Forward
+		resp.Position, resp.Forward, resp.Down = &out.Position, &out.Forward, &out.Down
+		if c := out.Camera; c != nil {
+			resp.Camera = &cameraResponse{Width: c.Width, Height: c.Height, Fx: c.Fx, Fy: c.Fy, Cx: c.Cx, Cy: c.Cy}
+		}
 		resp.Message = fmt.Sprintf("位置が分かりました（地図の3D点%d個と一致）。", out.Matches)
 	} else {
 		resp.Message = "保存した3Dデータと一致する景色が見つかりませんでした。前回撮った部分が写るように向けて、もう一度お試しください。"

@@ -317,6 +317,36 @@ type Camera struct {
 	Model  string
 	Width  int
 	Height int
+	// Params はカメラのモデルごとの値（SIMPLE_RADIAL なら f, cx, cy, k）。
+	Params []float64
+}
+
+// Intrinsics は焦点距離（画素）と画像の中心（主点、画素）。歪みは含まない。
+type Intrinsics struct {
+	Width, Height int
+	Fx, Fy        float64
+	Cx, Cy        float64
+}
+
+// Intrinsics はカメラの焦点距離と主点を返す。知らないモデルなら ok=false。
+// COLMAP のモデルの並び: SIMPLE_PINHOLE / SIMPLE_RADIAL / RADIAL は f, cx, cy, …、PINHOLE / OPENCV 系は fx, fy, cx, cy, …。
+func (c Camera) Intrinsics() (Intrinsics, bool) {
+	in := Intrinsics{Width: c.Width, Height: c.Height}
+	switch c.Model {
+	case "SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL", "SIMPLE_RADIAL_FISHEYE", "RADIAL_FISHEYE":
+		if len(c.Params) < 3 {
+			return in, false
+		}
+		in.Fx, in.Fy, in.Cx, in.Cy = c.Params[0], c.Params[0], c.Params[1], c.Params[2]
+	case "PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV", "FOV", "THIN_PRISM_FISHEYE":
+		if len(c.Params) < 4 {
+			return in, false
+		}
+		in.Fx, in.Fy, in.Cx, in.Cy = c.Params[0], c.Params[1], c.Params[2], c.Params[3]
+	default:
+		return in, false
+	}
+	return in, in.Fx > 0 && in.Fy > 0
 }
 
 // ReadCameras は cameras.txt を読む。形式: CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]
@@ -340,7 +370,11 @@ func ReadCameras(path string) ([]Camera, error) {
 		if err := errors.Join(err1, err2, err3); err != nil {
 			return nil, fmt.Errorf("カメラの行を読めません: %q", truncate(line, 80))
 		}
-		cams = append(cams, Camera{ID: id, Model: fields[1], Width: w, Height: h})
+		params, err := parseFloats(fields[4:])
+		if err != nil {
+			return nil, fmt.Errorf("カメラの値を読めません: %q", truncate(line, 80))
+		}
+		cams = append(cams, Camera{ID: id, Model: fields[1], Width: w, Height: h, Params: params})
 	}
 	return cams, nil
 }

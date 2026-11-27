@@ -1,74 +1,40 @@
 // AR で見ている間に、カメラ映像の上に重ねる画面（WebXR の DOM overlay）。
 //
-//   上      閉じる。右は、重ねているときは「透かす」、机に置いたときは「置き直す」。位置を見失ったら真ん中に「！」
-//   真ん中  重ねるまで: メーター（capture/LocateMeter.tsx）。机に置く前: 「ゆっくり動かす」→「置く所をタップ」
-//           机に置いた後: 1本指で左右になぞると回る、2本指でつまむと大きさが変わる（画面全体で受ける）
-//   下      見方の切り替え（「机に置く」⇔「実物に重ねる」）。机に置いたときは大きさ（押すと元の大きさ）
+//   上      閉じる。重ねた後は右に「透かす」
+//   真ん中  照合中: 経過秒数と目安の輪（メーター）。見つからなかったとき: 理由とやり直し方
+//   下      大きな「重ねる」ボタン（重ねた後は「重ね直す」）。重ねた後は一致した特徴点の数
 import { useEffect, useRef } from 'react';
-import { MovePhone } from '../capture/arIcons';
-import { LocateMeter } from '../capture/LocateMeter';
 import type { ArViewState } from './arView';
 
 interface Props {
   state: ArViewState | null;
   onClose: () => void;
-  onPlace: () => void;
-  onOverlay: () => void;
+  onAlign: () => void;
   onSeeThrough: () => void;
-  onRotate: (radians: number) => void;
-  onZoom: (factor: number) => void;
-  onResetZoom: () => void;
 }
 
-/** 1本指で画面の幅をなぞったときに回る角度（ラジアン）。 */
-const radiansPerScreen = 2 * Math.PI;
-
-export function ArViewHud({ state, onClose, onPlace, onOverlay, onSeeThrough, onRotate, onZoom, onResetZoom }: Props) {
+export function ArViewHud({ state, onClose, onAlign, onSeeThrough }: Props) {
   const root = useRef<HTMLDivElement>(null);
   const phase = state?.phase ?? 'loading';
 
-  // ボタンや操作面を触ったときに、AR の「画面のタップ」（置く）が起きないようにする。
-  // 置く前は操作面が無いので、画面のタップがそのまま「置く」になる。
+  // ボタンを押したときに、AR の「画面のタップ」が起きないようにする。
   useEffect(() => {
     const el = root.current;
     if (!el) return;
     const block = (e: Event) => {
-      if ((e.target as Element | null)?.closest('button, [data-gesture]')) e.preventDefault();
+      if ((e.target as Element | null)?.closest('button')) e.preventDefault();
     };
     el.addEventListener('beforexrselect', block);
     return () => el.removeEventListener('beforexrselect', block);
   }, []);
 
-  const gesture = useGesture(onRotate, onZoom);
-
-  const sizeLabel = !state
-    ? ''
-    : state.realScale
-      ? Math.abs(state.zoom - 1) < 0.01
-        ? '実物大'
-        : `実物の ${formatZoom(state.zoom)} 倍`
-      : `目安の大きさ${Math.abs(state.zoom - 1) < 0.01 ? '' : ` × ${formatZoom(state.zoom)}`}`;
-  // 置いた・重ねた後に位置を見失ったら知らせる（その間はメッシュが正しい所に出ない）。
-  const lostAfter = state && !state.tracking && (phase === 'placed' || phase === 'overlay');
-
   return (
     <div ref={root} className="pointer-events-none fixed inset-0 z-50 select-none text-paper">
-      {/* 置いた後は、画面全体で回す・大きさを変える操作を受ける。 */}
-      {phase === 'placed' && <div data-gesture className="pointer-events-auto absolute inset-0 touch-none" {...gesture} />}
-
       <div className="pad-safe-t relative flex items-start justify-between px-3 pt-2">
         <RoundButton label="閉じる" onClick={onClose}>
           <path d="M6 6l12 12M18 6L6 18" />
         </RoundButton>
-        {lostAfter && (
-          <span className="mt-1 rounded-full bg-black/60 px-3 py-1.5 text-sm font-semibold text-amber">! ゆっくり動かす</span>
-        )}
-        {phase === 'placed' ? (
-          <RoundButton label="置き直す" onClick={onPlace}>
-            <circle cx="12" cy="12" r="7" />
-            <circle cx="12" cy="12" r="1.5" fill="currentColor" />
-          </RoundButton>
-        ) : phase === 'overlay' ? (
+        {phase === 'overlay' ? (
           <RoundButton label={state?.seeThrough ? '透かすのをやめる' : '透かして実物と見比べる'} onClick={onSeeThrough}>
             <rect x="4" y="4" width="11" height="11" rx="1.5" />
             <rect x="9" y="9" width="11" height="11" rx="1.5" fill={state?.seeThrough ? 'currentColor' : 'none'} fillOpacity="0.35" />
@@ -78,116 +44,79 @@ export function ArViewHud({ state, onClose, onPlace, onOverlay, onSeeThrough, on
         )}
       </div>
 
-      {state?.error ? (
-        <p className="absolute inset-x-6 top-1/2 rounded-lg bg-black/70 p-3 text-center text-sm text-amber">{state.error}</p>
-      ) : phase === 'loading' ? (
-        <span className="absolute left-1/2 top-1/2 size-8 -translate-x-1/2 -translate-y-1/2 animate-spin rounded-full border-2 border-paper border-t-transparent" />
-      ) : phase === 'locating' && state?.locate ? (
-        <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 justify-center">
-          <LocateMeter progress={state.locate} />
-        </div>
-      ) : (
-        phase === 'placing' && (
-          <div className="absolute inset-x-0 top-1/2 mt-16 flex flex-col items-center gap-2 drop-shadow">
-            {!state?.aiming && <MovePhone />}
-            <p className="text-center text-base font-semibold">{state?.aiming ? '置く所をタップ' : 'ゆっくり動かす'}</p>
-          </div>
-        )
-      )}
+      <div className="absolute inset-x-0 top-1/2 flex -translate-y-1/2 flex-col items-center gap-3 px-6 drop-shadow">
+        {state?.error ? (
+          <p className="rounded-lg bg-black/70 p-3 text-center text-sm text-amber">{state.error}</p>
+        ) : phase === 'loading' ? (
+          <span className="size-8 animate-spin rounded-full border-2 border-paper border-t-transparent" />
+        ) : phase === 'checking' && state ? (
+          <CheckMeter seconds={state.checkingSeconds} expected={state.expectedSeconds} />
+        ) : phase === 'failed' && state?.failure ? (
+          <p className="max-w-xs rounded-lg bg-black/70 p-3 text-center text-sm">{state.failure}</p>
+        ) : phase === 'ready' ? (
+          <p className="rounded-full bg-black/50 px-3 py-1 text-center text-sm font-semibold">撮ったものに向けて押す</p>
+        ) : null}
+      </div>
 
-      <div className="pad-safe-b absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 pb-6">
-        {phase === 'placed' && state && (
-          <>
-            <button
-              type="button"
-              onClick={onResetZoom}
-              aria-label="元の大きさに戻す"
-              className="tabular pointer-events-auto rounded-full bg-black/60 px-4 py-2 text-sm"
-            >
-              {sizeLabel}
-            </button>
-            <GestureHint />
-          </>
+      <div className="pad-safe-b absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 pb-8">
+        {phase === 'overlay' && state?.matches != null && (
+          <span className="tabular rounded-full bg-black/60 px-3 py-1 text-xs">特徴点 {state.matches} 個で一致</span>
         )}
-        {/* 見方の切り替え。重ねている・重ねようとしている間は「机に置く」、机に置いている間は「実物に重ねる」。 */}
-        {(phase === 'locating' || phase === 'overlay') && (
-          <PillButton onClick={onPlace} label="机に置く">
-            <path d="M4 17h16M7 17l2-6h6l2 6" />
-          </PillButton>
+        {phase !== 'loading' && !state?.error && (
+          <button
+            type="button"
+            onClick={onAlign}
+            disabled={phase === 'checking'}
+            className="pointer-events-auto grid size-[76px] place-items-center rounded-full border-[3px] border-paper bg-black/30 disabled:opacity-40"
+            aria-label={phase === 'overlay' ? '重ね直す' : '重ねる'}
+          >
+            <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <rect x="3" y="5" width="11" height="11" rx="1.5" />
+              <rect x="10" y="8" width="11" height="11" rx="1.5" />
+            </svg>
+          </button>
         )}
-        {(phase === 'placing' || phase === 'placed') && state?.canOverlay && (
-          <PillButton onClick={onOverlay} label="実物に重ねる">
-            <rect x="4" y="6" width="10" height="10" rx="1.5" />
-            <rect x="10" y="9" width="10" height="10" rx="1.5" />
-          </PillButton>
+        {phase !== 'loading' && !state?.error && (
+          <span className="text-sm font-semibold drop-shadow">{phase === 'overlay' ? '重ね直す' : '重ねる'}</span>
         )}
       </div>
     </div>
   );
 }
 
-function PillButton({ onClick, label, children }: { onClick: () => void; label: string; children: React.ReactNode }) {
+/** 照合中のメーター: 経過秒数を輪で見せる（目安は前回かかった秒数。超えたら輪はいっぱいのまま数字だけ進む）。 */
+function CheckMeter({ seconds, expected }: { seconds: number; expected: number }) {
+  const size = 120;
+  const stroke = 8;
+  const r = (size - stroke) / 2;
+  const len = 2 * Math.PI * r;
+  const amount = Math.min(1, seconds / Math.max(1, expected));
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="pointer-events-auto flex min-h-11 items-center gap-2 rounded-full bg-black/60 px-4 text-sm font-semibold"
-    >
-      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-        {children}
-      </svg>
-      {label}
-    </button>
+    <div className="flex flex-col items-center gap-2" role="status" aria-label="照合中">
+      <div className="relative grid place-items-center" style={{ width: size, height: size }}>
+        <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size} className="absolute inset-0 -rotate-90" aria-hidden>
+          <circle cx={size / 2} cy={size / 2} r={r} fill="rgba(0,0,0,0.45)" stroke="rgba(255,255,255,0.25)" strokeWidth={stroke} />
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={r}
+            fill="none"
+            stroke="#ffffff"
+            strokeWidth={stroke}
+            strokeLinecap="round"
+            strokeDasharray={len}
+            strokeDashoffset={len * (1 - amount)}
+            style={{ transition: 'stroke-dashoffset 0.3s linear' }}
+          />
+        </svg>
+        <span className="tabular relative flex flex-col items-center leading-none">
+          <span className="text-3xl font-semibold">{Math.floor(seconds)}</span>
+          <span className="mt-1 text-xs opacity-80">/ {expected} 秒</span>
+        </span>
+      </div>
+      <p className="rounded-full bg-black/50 px-3 py-1 text-sm font-semibold">照合中・そのまま待つ</p>
+    </div>
   );
-}
-
-/**
- * 1本指で左右になぞると回し、2本指でつまむと大きさを変える。
- * Pointer Events で指ごとの位置を覚えておき、動くたびに前回との差を渡す。
- */
-function useGesture(onRotate: (radians: number) => void, onZoom: (factor: number) => void) {
-  const points = useRef(new Map<number, { x: number; y: number }>());
-  const spread = () => {
-    const [a, b] = [...points.current.values()];
-    return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
-  };
-  return {
-    onPointerDown: (e: React.PointerEvent) => {
-      (e.target as Element).setPointerCapture?.(e.pointerId);
-      points.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    },
-    onPointerMove: (e: React.PointerEvent) => {
-      const prev = points.current.get(e.pointerId);
-      if (!prev) return;
-      if (points.current.size === 1) {
-        onRotate(((e.clientX - prev.x) / window.innerWidth) * radiansPerScreen);
-        points.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      } else if (points.current.size === 2) {
-        const before = spread();
-        points.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-        const after = spread();
-        if (before > 10 && after > 10) onZoom(after / before);
-      }
-    },
-    onPointerUp: (e: React.PointerEvent) => points.current.delete(e.pointerId),
-    onPointerCancel: (e: React.PointerEvent) => points.current.delete(e.pointerId),
-  };
-}
-
-/** 回す・つまむ操作の絵（文字を使わずに伝える）。 */
-function GestureHint() {
-  return (
-    <svg viewBox="0 0 96 28" width="96" height="28" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="opacity-70" aria-hidden>
-      {/* 左右の矢印（回す） */}
-      <path d="M6 14h28M6 14l4-4M6 14l4 4M34 14l-4-4M34 14l-4 4" />
-      {/* 外向きの斜めの矢印（大きくする） */}
-      <path d="M62 22l8-8M78 6l-8 8M62 22v-5M62 22h5M78 6v5M78 6h-5" />
-    </svg>
-  );
-}
-
-function formatZoom(z: number): string {
-  return z >= 10 ? z.toFixed(0) : z.toFixed(1);
 }
 
 function RoundButton({ label, onClick, children }: { label: string; onClick: () => void; children: React.ReactNode }) {

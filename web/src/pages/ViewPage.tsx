@@ -93,17 +93,14 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
   const onState = useCallback((next: ViewerState) => setState(next), []);
 
   const ar = useArView();
-  // AR で見るのはメッシュだけ（向きと大きさに scene.json を使う）。
+  // AR で見る（撮った場所で、メッシュを実物に重ねる）。メッシュがあり、位置合わせ用の地図が残っているスキャンだけ。
   const arTarget =
-    active?.key === 'mesh' && active.url && info
+    active?.key === 'mesh' && active.url && info && scan.resumable
       ? {
           url: active.url,
           info,
           scene: scan.captureMode === 'scene',
-          // 位置合わせ用の地図があれば、撮った場所で開いたときに実物に重ねられる。
-          localize: scan.resumable
-            ? (image: Blob, signal: AbortSignal) => localizeFrame(scan.id, image, signal)
-            : undefined,
+          localize: (image: Blob, signal: AbortSignal) => localizeFrame(scan.id, image, signal),
         }
       : null;
 
@@ -189,7 +186,7 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
           {ar.ok && arTarget && (
             <Button className="col-span-2" onClick={() => ar.start(arTarget)} disabled={ar.active}>
               <CubeIcon />
-              AR で見る
+              AR で実物に重ねる
             </Button>
           )}
           {ar.notice && <p className="col-span-2 text-xs text-amber">{ar.notice}</p>}
@@ -209,12 +206,8 @@ function Viewer({ scan, splatEnabled }: { scan: Scan; splatEnabled: boolean }) {
           <ArViewHud
             state={ar.state}
             onClose={() => ar.ctl.current?.end()}
-            onPlace={() => ar.ctl.current?.place()}
-            onOverlay={() => ar.ctl.current?.overlay()}
+            onAlign={() => ar.ctl.current?.align()}
             onSeeThrough={() => ar.ctl.current?.toggleSeeThrough()}
-            onRotate={(r) => ar.ctl.current?.rotateBy(r)}
-            onZoom={(f) => ar.ctl.current?.zoomBy(f)}
-            onResetZoom={() => ar.ctl.current?.resetZoom()}
           />
         )}
       </div>
@@ -437,7 +430,7 @@ function useArView() {
     url: string;
     info: SceneInfo;
     scene: boolean;
-    localize?: (image: Blob, signal: AbortSignal) => Promise<LocalizeResult>;
+    localize: (image: Blob, signal: AbortSignal) => Promise<LocalizeResult>;
   }) => {
     const overlay = root.current;
     if (!overlay || active) return;

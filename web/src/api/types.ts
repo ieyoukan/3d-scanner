@@ -206,6 +206,10 @@ export interface LocalizeResult {
   position?: [number, number, number];
   /** レンズの向き（単位ベクトル）。 */
   forward?: [number, number, number];
+  /** 画像の下方向（単位ベクトル）。forward と合わせてカメラの向きが完全に決まる。 */
+  down?: [number, number, number];
+  /** その写真のカメラの画角（焦点距離と主点、画素）。 */
+  camera?: { width: number; height: number; fx: number; fy: number; cx: number; cy: number };
   /** 地図の3D点と一致した特徴点の数（多いほど確か）。 */
   matches: number;
   comparedImages: number;
